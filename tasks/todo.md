@@ -19,6 +19,7 @@
 - [x] 添加基于 CUDA/cuDNN runtime 的 GPU Dockerfile
 - [x] 配置国内 CUDA、APT 和 PyPI 镜像源及构建参数
 - [x] 添加镜像构建、GPU 启动、provider 验证和模型缓存文档
+- [x] 添加可重复执行的 T4 构建、启动和 CUDA provider 验证脚本
 
 ## 目标姓名
 

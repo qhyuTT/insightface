@@ -99,6 +99,41 @@ curl http://127.0.0.1:8000/healthz
 
 仓库根目录提供了 [Dockerfile](Dockerfile)，默认通过 DaoCloud 国内代理拉取 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`，并将 Ubuntu APT 源切换为阿里云、Python 包源切换为清华源。服务器需要安装 NVIDIA 驱动和 NVIDIA Container Toolkit，且 `nvidia-smi` 正常工作。
 
+推荐在 T4 服务器直接使用部署脚本。脚本会构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
+
+```bash
+git clone https://github.com/qhyuTT/insightface.git
+cd insightface
+chmod +x scripts/deploy_t4.sh
+./scripts/deploy_t4.sh
+```
+
+默认只监听服务器的 `127.0.0.1:8000`，通过本地 SSH 隧道访问监控页：
+
+```bash
+ssh -L 8000:127.0.0.1:8000 user@t4-server
+```
+
+然后打开 `http://127.0.0.1:8000/monitor`。脚本使用 host 网络，因此从 Mac 建立到 T4 的 RTSP 反向隧道后，容器可以直接读取服务器上的 `rtsp://127.0.0.1:18554/camera`。
+
+常用覆盖参数：
+
+```bash
+# 对局域网开放监控页；同时需要配置服务器防火墙/安全组
+T4_BIND_HOST=0.0.0.0 ./scripts/deploy_t4.sh
+
+# DaoCloud 不可用时切回官方 CUDA 镜像
+T4_CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
+  ./scripts/deploy_t4.sh
+
+# 从国内对象存储下载 YOLOX，并在部署时预下载 buffalo_l
+T4_YOLOX_MODEL_URL=https://your-cn-oss.example/yolox_tiny.onnx \
+T4_PRELOAD_INSIGHTFACE=1 \
+  ./scripts/deploy_t4.sh
+```
+
+`T4_PRELOAD_INSIGHTFACE=1` 会在部署阶段下载 `buffalo_l`；若服务器无法访问 InsightFace 上游，可保持默认值 `0`，并将准备好的模型目录放入 Docker volume `person-search-models`。
+
 构建镜像（`onnxruntime-gpu==1.23.2` 是 CUDA 12.x 示例版本）：
 
 ```bash

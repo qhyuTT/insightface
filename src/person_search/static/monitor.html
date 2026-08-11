@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>寻迹 · 实时寻人控制台</title>
+  <style>
+    :root {
+      --ink: #07110f;
+      --panel: #0b1714;
+      --line: #253832;
+      --muted: #82958e;
+      --paper: #dfe6df;
+      --signal: #f4b942;
+      --found: #4be17a;
+      --danger: #ff665a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--ink); color: var(--paper); }
+    body {
+      font-family: "Avenir Next Condensed", "PingFang SC", sans-serif;
+      background-image:
+        linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.018) 1px, transparent 1px),
+        radial-gradient(circle at 73% 15%, #17362d 0, transparent 34%);
+      background-size: 36px 36px, 36px 36px, auto;
+    }
+    body::after {
+      content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .11;
+      background: url("data:image/svg+xml,%3Csvg viewBox='0 0 120 120' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.35'/%3E%3C/svg%3E");
+    }
+    .shell { width: min(1540px, 100%); margin: auto; padding: 26px clamp(18px, 3vw, 52px) 42px; }
+    header { display: flex; align-items: end; justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 22px; }
+    .brand { display: flex; gap: 15px; align-items: center; }
+    .mark { width: 48px; height: 48px; border: 1px solid var(--signal); position: relative; transform: rotate(45deg); }
+    .mark::before, .mark::after { content: ""; position: absolute; background: var(--signal); }
+    .mark::before { width: 1px; height: 70px; left: 23px; top: -12px; }
+    .mark::after { height: 1px; width: 70px; top: 23px; left: -12px; }
+    h1 { margin: 0; font: 700 clamp(28px, 4vw, 48px)/.9 Georgia, "Songti SC", serif; letter-spacing: .08em; }
+    .eyebrow, .mono { font-family: "SFMono-Regular", Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
+    .eyebrow { color: var(--signal); font-size: 10px; margin: 0 0 7px; }
+    .header-state { text-align: right; }
+    .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 8px; }
+    .live-dot.running { background: var(--found); box-shadow: 0 0 16px var(--found); animation: pulse 1.5s infinite; }
+    @keyframes pulse { 50% { opacity: .35; } }
+    main { display: grid; grid-template-columns: minmax(270px, 340px) 1fr; gap: 22px; }
+    .panel { background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--line); position: relative; }
+    .panel::before { content: attr(data-index); position: absolute; top: 10px; right: 12px; color: #41564e; font: 10px Menlo, monospace; }
+    .controls { padding: 24px; align-self: start; }
+    h2 { font: 600 14px Georgia, serif; letter-spacing: .14em; margin: 0 0 18px; }
+    label { display: block; color: var(--muted); font: 10px Menlo, monospace; letter-spacing: .08em; margin: 16px 0 7px; text-transform: uppercase; }
+    input[type="text"], select {
+      width: 100%; border: 1px solid var(--line); background: #07100e; color: var(--paper);
+      padding: 12px; outline: none; font: 12px Menlo, monospace;
+    }
+    input:focus, select:focus { border-color: var(--signal); }
+    .file-drop { border: 1px dashed #52665e; min-height: 144px; display: grid; place-items: center; position: relative; overflow: hidden; cursor: pointer; }
+    .file-drop:hover { border-color: var(--signal); }
+    .file-drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    .file-drop img { width: 100%; height: 144px; object-fit: cover; display: none; filter: saturate(.75); }
+    .drop-copy { text-align: center; color: var(--muted); font-size: 12px; }
+    button { width: 100%; border: 0; padding: 13px 16px; margin-top: 11px; background: var(--signal); color: #12120d; font: 700 12px Menlo, monospace; letter-spacing: .08em; cursor: pointer; transition: transform .15s, filter .15s; }
+    button:hover { filter: brightness(1.12); transform: translateY(-1px); }
+    button:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+    button.secondary { background: transparent; color: var(--paper); border: 1px solid var(--line); }
+    button.danger { color: var(--danger); border-color: #65342f; }
+    .target-id { font: 10px Menlo, monospace; color: var(--found); overflow-wrap: anywhere; min-height: 28px; margin: 10px 0 0; }
+    .stage { min-width: 0; }
+    .viewport { aspect-ratio: 16/9; background: #020504; display: grid; place-items: center; overflow: hidden; position: relative; }
+    .viewport img { width: 100%; height: 100%; object-fit: contain; display: none; }
+    .empty { text-align: center; color: #61746d; }
+    .reticle { width: 78px; height: 78px; border: 1px solid #344a42; margin: 0 auto 18px; position: relative; }
+    .reticle::before, .reticle::after { content: ""; position: absolute; background: #344a42; }
+    .reticle::before { left: 38px; top: -20px; width: 1px; height: 118px; }
+    .reticle::after { top: 38px; left: -20px; height: 1px; width: 118px; }
+    .scanline { display: none; position: absolute; left: 0; right: 0; height: 2px; top: 0; background: var(--signal); opacity: .5; box-shadow: 0 0 14px var(--signal); animation: scan 3.2s linear infinite; }
+    @keyframes scan { to { top: 100%; } }
+    .result-banner { position: absolute; left: 18px; top: 18px; padding: 10px 13px; background: rgba(7,17,15,.87); border-left: 4px solid var(--signal); font: 700 12px Menlo, monospace; letter-spacing: .08em; }
+    .result-banner.found { color: var(--found); border-color: var(--found); }
+    .meta { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
+    .metric { padding: 15px 18px; border-right: 1px solid var(--line); }
+    .metric:last-child { border: 0; }
+    .metric small { display: block; color: var(--muted); font: 9px Menlo, monospace; letter-spacing: .1em; margin-bottom: 5px; }
+    .metric strong { font: 500 17px Georgia, serif; }
+    .events { margin-top: 22px; padding: 20px; min-height: 150px; }
+    .event-list { display: grid; gap: 7px; max-height: 180px; overflow: auto; }
+    .event { display: grid; grid-template-columns: 86px 1fr auto; gap: 12px; padding: 8px 0; border-bottom: 1px solid #1b2a25; font: 11px Menlo, monospace; }
+    .event .kind { color: var(--signal); }
+    .event.confirmed .kind { color: var(--found); }
+    .event.search_status .kind { color: #72bce7; }
+    .notice { min-height: 20px; color: var(--danger); font: 11px/1.5 Menlo, monospace; margin-top: 12px; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .controls { order: 2; } .stage { order: 1; } .meta { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand"><div class="mark"></div><div><p class="eyebrow">Robot vision / Search console</p><h1>寻迹</h1></div></div>
+      <div class="header-state"><p class="eyebrow">System state</p><div class="mono"><span id="liveDot" class="live-dot"></span><span id="globalState">待命</span></div></div>
+    </header>
+    <main>
+      <aside class="panel controls" data-index="01 / TARGET">
+        <h2>目标与视频源</h2>
+        <label for="targetName">目标姓名</label>
+        <input id="targetName" type="text" maxlength="80" placeholder="例如：张三" autocomplete="name">
+        <label>目标人脸照片</label>
+        <div class="file-drop" id="dropZone">
+          <input id="targetFile" type="file" accept="image/jpeg,image/png,image/webp">
+          <img id="targetPreview" alt="目标照片预览">
+          <div class="drop-copy" id="dropCopy">点击或拖入一张正脸照片<br><span class="mono">JPG / PNG / WEBP</span></div>
+        </div>
+        <button id="enrollBtn" disabled>01 · 登记目标</button>
+        <div class="target-id" id="targetInfo">尚未登记目标</div>
+
+        <label for="sourceType">视频源</label>
+        <select id="sourceType"><option value="rtsp">RTSP 网络流</option><option value="camera">本机摄像头</option></select>
+        <div id="rtspFields"><label for="rtspUri">RTSP URI</label><input id="rtspUri" type="text" value="rtsp://127.0.0.1:8554/camera"></div>
+        <div id="cameraFields" style="display:none"><label for="cameraIndex">设备编号</label><input id="cameraIndex" type="text" value="0"></div>
+        <button id="startBtn" disabled>02 · 开始实时寻找</button>
+        <button id="stopBtn" class="secondary danger" disabled>停止本次搜索</button>
+        <div class="notice" id="notice"></div>
+      </aside>
+
+      <section class="stage">
+        <div class="panel" data-index="02 / LIVE FEED">
+          <div class="viewport">
+            <div class="empty" id="emptyState"><div class="reticle"></div><span class="mono">等待视频流接入</span></div>
+            <img id="stream" alt="实时标注视频流">
+            <div class="scanline" id="scanline"></div>
+            <div class="result-banner" id="banner">● 尚未开始</div>
+          </div>
+          <div class="meta">
+            <div class="metric"><small>SEARCH STATUS</small><strong id="statusMetric">IDLE</strong></div>
+            <div class="metric"><small>PROCESSED FPS</small><strong id="fpsMetric">0.0</strong></div>
+            <div class="metric"><small>P95 LATENCY</small><strong id="latencyMetric">0 ms</strong></div>
+            <div class="metric"><small>BEST SIMILARITY</small><strong id="similarityMetric">—</strong></div>
+          </div>
+        </div>
+        <div class="panel events" data-index="03 / EVENT LOG">
+          <h2>识别事件</h2><div class="event-list" id="eventList"><div class="empty">检测结果会实时显示在这里</div></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let targetId = null, targetName = '', searchId = null, socket = null, pollTimer = null, bestSimilarity = -1;
+
+    function fail(message) { $('notice').textContent = message; }
+    function setState(status) {
+      $('globalState').textContent = ({running:'实时检测中', source_lost:'视频源断开', failed:'任务失败', stopped:'已停止', initializing:'正在连接'}[status] || '待命');
+      $('statusMetric').textContent = (status || 'idle').toUpperCase();
+      $('liveDot').classList.toggle('running', status === 'running');
+      if (status === 'running') { $('scanline').style.display = 'block'; $('banner').textContent = '● 正在寻找目标'; }
+    }
+    function problem(body, fallback) { return body?.detail?.message || fallback; }
+
+    function updateEnrollAvailability() {
+      $('enrollBtn').disabled = !$('targetFile').files[0] || !$('targetName').value.trim();
+    }
+    $('targetName').addEventListener('input', updateEnrollAvailability);
+    $('targetFile').addEventListener('change', () => {
+      const file = $('targetFile').files[0];
+      updateEnrollAvailability();
+      if (file) { $('targetPreview').src = URL.createObjectURL(file); $('targetPreview').style.display = 'block'; $('dropCopy').style.display = 'none'; }
+    });
+    $('sourceType').addEventListener('change', () => {
+      const rtsp = $('sourceType').value === 'rtsp';
+      $('rtspFields').style.display = rtsp ? 'block' : 'none'; $('cameraFields').style.display = rtsp ? 'none' : 'block';
+    });
+    $('enrollBtn').addEventListener('click', async () => {
+      fail(''); $('enrollBtn').disabled = true; $('enrollBtn').textContent = '正在分析人脸…';
+      const data = new FormData(); data.append('name', $('targetName').value.trim()); data.append('image', $('targetFile').files[0]);
+      try {
+        const response = await fetch('/v1/targets', {method:'POST', body:data}); const body = await response.json();
+        if (!response.ok) throw new Error(problem(body, '照片登记失败'));
+        targetId = body.target_id; targetName = body.name; $('targetInfo').textContent = `${targetName} · TARGET ${targetId} · QUALITY ${body.quality_score.toFixed(2)}`;
+        $('startBtn').disabled = false; $('enrollBtn').textContent = '✓ 目标已登记';
+      } catch (error) { fail(error.message); $('enrollBtn').disabled = false; $('enrollBtn').textContent = '01 · 重新登记'; }
+    });
+    $('startBtn').addEventListener('click', async () => {
+      fail(''); $('startBtn').disabled = true;
+      const source = $('sourceType').value === 'rtsp'
+        ? {type:'rtsp', uri:$('rtspUri').value.trim()}
+        : {type:'camera', device_index:Number($('cameraIndex').value)};
+      try {
+        const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, source})});
+        const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));
+        searchId = body.search_id; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
+        $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
+        $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
+        connectEvents(); pollStatus();
+      } catch (error) { fail(error.message + (error.message.includes('one search') ? '；请先停止旧任务或重启服务。' : '')); $('startBtn').disabled = false; }
+    });
+    $('stopBtn').addEventListener('click', stopSearch);
+
+    async function stopSearch() {
+      if (!searchId) return;
+      await fetch(`/v1/searches/${searchId}`, {method:'DELETE'});
+      if (socket) socket.close(); clearTimeout(pollTimer); setState('stopped');
+      $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('emptyState').style.display = 'block'; $('scanline').style.display = 'none';
+      $('stopBtn').disabled = true; $('startBtn').disabled = true; targetId = null; targetName = ''; searchId = null; bestSimilarity = -1;
+      $('targetInfo').textContent = '任务已结束，请重新登记目标'; $('banner').textContent = '● 已停止';
+    }
+    function connectEvents() {
+      const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+      socket = new WebSocket(`${protocol}://${location.host}/v1/searches/${searchId}/events`);
+      socket.onmessage = ({data}) => {
+        const event = JSON.parse(data); addEvent(event);
+        if (event.type === 'search_status') setState(event.data.status);
+        if (event.type === 'candidate' || event.type === 'confirmed') {
+          bestSimilarity = Math.max(bestSimilarity, event.data.similarity); $('similarityMetric').textContent = bestSimilarity.toFixed(3);
+        }
+        if (event.type === 'confirmed') { $('banner').textContent = `✓ 已找到 · ${event.data.target_name || targetName} · 轨迹 #${event.data.track_id}`; $('banner').classList.add('found'); }
+        if (event.type === 'lost') { $('banner').textContent = '● 目标暂时离开画面'; $('banner').classList.remove('found'); }
+      };
+    }
+    function addEvent(event) {
+      if ($('eventList').querySelector('.empty')) $('eventList').innerHTML = '';
+      const row = document.createElement('div'); row.className = `event ${event.type}`;
+      const time = new Date(event.occurred_at).toLocaleTimeString();
+      const detail = event.type === 'search_status' ? event.data.status : `${event.data.target_name || targetName} · TRACK #${event.data.track_id} · SIM ${(event.data.similarity ?? 0).toFixed(3)}`;
+      const timeCell = document.createElement('span'); timeCell.textContent = time;
+      const kindCell = document.createElement('span'); kindCell.className = 'kind'; kindCell.textContent = event.type.toUpperCase();
+      const detailCell = document.createElement('span'); detailCell.textContent = detail;
+      row.append(timeCell, kindCell, detailCell);
+      $('eventList').prepend(row); while ($('eventList').children.length > 30) $('eventList').lastChild.remove();
+    }
+    async function pollStatus() {
+      if (!searchId) return;
+      try {
+        const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
+        if (response.ok) { setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`; if (body.error) fail(body.error); }
+      } finally { pollTimer = setTimeout(pollStatus, 1200); }
+    }
+  </script>
+</body>
+</html>

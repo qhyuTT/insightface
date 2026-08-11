@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-person-search-poc"
+version = "0.1.0"
+description = "Photo-to-live-video person search PoC for robots"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.115,<1",
+  "numpy>=1.26,<2",
+  "opencv-python>=4.10,<4.12",
+  "pydantic-settings>=2.5,<3",
+  "python-multipart>=0.0.9,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+inference-cpu = [
+  "insightface==1.0.1",
+  "onnxruntime>=1.20,<1.24",
+  "scipy>=1.13,<1.16",
+]
+test = [
+  "httpx>=0.27,<1",
+  "pytest>=8.2,<9",
+  "pytest-cov>=5,<7",
+  "ruff>=0.8,<1",
+]
+
+[project.scripts]
+person-search-api = "person_search.main:run"
+person-search-eval = "person_search.cli:main"
+person-search-download-models = "person_search.model_assets:main"
+person-search-vlc-camera = "person_search.vlc_camera:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/person_search"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.uv]
+default-groups = []

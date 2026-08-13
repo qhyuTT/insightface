@@ -7,7 +7,8 @@ name = "robot-person-search-poc"
 version = "0.1.0"
 description = "Photo-to-live-video person search PoC for robots"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+# person_search.domain uses enum.StrEnum, which was added in 3.11.
+requires-python = ">=3.11,<3.12"
 license = { text = "MIT" }
 dependencies = [
   "fastapi>=0.115,<1",
@@ -46,7 +47,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.uv]
 default-groups = []

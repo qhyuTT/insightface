@@ -20,7 +20,6 @@ ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
 
 WORKDIR /app
 
-# Ubuntu 22.04 provides Python 3.10, which is supported by this project.
 RUN sed -i \
       -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
       -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
@@ -29,24 +28,39 @@ RUN sed -i \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
+      gnupg \
       libgl1 \
       libglib2.0-0 \
       libsm6 \
       libxext6 \
       libxrender1 \
-      python3.10 \
-      python3.10-venv \
       python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3.10 -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" "uv==0.6.9"
+# The code uses enum.StrEnum, so it needs Python 3.11 or newer. Ubuntu 22.04
+# ships 3.10 by default and its python3.11 package is only a release candidate,
+# so take the released build from the deadsnakes PPA. apt-key/add-apt-repository
+# are avoided to keep this to one layer without extra tooling.
+ARG DEADSNAKES_KEY=F23C5A6CF475977595C89F51BA6932366A755776
+RUN set -eux; \
+    curl --fail --location --show-error --silent \
+      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DEADSNAKES_KEY}" \
+      | gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
+      > /etc/apt/sources.list.d/deadsnakes.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends python3.11 python3.11-venv; \
+    rm -rf /var/lib/apt/lists/*; \
+    python3.11 --version
+
+RUN python3 -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" "uv==0.6.9"
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 
 # The lock file contains CPU onnxruntime for the inference-cpu extra. Replace
 # that package with the GPU build after syncing the remaining dependencies.
-RUN uv sync --frozen --python /usr/bin/python3.10 --extra inference-cpu \
+RUN uv sync --frozen --python /usr/bin/python3.11 --extra inference-cpu \
     && uv pip uninstall --python /app/.venv/bin/python onnxruntime \
     && uv pip install --python /app/.venv/bin/python \
       --index-url "${PIP_INDEX_URL}" "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"

@@ -51,9 +51,24 @@ RUN uv sync --frozen --python /usr/bin/python3.10 --extra inference-cpu \
     && uv pip install --python /app/.venv/bin/python \
       --index-url "${PIP_INDEX_URL}" "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
 
-RUN mkdir -p /app/models \
-    && curl --fail --location --retry 3 "${YOLOX_MODEL_URL}" \
-      --output /app/models/yolox_tiny.onnx \
+# Pick up the YOLOX weight when it was prefetched into the build context (see
+# scripts/deploy_t4.sh); .dockerignore lets that one file through despite the
+# blanket models/* rule. pyproject.toml is only here as an always-present source
+# so the trailing glob may match nothing without failing the build.
+COPY pyproject.toml models/yolox_tiny.onnx* /app/models/
+
+# Prefer the prefetched weight: downloading here is the step most likely to fail
+# behind a slow or proxied connection, and it discards every cached layer above.
+RUN rm -f /app/models/pyproject.toml \
+    && if [ -f /app/models/yolox_tiny.onnx ]; then \
+         echo "Using the YOLOX weight from the build context"; \
+       else \
+         echo "Downloading the YOLOX weight from ${YOLOX_MODEL_URL}"; \
+         curl --fail --location --http1.1 \
+           --retry 5 --retry-delay 5 --retry-connrefused \
+           --connect-timeout 20 --max-time 900 \
+           "${YOLOX_MODEL_URL}" --output /app/models/yolox_tiny.onnx; \
+       fi \
     && echo "${YOLOX_MODEL_SHA256}  /app/models/yolox_tiny.onnx" | sha256sum --check --strict
 
 RUN mkdir -p /models/.insightface

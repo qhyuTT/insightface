@@ -13,6 +13,9 @@ T4_ORT_VERSION="${T4_ORT_VERSION:-1.23.2}"
 T4_BIND_HOST="${T4_BIND_HOST:-127.0.0.1}"
 T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
 T4_YOLOX_MODEL_URL="${T4_YOLOX_MODEL_URL:-}"
+T4_PREFETCH_YOLOX="${T4_PREFETCH_YOLOX:-1}"
+# Prefix-style GitHub proxies, tried in order before the upstream URL itself.
+T4_YOLOX_MIRRORS="${T4_YOLOX_MIRRORS-https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/}"
 
 log() {
   printf '[deploy-t4] %s\n' "$*"
@@ -34,6 +37,90 @@ docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable for the curren
 nvidia-smi -L >/dev/null 2>&1 || fail "NVIDIA driver cannot see the T4 GPU"
 
 cd "${PROJECT_ROOT}"
+
+# Keep this in sync with YOLOX_MODEL_SHA256 in the Dockerfile.
+YOLOX_SHA256="427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
+YOLOX_UPSTREAM_URL="https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx"
+YOLOX_PATH="models/yolox_tiny.onnx"
+
+yolox_checksum_ok() {
+  [[ -f "$1" ]] || return 1
+  [[ "$(sha256sum "$1" | awk '{ print $1 }')" == "${YOLOX_SHA256}" ]]
+}
+
+# Downloading the YOLOX weight inside `docker build` is the step most likely to
+# fail on a slow or proxied connection, and a failure there throws away every
+# cached layer above it. Fetch it on the host instead, where a partial transfer
+# can be resumed and mirrors can be retried; the Dockerfile then COPYs it out of
+# the build context. Set T4_PREFETCH_YOLOX=0 to download during the build.
+prefetch_yolox() {
+  if yolox_checksum_ok "${YOLOX_PATH}"; then
+    log "YOLOX weight already present and verified: ${YOLOX_PATH}"
+    return 0
+  fi
+
+  local source_url="${T4_YOLOX_MODEL_URL:-${YOLOX_UPSTREAM_URL}}"
+  local -a candidates=()
+  # Mirrors only apply to GitHub URLs; a custom T4_YOLOX_MODEL_URL is used as-is.
+  if [[ -z "${T4_YOLOX_MODEL_URL}" ]]; then
+    local mirror
+    for mirror in ${T4_YOLOX_MIRRORS}; do
+      candidates+=("${mirror}${source_url}")
+    done
+  fi
+  candidates+=("${source_url}")
+
+  mkdir -p "$(dirname "${YOLOX_PATH}")"
+  local partial="${YOLOX_PATH}.part"
+  local round url status
+  for round in 1 2; do
+    for url in "${candidates[@]}"; do
+      log "Fetching YOLOX weight (round ${round}) via $(printf '%s' "${url}" | awk -F/ '{ print $3 }')"
+      # Resume only when there is something to resume from: -C - on a
+      # zero-length file makes curl fail before it sends the request.
+      local -a resume=()
+      if [[ -s "${partial}" ]]; then
+        resume=(--continue-at -)
+      fi
+      status=0
+      # --http1.1 avoids the HTTP/2 INTERNAL_ERROR some GitHub proxies return
+      # mid-transfer. --speed-limit gives up on a stalled mirror instead of
+      # sitting on it until --max-time. The ${a[@]+"${a[@]}"} form expands an
+      # empty array safely under `set -u` in Bash 3.2.
+      curl --fail --location --http1.1 ${resume[@]+"${resume[@]}"} \
+        --retry 3 --retry-delay 5 --retry-connrefused \
+        --connect-timeout 20 --max-time 900 \
+        --speed-limit 30720 --speed-time 60 \
+        --output "${partial}" "${url}" || status=$?
+
+      if [[ "${status}" -eq 0 ]]; then
+        if yolox_checksum_ok "${partial}"; then
+          mv "${partial}" "${YOLOX_PATH}"
+          log "YOLOX weight verified: ${YOLOX_PATH}"
+          return 0
+        fi
+        # A complete but wrong file is usually a proxy error page, so the bytes
+        # are not worth resuming from.
+        log "Checksum mismatch, discarding the download"
+        rm -f "${partial}"
+      else
+        # An interrupted transfer is kept so the next candidate can resume it.
+        log "Transfer failed (curl ${status}), keeping $(wc -c <"${partial}" 2>/dev/null || echo 0) bytes for resume"
+      fi
+    done
+  done
+
+  rm -f "${partial}"
+  log "Could not prefetch the YOLOX weight; falling back to downloading during the build"
+  log "To supply it manually: place a verified yolox_tiny.onnx at ${PROJECT_ROOT}/${YOLOX_PATH}"
+  return 1
+}
+
+if [[ "${T4_PREFETCH_YOLOX}" == "1" ]]; then
+  require_command curl
+  require_command sha256sum
+  prefetch_yolox || true
+fi
 
 build_args=(
   --build-arg "CUDA_IMAGE=${T4_CUDA_IMAGE}"

@@ -13,3 +13,6 @@ artifacts
 *.mp4
 .DS_Store
 models/*
+# Keep a prefetched YOLOX weight in the build context so the image does not have
+# to download it. Still ignored by Git; see models/README.md.
+!models/yolox_tiny.onnx

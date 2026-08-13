@@ -99,7 +99,7 @@ curl http://127.0.0.1:8000/healthz
 
 仓库根目录提供了 [Dockerfile](Dockerfile)，默认通过 DaoCloud 国内代理拉取 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`，并将 Ubuntu APT 源切换为阿里云、Python 包源切换为清华源。服务器需要安装 NVIDIA 驱动和 NVIDIA Container Toolkit，且 `nvidia-smi` 正常工作。
 
-推荐在 T4 服务器直接使用部署脚本。脚本会构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
+推荐在 T4 服务器直接使用部署脚本。脚本会预取 YOLOX 权重、构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
 
 ```bash
 git clone https://github.com/qhyuTT/insightface.git
@@ -133,6 +133,28 @@ T4_PRELOAD_INSIGHTFACE=1 \
 ```
 
 `T4_PRELOAD_INSIGHTFACE=1` 会在部署阶段下载 `buffalo_l`；若服务器无法访问 InsightFace 上游，可保持默认值 `0`，并将准备好的模型目录放入 Docker volume `person-search-models`。
+
+##### YOLOX 权重的获取方式
+
+构建期下载权重是整条链路里最容易失败的一步，一旦失败还会丢掉上面所有缓存层。因此脚本默认先在宿主机上把 `models/yolox_tiny.onnx` 下好，`Dockerfile` 再从构建上下文 `COPY` 进镜像；只有上下文里没有这个文件时才回退到构建期下载。宿主机预取的好处是断点可续、可以换源重试，而且失败了不影响已经构建好的层。
+
+预取依次尝试 `gh-proxy.com`、`ghfast.top`、`ghproxy.net` 三个 GitHub 代理，最后才是 GitHub 官方地址，共两轮。请求固定使用 HTTP/1.1，因为部分代理在 HTTP/2 下会在传输中途返回 `INTERNAL_ERROR`，导致 `curl` 以 92 退出。下载完成后校验 SHA-256，校验不通过的文件会被丢弃（通常是代理返回的错误页）。
+
+所有源都失败时脚本只告警、不中断，继续走构建期下载。也可以手动放好权重后重跑：
+
+```bash
+# 已有权重时直接跳过下载（校验通过即复用）
+cp /path/to/yolox_tiny.onnx models/yolox_tiny.onnx
+./scripts/deploy_t4.sh
+
+# 自定义代理列表；留空表示只用官方地址
+T4_YOLOX_MIRRORS="https://your-proxy.example/" ./scripts/deploy_t4.sh
+
+# 完全关闭宿主机预取，改回构建期下载
+T4_PREFETCH_YOLOX=0 ./scripts/deploy_t4.sh
+```
+
+`models/yolox_tiny.onnx` 仍然不进 Git（见 [.gitignore](.gitignore)），但 [.dockerignore](.dockerignore) 为它开了 `models/*` 的例外，好让它能进入构建上下文。
 
 构建镜像（`onnxruntime-gpu==1.23.2` 是 CUDA 12.x 示例版本）：
 

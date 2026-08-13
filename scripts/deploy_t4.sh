@@ -8,7 +8,9 @@ T4_IMAGE_NAME="${T4_IMAGE_NAME:-person-search:t4}"
 T4_CONTAINER_NAME="${T4_CONTAINER_NAME:-person-search}"
 T4_MODEL_VOLUME="${T4_MODEL_VOLUME:-person-search-models}"
 T4_CUDA_IMAGE="${T4_CUDA_IMAGE:-docker.m.daocloud.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04}"
-T4_PIP_INDEX_URL="${T4_PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+T4_PIP_INDEX_URL="${T4_PIP_INDEX_URL:-}"
+# Tried in order when T4_PIP_INDEX_URL is unset; the first reachable one wins.
+T4_PIP_INDEX_CANDIDATES="${T4_PIP_INDEX_CANDIDATES-https://mirrors.aliyun.com/pypi/simple https://mirrors.ustc.edu.cn/pypi/simple https://pypi.org/simple}"
 T4_ORT_VERSION="${T4_ORT_VERSION:-1.23.2}"
 T4_BIND_HOST="${T4_BIND_HOST:-127.0.0.1}"
 T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
@@ -120,6 +122,32 @@ if [[ "${T4_PREFETCH_YOLOX}" == "1" ]]; then
   require_command curl
   require_command sha256sum
   prefetch_yolox || true
+fi
+
+# A mirror that rate-limits or blocks this host fails the build several layers
+# in, so pick one that answers now rather than trusting a hardcoded default.
+select_pip_index() {
+  local url code
+  for url in ${T4_PIP_INDEX_CANDIDATES}; do
+    code="$(
+      curl --silent --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 10 --max-time 20 "${url}/pip/" 2>/dev/null || true
+    )"
+    if [[ "${code}" == "200" ]]; then
+      T4_PIP_INDEX_URL="${url}"
+      log "Using Python package index ${url}"
+      return 0
+    fi
+    log "Skipping ${url} (HTTP ${code:-no response})"
+  done
+  return 1
+}
+
+if [[ -z "${T4_PIP_INDEX_URL}" ]]; then
+  require_command curl
+  if ! select_pip_index; then
+    fail "No usable Python package index found; set T4_PIP_INDEX_URL explicitly"
+  fi
 fi
 
 build_args=(

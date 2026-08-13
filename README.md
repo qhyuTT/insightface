@@ -97,7 +97,9 @@ curl http://127.0.0.1:8000/healthz
 
 #### 使用 Docker 部署 T4
 
-仓库根目录提供了 [Dockerfile](Dockerfile)，默认通过 DaoCloud 国内代理拉取 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`，并将 Ubuntu APT 源切换为阿里云、Python 包源切换为清华源。服务器需要安装 NVIDIA 驱动和 NVIDIA Container Toolkit，且 `nvidia-smi` 正常工作。
+仓库根目录提供了 [Dockerfile](Dockerfile)，默认通过 DaoCloud 国内代理拉取 `nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04`，Ubuntu APT 源和 Python 包源都切换为阿里云。镜像使用 Python 3.11（`enum.StrEnum` 需要 3.11，Ubuntu 22.04 默认只有 3.10，因此从 deadsnakes PPA 安装正式版）。服务器需要安装 NVIDIA 驱动和 NVIDIA Container Toolkit，且 `nvidia-smi` 正常工作。
+
+部署脚本在构建前会依次探测阿里云、中科大、PyPI 官方，选第一个可用的作为 Python 包源。这一步是必要的：镜像站可能对某个 IP 限流并返回 403，而失败会发生在构建的中段，白费上面所有层。用 `T4_PIP_INDEX_URL` 可以指定固定源，跳过探测；用 `T4_PIP_INDEX_CANDIDATES` 可以自定义候选列表。
 
 推荐在 T4 服务器直接使用部署脚本。脚本会预取 YOLOX 权重、构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
 

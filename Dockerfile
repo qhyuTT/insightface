@@ -2,7 +2,7 @@ ARG CUDA_IMAGE=docker.m.daocloud.io/nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 FROM ${CUDA_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 ARG ONNXRUNTIME_GPU_VERSION=1.23.2
 ARG YOLOX_MODEL_URL=https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx
 ARG YOLOX_MODEL_SHA256=427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7
@@ -40,11 +40,11 @@ RUN sed -i \
 # The code uses enum.StrEnum, so it needs Python 3.11 or newer. Ubuntu 22.04
 # ships 3.10 by default and its python3.11 package is only a release candidate,
 # so take the released build from the deadsnakes PPA. apt-key/add-apt-repository
-# are avoided to keep this to one layer without extra tooling.
-ARG DEADSNAKES_KEY=F23C5A6CF475977595C89F51BA6932366A755776
+# are avoided to keep this to one layer without extra tooling. The fingerprint is
+# inlined rather than passed as an ARG so BuildKit does not flag it as a secret.
 RUN set -eux; \
     curl --fail --location --show-error --silent \
-      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${DEADSNAKES_KEY}" \
+      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" \
       | gpg --dearmor -o /usr/share/keyrings/deadsnakes.gpg; \
     echo "deb [signed-by=/usr/share/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" \
       > /etc/apt/sources.list.d/deadsnakes.list; \

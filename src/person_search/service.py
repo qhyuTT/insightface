@@ -189,10 +189,6 @@ class SearchSession:
                     target=self.target,
                 )
                 for decision in decisions:
-                    self._track_states[decision.track_id] = (
-                        decision.state.value,
-                        decision.similarity,
-                    )
                     event = SearchEvent(
                         search_id=self.search_id,
                         target_id=self.target.target_id,
@@ -207,6 +203,10 @@ class SearchSession:
                         model=self.face_backend.model_name,
                     )
                     self.events.publish(decision.state.value, event.model_dump(mode="json"))
+                self._track_states = {
+                    track_id: (state.value, similarity)
+                    for track_id, (state, similarity) in self._confirmation.active_track_states().items()
+                }
                 self._publish_preview(packet.frame, tracks, faces)
                 self.metrics.frame_count += 1
                 self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
@@ -230,7 +230,7 @@ class SearchSession:
             elif state == "candidate":
                 color, label = (0, 184, 255), f"CANDIDATE  {similarity:.2f}"
             else:
-                color, label = (255, 190, 55), f"PERSON  #{track.track_id}"
+                continue
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 3)
             (text_width, text_height), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2

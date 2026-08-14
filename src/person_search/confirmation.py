@@ -47,6 +47,16 @@ class TrackConfirmation:
     def reset(self) -> None:
         self._states.clear()
 
+    def active_track_states(self) -> dict[int, tuple[MatchState, float]]:
+        return {
+            track_id: (
+                MatchState.CONFIRMED if state.confirmed else MatchState.CANDIDATE,
+                state.last_similarity,
+            )
+            for track_id, state in self._states.items()
+            if state.confirmed or state.evidence
+        }
+
     def process(
         self,
         *,

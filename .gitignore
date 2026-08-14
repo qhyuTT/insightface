@@ -13,3 +13,5 @@ models/*
 artifacts/
 *.mp4
 .DS_Store
+/auto.crt
+/auto.key

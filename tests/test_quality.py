@@ -51,3 +51,28 @@ def test_face_quality_reports_small_dark_blurry_face() -> None:
     assert {"face_too_small", "detection_score_low", "face_blurry", "face_exposure_bad"} <= set(
         result.reasons
     )
+
+
+def test_search_accepts_pose_and_score_that_enrollment_rejects() -> None:
+    checker = np.indices((200, 200)).sum(axis=0) % 2
+    frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    bbox = np.asarray([20, 20, 180, 180])
+    side_landmarks = np.asarray(
+        [[60, 80], [140, 80], [130, 110], [70, 140], [130, 140]]
+    )
+    settings = Settings(
+        min_enrollment_blur_variance=1,
+        min_search_blur_variance=1,
+        min_brightness=0,
+        max_brightness=255,
+    )
+
+    enrollment = assess_face(
+        frame, bbox, side_landmarks, 0.5, settings, enrollment=True
+    )
+    search = assess_face(frame, bbox, side_landmarks, 0.5, settings, enrollment=False)
+
+    assert not enrollment.accepted
+    assert {"detection_score_low", "face_yaw_too_large"} <= set(enrollment.reasons)
+    assert search.accepted
+    assert "face_yaw_too_large" not in search.reasons

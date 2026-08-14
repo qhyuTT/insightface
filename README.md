@@ -19,7 +19,7 @@ RTSP / USB
 
 InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近距离大脸，640 负责视频中的较小人脸。可用 `PERSON_SEARCH_FACE_DETECTION_SIZE` 强制单一尺寸，但通常不建议覆盖默认值。
 
-登记照和视频帧使用不同的清晰度门控：登记照允许轻微柔焦，只要正脸、尺寸和姿态合格；视频识别帧保持更严格的运动模糊过滤，避免低质量帧成为确认依据。
+登记照和视频帧使用不同门控：登记照至少需要 `0.60` 检测分，并保持严格的正脸姿态要求；视频检测从 `0.45` 开始，不因 roll/yaw 直接拒绝，而是将姿态作为质量软分。视频帧仍使用更严格的运动模糊过滤，避免低质量帧成为确认依据。`PERSON_SEARCH_MAX_ABS_ROLL_DEGREES` 和 `PERSON_SEARCH_MAX_YAW_PROXY` 只约束登记照。
 
 ## 使用 uv 安装
 
@@ -345,6 +345,39 @@ uv run person-search-eval \
 ```
 
 输出 `annotated.mp4` 和 `report.json`。默认相似度阈值 `0.55` 只用于跑通流程，不能作为机器人动作的生产阈值。应使用真实摄像头采集目标与非目标轨迹，按“可接受的每小时误确认数”重新标定 `PERSON_SEARCH_SIMILARITY_THRESHOLD`。
+
+批量标定使用版本 1 manifest。路径相对 manifest 文件解析；`expected_intervals_seconds` 是目标实际出现在视频中的起止秒数，空列表表示纯负样本：
+
+```json
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "gate-a-positive",
+      "photo": "media/target.jpg",
+      "video": "media/gate-a.mp4",
+      "target_name": "张三",
+      "expected_intervals_seconds": [[12.4, 28.7], [51.0, 63.2]]
+    },
+    {
+      "id": "gate-b-negative",
+      "photo": "media/target.jpg",
+      "video": "media/gate-b.mp4",
+      "target_name": "张三",
+      "expected_intervals_seconds": []
+    }
+  ]
+}
+```
+
+```bash
+uv run person-search-eval \
+  --manifest evaluation/manifest.json \
+  --thresholds 0.50 0.55 0.60 0.65 \
+  --output-dir artifacts/airport-eval
+```
+
+每个 case 会生成独立的 `annotated.mp4` 和 `report.json`，根目录报告汇总区间召回率、确认延迟、区间外误确认和非目标暴露时长。只有区间召回率至少 90%、误确认不超过每小时 0.1 次，并累计至少 10 小时非目标视频时才推荐阈值；数据不足或没有阈值通过时不会给出生产推荐。阈值扫描共用同一次模型推理，不会在报告中保存人脸 embedding。
 
 ## 当前边界
 

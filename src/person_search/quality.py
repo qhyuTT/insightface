@@ -57,7 +57,12 @@ def assess_face(
     )
     if min(face_width, face_height) < minimum_size:
         reasons.append("face_too_small")
-    if detection_score < settings.face_detection_threshold:
+    minimum_detection_score = (
+        max(settings.face_detection_threshold, settings.min_enrollment_detection_score)
+        if enrollment
+        else settings.face_detection_threshold
+    )
+    if detection_score < minimum_detection_score:
         reasons.append("detection_score_low")
 
     blur = 0.0
@@ -74,10 +79,11 @@ def assess_face(
             reasons.append("face_exposure_bad")
 
     roll, yaw = _pose_proxies(landmarks)
-    if roll is not None and abs(roll) > settings.max_abs_roll_degrees:
-        reasons.append("face_roll_too_large")
-    if yaw is not None and abs(yaw) > settings.max_yaw_proxy:
-        reasons.append("face_yaw_too_large")
+    if enrollment:
+        if roll is not None and abs(roll) > settings.max_abs_roll_degrees:
+            reasons.append("face_roll_too_large")
+        if yaw is not None and abs(yaw) > settings.max_yaw_proxy:
+            reasons.append("face_yaw_too_large")
 
     size_score = min(1.0, min(face_width, face_height) / max(minimum_size * 1.5, 1))
     blur_score = min(1.0, blur / max(minimum_blur * 2.0, 1.0))
@@ -90,9 +96,9 @@ def assess_face(
     score = float(np.clip(
         0.25 * detection_score
         + 0.25 * size_score
-        + 0.2 * blur_score
+        + 0.27 * blur_score
         + 0.15 * exposure_score
-        + 0.15 * pose_score,
+        + 0.08 * pose_score,
         0.0,
         1.0,
     ))

@@ -33,7 +33,8 @@ class Settings(BaseSettings):
     face_detection_hz_cuda: float = 8.0
     frame_queue_size: int = 2
 
-    face_detection_threshold: float = 0.6
+    face_detection_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    min_enrollment_detection_score: float = Field(default=0.6, ge=0.0, le=1.0)
     min_enrollment_face_px: int = 100
     min_search_face_px: int = 80
     min_enrollment_blur_variance: float = 5.0

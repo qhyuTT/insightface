@@ -105,3 +105,29 @@ def test_face_associates_to_smallest_upper_body_box() -> None:
 def test_face_below_upper_body_is_not_associated() -> None:
     face = make_face(bbox=(40, 150, 60, 180))
     assert associate_faces_to_tracks([face], [_track()]) == {}
+
+
+def test_candidate_state_disappears_when_evidence_expires() -> None:
+    matcher = TrackConfirmation(
+        Settings(similarity_threshold=0.8, evidence_required=3, evidence_window_seconds=1.0)
+    )
+    track = _track()
+    matcher.process(
+        frame_id=1,
+        timestamp=0.0,
+        frame_shape=(200, 100, 3),
+        tracks=[track],
+        faces=[make_face()],
+        target=_target(),
+    )
+    assert matcher.active_track_states()[track.track_id][0] == MatchState.CANDIDATE
+
+    matcher.process(
+        frame_id=2,
+        timestamp=1.01,
+        frame_shape=(200, 100, 3),
+        tracks=[track],
+        faces=[],
+        target=_target(),
+    )
+    assert matcher.active_track_states() == {}

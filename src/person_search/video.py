@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -109,4 +110,12 @@ class LatestFrameReader:
     def _open(self) -> cv2.VideoCapture:
         if self.source.type == SourceType.CAMERA:
             return cv2.VideoCapture(int(self.source.device_index))
+        if self.source.type == SourceType.RTSP:
+            # OpenCV delegates RTSP to FFmpeg. Without an explicit transport,
+            # FFmpeg commonly selects UDP and damaged H.264 frames persist until
+            # the next keyframe when packets are lost.
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                f"rtsp_transport;{self.settings.rtsp_transport}"
+            )
+            return cv2.VideoCapture(str(self.source.uri), cv2.CAP_FFMPEG)
         return cv2.VideoCapture(str(self.source.uri))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -49,6 +50,7 @@ class Settings(BaseSettings):
     evidence_window_seconds: float = 1.5
     confirmed_track_grace_seconds: float = 2.0
     candidate_emit_interval_seconds: float = 0.5
+    rtsp_transport: Literal["tcp", "udp"] = "tcp"
     rtsp_reconnect_max_seconds: float = 10.0
 
 

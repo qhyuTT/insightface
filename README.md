@@ -243,6 +243,8 @@ uv run person-search-api
 
 可视化监控页位于 `http://127.0.0.1:8000/monitor`（根路径也会打开该页面）。页面可以完成目标照片登记、启动/停止搜索，并显示带人物框和人脸框的实时视频：普通轨迹为蓝框，候选目标为黄框，连续多帧确认后为绿框。状态、FPS、延迟、相似度和识别事件会同步更新。视频预览使用只保留最新帧的 MJPEG 流，不会因浏览器读取慢而阻塞推理。
 
+RTSP 默认通过 FFmpeg 的 TCP transport 拉流，避免局域网丢包导致 H.264 花屏。只在网络可靠且更看重最低延迟时，才设置 `PERSON_SEARCH_RTSP_TRANSPORT=udp` 改回 UDP。
+
 ### 使用 VLC 发布 Mac 摄像头 RTSP
 
 本机内建 FaceTime 摄像头可通过项目命令发布为 `rtsp://127.0.0.1:8554/camera`：

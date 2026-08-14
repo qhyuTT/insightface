@@ -103,6 +103,8 @@ curl http://127.0.0.1:8000/healthz
 
 推荐在 T4 服务器直接使用部署脚本。脚本会预取 YOLOX 权重、构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
 
+完整的源码发布、服务器更新、容器替换、GitHub 不可达备用方案和 GPU 核验步骤见 [T4 部署与 GPU 验证](docs/t4-deployment.md)。
+
 ```bash
 git clone https://github.com/qhyuTT/insightface.git
 cd insightface

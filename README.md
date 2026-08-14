@@ -245,46 +245,50 @@ uv run person-search-api
 
 RTSP 默认通过 FFmpeg 的 TCP transport 拉流，避免局域网丢包导致 H.264 花屏。只在网络可靠且更看重最低延迟时，才设置 `PERSON_SEARCH_RTSP_TRANSPORT=udp` 改回 UDP。
 
-### 使用 VLC 发布 Mac 摄像头 RTSP
+### 发布 Mac 摄像头 RTSP
 
-本机内建 FaceTime 摄像头可通过项目命令发布为 `rtsp://127.0.0.1:8554/camera`：
-
-```bash
-uv run person-search-vlc-camera
-```
-
-第一次运行需要在 macOS“系统设置 → 隐私与安全性 → 摄像头”中允许 VLC。该命令以前台方式运行，按 `Ctrl+C` 停止。只查看底层 VLC 命令而不打开摄像头：
+本机摄像头通过 MediaMTX + FFmpeg 发布。先安装依赖：
 
 ```bash
-uv run person-search-vlc-camera --print-only
+brew install mediamtx ffmpeg
 ```
 
-默认的 `127.0.0.1` 只对本机可见。若 T4 与 Mac 在同一局域网，使用 Mac 的局域网 IP 发布，并在服务器搜索请求中填写同一个地址：
+使用项目脚本在后台一键启停：
 
 ```bash
-# 将 192.168.1.20 换成 Mac 的局域网 IP
-uv run person-search-vlc-camera --host 192.168.1.20
+./scripts/local_rtsp.sh start
+./scripts/local_rtsp.sh status
+./scripts/local_rtsp.sh stop
 ```
+
+脚本使用 `launchctl` 管理后台任务，重复执行 `start` 或 `stop` 是安全的。`start` 会检查依赖、端口占用、后台任务和实际视频帧；失败时自动清理本次启动的任务。`stop` 只停止脚本管理的摄像头和 MediaMTX，不会终止占用相同端口的其他程序。
+
+其他管理命令：
+
+```bash
+./scripts/local_rtsp.sh restart
+./scripts/local_rtsp.sh logs
+./scripts/local_rtsp.sh logs -f
+```
+
+首次运行需要在 macOS“系统设置 → 隐私与安全性 → 摄像头”中允许 FFmpeg。默认发布地址为 `rtsp://127.0.0.1:8554/camera`；同一局域网内的 T4 使用 Mac 的局域网 IP，例如：
 
 服务器中的 RTSP source：
 
 ```json
-{"type": "rtsp", "uri": "rtsp://192.168.1.20:8554/camera"}
+{"type": "rtsp", "uri": "rtsp://192.168.31.241:8554/camera"}
 ```
 
-若 T4 在云服务器或无法主动访问 Mac，可在 Mac 上建立 SSH 反向端口转发。此时 VLC 仍使用默认的 `127.0.0.1`，服务器搜索请求改为转发后的端口：
+常用参数可通过环境变量覆盖：
 
 ```bash
-# 在 Mac 上执行；18554 可换成服务器上的空闲端口
-ssh -N -T -o ExitOnForwardFailure=yes \
-  -R 18554:127.0.0.1:8554 user@t4-server
+LOCAL_RTSP_CAMERA_DEVICE=1 \
+LOCAL_RTSP_VIDEO_SIZE=1920x1080 \
+LOCAL_RTSP_FRAME_RATE=25 \
+./scripts/local_rtsp.sh restart
 ```
 
-```json
-{"type": "rtsp", "uri": "rtsp://127.0.0.1:18554/camera"}
-```
-
-无论哪种方式，先从 T4 服务器测试 RTSP 能否读取到一帧；直接跨公网暴露 RTSP 端口不建议用于测试之外的场景。
+完整参数列表使用 `./scripts/local_rtsp.sh help` 查看。无论哪种方式，都应先从 T4 服务器测试 RTSP 能否读取到一帧。
 
 验证 OpenCV 可以拉取一帧：
 
@@ -301,7 +305,7 @@ cap.release()
 PY
 ```
 
-VLC 占用摄像头期间，搜索请求应使用 RTSP source，不能同时使用 `camera/device_index=0`。
+FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时使用 `camera/device_index=0`。
 
 监控页面只提供 RTSP 视频源，默认地址为 `rtsp://192.168.31.241:8554/camera`。
 

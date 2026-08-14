@@ -12,6 +12,8 @@ class SearchStatus(StrEnum):
     INITIALIZING = "initializing"
     RUNNING = "running"
     SOURCE_LOST = "source_lost"
+    COMPLETED = "completed"
+    TIMED_OUT = "timed_out"
     STOPPED = "stopped"
     FAILED = "failed"
 
@@ -20,6 +22,11 @@ class MatchState(StrEnum):
     CANDIDATE = "candidate"
     CONFIRMED = "confirmed"
     LOST = "lost"
+
+
+class TargetSearchStatus(StrEnum):
+    SEARCHING = "searching"
+    FOUND = "found"
 
 
 class SourceType(StrEnum):
@@ -47,9 +54,17 @@ class SearchCreate(BaseModel):
     source: SourceConfig
 
 
+class TargetSearchView(BaseModel):
+    target_id: str
+    name: str
+    status: TargetSearchStatus = TargetSearchStatus.SEARCHING
+    found_at: int | None = None
+    best_similarity: float | None = None
+
+
 class SearchView(BaseModel):
     search_id: str
-    target_id: str
+    target_id: str | None = None
     target_name: str = "目标"
     status: SearchStatus
     source: SourceConfig
@@ -58,6 +73,11 @@ class SearchView(BaseModel):
     p95_latency_ms: float = 0.0
     dropped_frames: int = 0
     error: str | None = None
+    targets: list[TargetSearchView] = Field(default_factory=list)
+    found_count: int = 0
+    total_count: int = 0
+    unfound_target_ids: list[str] = Field(default_factory=list)
+    timeout_seconds: float | None = None
 
 
 class TargetView(BaseModel):

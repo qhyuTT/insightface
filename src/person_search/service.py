@@ -25,6 +25,7 @@ from .domain import (
     SourceConfig,
     SourceType,
     Target,
+    TargetSearchView,
     TargetView,
     Track,
 )
@@ -88,21 +89,37 @@ class PreviewHub:
 @dataclass
 class SearchSession:
     search_id: str
-    target: Target
+    target: Target | None
     source: SourceConfig
     settings: Settings
     face_backend: FaceBackend
     person_detector: PersonDetector
-    on_finished: Callable[[str, str], None]
+    on_finished: Callable[[str, list[str]], None]
+    targets: list[Target] | None = None
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        if self.targets is None:
+            self.targets = [self.target] if self.target is not None else []
+        if not self.targets:
+            raise ValueError("at least one target is required")
+        if self.target is None:
+            self.target = self.targets[0]
         self.status = SearchStatus.INITIALIZING
         self.error: str | None = None
         self.metrics = SearchMetrics()
         self.events = EventHub()
         self.preview = PreviewHub()
         self._tracker = ByteTracker()
-        self._confirmation = TrackConfirmation(self.settings)
+        self._confirmations = {
+            target.target_id: TrackConfirmation(self.settings) for target in self.targets
+        }
+        self._all_targets = {target.target_id: target for target in self.targets}
+        self._active_targets = {target.target_id: target for target in self.targets}
+        self._target_status = {
+            target.target_id: {"status": "searching", "found_at": None, "best_similarity": None}
+            for target in self.targets
+        }
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._reader: LatestFrameReader | None = None
@@ -126,6 +143,15 @@ class SearchSession:
     def view(self) -> SearchView:
         with self._lock:
             metrics = self.metrics.snapshot()
+            target_views = [
+                TargetSearchView(
+                    target_id=target.target_id,
+                    name=target.name,
+                    **self._target_status[target.target_id],
+                )
+                for target in self.targets
+            ]
+            found_count = sum(item.status == "found" for item in target_views)
             return SearchView(
                 search_id=self.search_id,
                 target_id=self.target.target_id,
@@ -134,6 +160,13 @@ class SearchSession:
                 source=_sanitize_source(self.source),
                 provider=f"face={self.face_backend.provider_name},person={self.person_detector.provider_name}",
                 error=self.error,
+                targets=target_views,
+                found_count=found_count,
+                total_count=len(target_views),
+                unfound_target_ids=[
+                    item.target_id for item in target_views if item.status != "found"
+                ],
+                timeout_seconds=self.timeout_seconds,
                 **metrics,
             )
 
@@ -149,22 +182,31 @@ class SearchSession:
         tracks: list[Track] = []
         last_person_at = -1e9
         last_face_at = -1e9
-        is_cuda = "CUDA" in (
-            self.face_backend.provider_name + self.person_detector.provider_name
-        )
+        is_cuda = "CUDA" in (self.face_backend.provider_name + self.person_detector.provider_name)
         person_hz = (
             self.settings.person_detection_hz_cuda
             if is_cuda
             else self.settings.person_detection_hz_cpu
         )
         face_hz = (
-            self.settings.face_detection_hz_cuda
-            if is_cuda
-            else self.settings.face_detection_hz_cpu
+            self.settings.face_detection_hz_cuda if is_cuda else self.settings.face_detection_hz_cpu
         )
         try:
             reader.start()
             while not self._stop.is_set():
+                if (
+                    self.timeout_seconds is not None
+                    and time.monotonic() - self.metrics.started_at >= self.timeout_seconds
+                ):
+                    self._transition(SearchStatus.TIMED_OUT, None)
+                    self.events.publish(
+                        "search_timeout",
+                        {
+                            "search_id": self.search_id,
+                            "unfound_target_ids": list(self._active_targets),
+                        },
+                    )
+                    break
                 packet = reader.get(timeout=0.5)
                 if packet is None:
                     if reader.ended.is_set():
@@ -180,33 +222,75 @@ class SearchSession:
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
                     faces = self.face_backend.analyze(packet.frame, enrollment=False)
                     last_face_at = now
-                decisions = self._confirmation.process(
-                    frame_id=packet.frame_id,
-                    timestamp=now,
-                    frame_shape=packet.frame.shape,
-                    tracks=tracks,
-                    faces=faces,
-                    target=self.target,
-                )
-                for decision in decisions:
-                    event = SearchEvent(
-                        search_id=self.search_id,
-                        target_id=self.target.target_id,
-                        target_name=self.target.name,
-                        state=decision.state,
-                        timestamp_ms=int(time.time() * 1000),
-                        track_id=decision.track_id,
-                        bbox=normalize_bbox(decision.bbox, packet.frame.shape),
-                        similarity=decision.similarity,
-                        quality=decision.quality,
-                        evidence_count=decision.evidence_count,
-                        model=self.face_backend.model_name,
-                    )
-                    self.events.publish(decision.state.value, event.model_dump(mode="json"))
-                self._track_states = {
-                    track_id: (state.value, similarity)
-                    for track_id, (state, similarity) in self._confirmation.active_track_states().items()
+                faces_by_target: dict[str, list[FaceObservation]] = {
+                    target_id: [] for target_id in self._active_targets
                 }
+                for face in faces:
+                    if not face.accepted or not self._active_targets:
+                        continue
+                    target_id, similarity = max(
+                        (
+                            (target_id, float(np.dot(target.embedding, face.embedding)))
+                            for target_id, target in self._all_targets.items()
+                        ),
+                        key=lambda item: item[1],
+                    )
+                    if (
+                        target_id in self._active_targets
+                        and similarity >= self.settings.similarity_threshold
+                    ):
+                        faces_by_target[target_id].append(face)
+
+                track_states: dict[int, tuple[str, float]] = {}
+                for target_id, target in list(self._active_targets.items()):
+                    confirmation = self._confirmations[target_id]
+                    decisions = confirmation.process(
+                        frame_id=packet.frame_id,
+                        timestamp=now,
+                        frame_shape=packet.frame.shape,
+                        tracks=tracks,
+                        faces=faces_by_target[target_id],
+                        target=target,
+                    )
+                    for decision in decisions:
+                        event = SearchEvent(
+                            search_id=self.search_id,
+                            target_id=target.target_id,
+                            target_name=target.name,
+                            state=decision.state,
+                            timestamp_ms=int(time.time() * 1000),
+                            track_id=decision.track_id,
+                            bbox=normalize_bbox(decision.bbox, packet.frame.shape),
+                            similarity=decision.similarity,
+                            quality=decision.quality,
+                            evidence_count=decision.evidence_count,
+                            model=self.face_backend.model_name,
+                        )
+                        payload = event.model_dump(mode="json")
+                        self.events.publish(decision.state.value, payload)
+                        with self._lock:
+                            current = self._target_status[target_id]
+                            current["best_similarity"] = max(
+                                decision.similarity, current["best_similarity"] or -1.0
+                            )
+                            if decision.state.value == "confirmed":
+                                current["status"] = "found"
+                                current["found_at"] = payload["timestamp_ms"]
+                                self.events.publish("target_found", payload)
+                                self._active_targets.pop(target_id, None)
+                    for track_id, (state, similarity) in confirmation.active_track_states().items():
+                        previous = track_states.get(track_id)
+                        if (
+                            previous is None
+                            or state.value == "confirmed"
+                            or previous[0] != "confirmed"
+                        ):
+                            track_states[track_id] = (state.value, similarity)
+                self._track_states = track_states
+                if not self._active_targets:
+                    self._transition(SearchStatus.COMPLETED, None)
+                    self.events.publish("all_found", {"search_id": self.search_id})
+                    break
                 self._publish_preview(packet.frame, tracks, faces)
                 self.metrics.frame_count += 1
                 self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
@@ -214,9 +298,14 @@ class SearchSession:
             self._transition(SearchStatus.FAILED, _safe_error(exc))
         finally:
             reader.stop()
-            if self.status not in (SearchStatus.FAILED, SearchStatus.STOPPED):
+            if self.status not in (
+                SearchStatus.FAILED,
+                SearchStatus.STOPPED,
+                SearchStatus.COMPLETED,
+                SearchStatus.TIMED_OUT,
+            ):
                 self._transition(SearchStatus.STOPPED, None)
-            self.on_finished(self.search_id, self.target.target_id)
+            self.on_finished(self.search_id, [target.target_id for target in self.targets])
 
     def _publish_preview(
         self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
@@ -232,9 +321,7 @@ class SearchSession:
             else:
                 continue
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 3)
-            (text_width, text_height), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2
-            )
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
             top = max(0, y1 - text_height - 12)
             cv2.rectangle(canvas, (x1, top), (x1 + text_width + 14, y1), color, -1)
             cv2.putText(
@@ -260,7 +347,12 @@ class SearchSession:
 
     def _transition(self, status: SearchStatus, error: str | None) -> None:
         with self._lock:
-            if self.status in (SearchStatus.STOPPED, SearchStatus.FAILED):
+            if self.status in (
+                SearchStatus.STOPPED,
+                SearchStatus.FAILED,
+                SearchStatus.COMPLETED,
+                SearchStatus.TIMED_OUT,
+            ):
                 return
             if status == self.status and error == self.error:
                 return
@@ -324,7 +416,7 @@ class SearchManager:
         with self._lock:
             if self._active_search_id:
                 session = self._sessions[self._active_search_id]
-                if session.target.target_id == target_id:
+                if any(target.target_id == target_id for target in session.targets):
                     raise PersonSearchError(
                         "target is used by an active search", code="target_in_use", status_code=409
                     )
@@ -338,10 +430,31 @@ class SearchManager:
         return target
 
     def start_search(self, target_id: str, source: SourceConfig) -> SearchView:
+        return self.start_batch_search([target_id], source)
+
+    def start_batch_search(
+        self,
+        target_ids: list[str],
+        source: SourceConfig,
+        timeout_seconds: float | None = None,
+    ) -> SearchView:
+        if not target_ids:
+            raise PersonSearchError(
+                "at least one target is required", code="invalid_targets", status_code=422
+            )
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise PersonSearchError(
+                "timeout_seconds must be positive", code="invalid_timeout", status_code=422
+            )
         with self._lock:
-            target = self._targets.get(target_id)
-            if target is None:
-                raise PersonSearchError("target not found", code="target_not_found", status_code=404)
+            targets: list[Target] = []
+            for target_id in target_ids:
+                target = self._targets.get(target_id)
+                if target is None:
+                    raise PersonSearchError(
+                        "target not found", code="target_not_found", status_code=404
+                    )
+                targets.append(target)
             if self._active_search_id is not None:
                 raise PersonSearchError(
                     "only one search may run at a time",
@@ -354,12 +467,14 @@ class SearchManager:
             search_id = str(uuid.uuid4())
             session = SearchSession(
                 search_id=search_id,
-                target=target,
+                target=targets[0],
                 source=source,
                 settings=self.settings,
                 face_backend=self.face_backend,
                 person_detector=self.person_detector,
                 on_finished=self._on_finished,
+                targets=targets,
+                timeout_seconds=timeout_seconds,
             )
             self._sessions[search_id] = session
             self._active_search_id = search_id
@@ -390,11 +505,12 @@ class SearchManager:
             raise PersonSearchError("search not found", code="search_not_found", status_code=404)
         return session
 
-    def _on_finished(self, search_id: str, target_id: str) -> None:
+    def _on_finished(self, search_id: str, target_ids: list[str]) -> None:
         with self._lock:
             if self._active_search_id == search_id:
                 self._active_search_id = None
-            self._targets.pop(target_id, None)
+            for target_id in target_ids:
+                self._targets.pop(target_id, None)
 
 
 def _sanitize_source(source: SourceConfig) -> SourceConfig:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -22,12 +23,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import Settings, get_settings
-from .domain import SearchCreate, SearchView, SourceType, TargetView
+from .domain import SearchCreate, SearchView, SourceConfig, SourceType, TargetView
 from .errors import PersonSearchError
 from .service import SearchManager
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
+MAX_BATCH_TARGETS = 20
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
@@ -120,6 +122,111 @@ def create_app(
                 )
         return await asyncio.to_thread(manager.start_search, request.target_id, request.source)
 
+    @app.post("/v1/batch-searches", response_model=SearchView, status_code=201)
+    async def create_batch_search(
+        targets: Annotated[str, Form()],
+        source: Annotated[str, Form()],
+        images: Annotated[list[UploadFile], File()],
+        timeout_seconds: Annotated[float | None, Form()] = None,
+    ) -> SearchView:
+        try:
+            target_specs = json.loads(targets)
+            source_data = json.loads(source)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise PersonSearchError(
+                "targets and source must be valid JSON",
+                code="invalid_batch_request",
+                status_code=422,
+            ) from exc
+        if not isinstance(target_specs, list) or not target_specs:
+            raise PersonSearchError(
+                "targets must be a non-empty JSON array", code="invalid_targets", status_code=422
+            )
+        if len(target_specs) > MAX_BATCH_TARGETS:
+            raise PersonSearchError(
+                f"at most {MAX_BATCH_TARGETS} targets are allowed",
+                code="too_many_targets",
+                status_code=422,
+            )
+        if len(images) != len(target_specs):
+            raise PersonSearchError(
+                "each target must have exactly one image",
+                code="image_target_mismatch",
+                status_code=422,
+            )
+        try:
+            request_source = SourceConfig.model_validate(source_data)
+        except (
+            Exception
+        ) as exc:  # pydantic's detailed errors are not part of the public API contract
+            raise PersonSearchError(
+                "invalid source", code="invalid_source", status_code=422
+            ) from exc
+        if request_source.type == SourceType.FILE:
+            raise PersonSearchError(
+                "file sources are supported by person-search-eval, not the live API",
+                code="invalid_source",
+                status_code=422,
+            )
+        if request_source.type == SourceType.RTSP:
+            scheme = urlsplit(request_source.uri or "").scheme.lower()
+            if scheme not in {"rtsp", "rtsps"}:
+                raise PersonSearchError(
+                    "RTSP source URI must use rtsp:// or rtsps://",
+                    code="invalid_source",
+                    status_code=422,
+                )
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise PersonSearchError(
+                "timeout_seconds must be positive", code="invalid_timeout", status_code=422
+            )
+
+        specs_by_filename: dict[str, dict[str, Any]] = {}
+        for spec in target_specs:
+            if not isinstance(spec, dict) or not isinstance(spec.get("name"), str):
+                raise PersonSearchError(
+                    "each target must contain a name and image_filename",
+                    code="invalid_targets",
+                    status_code=422,
+                )
+            filename = spec.get("image_filename")
+            if (
+                not isinstance(filename, str)
+                or not filename.strip()
+                or filename in specs_by_filename
+            ):
+                raise PersonSearchError(
+                    "image_filename values must be non-empty and unique",
+                    code="invalid_targets",
+                    status_code=422,
+                )
+            specs_by_filename[filename] = spec
+
+        enrolled_ids: list[str] = []
+        try:
+            for image in images:
+                filename = Path(image.filename or "").name
+                spec = specs_by_filename.get(filename)
+                if spec is None:
+                    raise PersonSearchError(
+                        f"uploaded image {filename!r} is not declared in targets",
+                        code="image_target_mismatch",
+                        status_code=422,
+                    )
+                frame = await _decode_upload(image)
+                target = await asyncio.to_thread(manager.enroll, frame, spec["name"])
+                enrolled_ids.append(target.target_id)
+            return await asyncio.to_thread(
+                manager.start_batch_search, enrolled_ids, request_source, timeout_seconds
+            )
+        except Exception:
+            for target_id in enrolled_ids:
+                try:
+                    manager.delete_target(target_id)
+                except PersonSearchError:
+                    pass
+            raise
+
     @app.get("/v1/searches/{search_id}", response_model=SearchView)
     async def get_search(search_id: str) -> SearchView:
         return manager.get_search(search_id)
@@ -138,7 +245,7 @@ def create_app(
                 seq, jpeg = await asyncio.to_thread(session.preview.after, seq, 1.0)
                 if jpeg is not None:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-                if session.status.value in {"stopped", "failed"} and jpeg is None:
+                if session.status.value in {"completed", "timed_out", "stopped", "failed"} and jpeg is None:
                     return
 
         return StreamingResponse(
@@ -168,7 +275,7 @@ def create_app(
                     event["search_id"] = search_id
                     await websocket.send_json(event)
                     seq = int(event["seq"])
-                if session.status.value in {"stopped", "failed"} and not events:
+                if session.status.value in {"completed", "timed_out", "stopped", "failed"} and not events:
                     await websocket.close(code=1000)
                     return
         except WebSocketDisconnect:
@@ -182,3 +289,28 @@ def _problem(status: int, code: str, message: str, fields: Any = None) -> JSONRe
     if fields is not None:
         detail["fields"] = fields
     return JSONResponse(status_code=status, content={"detail": detail})
+
+
+async def _decode_upload(image: UploadFile) -> np.ndarray:
+    if image.content_type not in ALLOWED_IMAGE_TYPES:
+        raise PersonSearchError(
+            "supported image types are JPEG, PNG, and WebP",
+            code="unsupported_media_type",
+            status_code=415,
+        )
+    payload = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise PersonSearchError(
+            "image exceeds the 10 MiB limit", code="image_too_large", status_code=413
+        )
+    array = np.frombuffer(payload, dtype=np.uint8)
+    frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise PersonSearchError(
+            "image cannot be decoded", code="image_decode_failed", status_code=422
+        )
+    if frame.shape[0] * frame.shape[1] > MAX_IMAGE_PIXELS:
+        raise PersonSearchError(
+            "decoded image exceeds the pixel limit", code="image_too_large", status_code=413
+        )
+    return frame

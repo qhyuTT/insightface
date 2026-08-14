@@ -49,11 +49,13 @@
     .controls { padding: 24px; align-self: start; }
     h2 { font: 600 14px Georgia, serif; letter-spacing: .14em; margin: 0 0 18px; }
     label { display: block; color: var(--muted); font: 10px Menlo, monospace; letter-spacing: .08em; margin: 16px 0 7px; text-transform: uppercase; }
-    input[type="text"], select {
+    input[type="text"], input[type="number"], textarea {
       width: 100%; border: 1px solid var(--line); background: #07100e; color: var(--paper);
       padding: 12px; outline: none; font: 12px Menlo, monospace;
     }
-    input:focus, select:focus { border-color: var(--signal); }
+    input:focus, textarea:focus { border-color: var(--signal); }
+    textarea { resize: vertical; min-height: 78px; }
+    .batch-tools input[type="file"] { width: 100%; color: var(--muted); font: 11px Menlo, monospace; }
     .file-drop { border: 1px dashed #52665e; min-height: 144px; display: grid; place-items: center; position: relative; overflow: hidden; cursor: pointer; }
     .file-drop:hover { border-color: var(--signal); }
     .file-drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
@@ -65,6 +67,7 @@
     button.secondary { background: transparent; color: var(--paper); border: 1px solid var(--line); }
     button.danger { color: var(--danger); border-color: #65342f; }
     .target-id { font: 10px Menlo, monospace; color: var(--found); overflow-wrap: anywhere; min-height: 28px; margin: 10px 0 0; }
+    #batchInfo { white-space: pre-line; line-height: 1.8; }
     .stage { min-width: 0; }
     .viewport { aspect-ratio: 16/9; background: #020504; display: grid; place-items: center; overflow: hidden; position: relative; }
     .viewport img { width: 100%; height: 100%; object-fit: contain; display: none; }
@@ -111,11 +114,18 @@
         </div>
         <button id="enrollBtn" disabled>01 · 登记目标</button>
         <div class="target-id" id="targetInfo">尚未登记目标</div>
+        <div class="batch-tools">
+          <label for="batchNames">批量目标姓名（每行一个，与照片顺序对应）</label>
+          <textarea id="batchNames" rows="3" maxlength="1600" placeholder="张三\n李四"></textarea>
+          <label for="batchFiles">批量目标照片（最多 20 张）</label>
+          <input id="batchFiles" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+          <input id="batchTimeout" type="number" min="1" step="1" placeholder="超时秒数（可选）">
+          <button id="batchStartBtn" class="secondary" disabled>批量上传并开始</button>
+          <div class="target-id" id="batchInfo"></div>
+        </div>
 
-        <label for="sourceType">视频源</label>
-        <select id="sourceType"><option value="rtsp">RTSP 网络流</option><option value="camera">本机摄像头</option></select>
-        <div id="rtspFields"><label for="rtspUri">RTSP URI</label><input id="rtspUri" type="text" value="rtsp://127.0.0.1:8554/camera"></div>
-        <div id="cameraFields" style="display:none"><label for="cameraIndex">设备编号</label><input id="cameraIndex" type="text" value="0"></div>
+        <label for="rtspUri">RTSP URI</label>
+        <input id="rtspUri" type="text" value="rtsp://192.168.31.241:8554/camera">
         <button id="startBtn" disabled>02 · 开始实时寻找</button>
         <button id="stopBtn" class="secondary danger" disabled>停止本次搜索</button>
         <div class="notice" id="notice"></div>
@@ -148,12 +158,15 @@
 
     function fail(message) { $('notice').textContent = message; }
     function setState(status) {
-      $('globalState').textContent = ({running:'实时检测中', source_lost:'视频源断开', failed:'任务失败', stopped:'已停止', initializing:'正在连接'}[status] || '待命');
+      $('globalState').textContent = ({running:'实时检测中', source_lost:'视频源断开', failed:'任务失败', stopped:'已停止', initializing:'正在连接', completed:'全部找到', timed_out:'搜索超时'}[status] || '待命');
       $('statusMetric').textContent = (status || 'idle').toUpperCase();
       $('liveDot').classList.toggle('running', status === 'running');
       if (status === 'running') { $('scanline').style.display = 'block'; $('banner').textContent = '● 正在寻找目标'; }
     }
     function problem(body, fallback) { return body?.detail?.message || fallback; }
+    function renderTargets(targets = []) {
+      $('batchInfo').textContent = targets.map(item => `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}`).join('\n');
+    }
 
     function updateEnrollAvailability() {
       $('enrollBtn').disabled = !$('targetFile').files[0] || !$('targetName').value.trim();
@@ -164,10 +177,13 @@
       updateEnrollAvailability();
       if (file) { $('targetPreview').src = URL.createObjectURL(file); $('targetPreview').style.display = 'block'; $('dropCopy').style.display = 'none'; }
     });
-    $('sourceType').addEventListener('change', () => {
-      const rtsp = $('sourceType').value === 'rtsp';
-      $('rtspFields').style.display = rtsp ? 'block' : 'none'; $('cameraFields').style.display = rtsp ? 'none' : 'block';
-    });
+    function updateBatchAvailability() {
+      const names = $('batchNames').value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+      const files = [...$('batchFiles').files];
+      $('batchStartBtn').disabled = !!searchId || !names.length || names.length !== files.length || names.length > 20;
+    }
+    $('batchNames').addEventListener('input', updateBatchAvailability);
+    $('batchFiles').addEventListener('change', updateBatchAvailability);
     $('enrollBtn').addEventListener('click', async () => {
       fail(''); $('enrollBtn').disabled = true; $('enrollBtn').textContent = '正在分析人脸…';
       const data = new FormData(); data.append('name', $('targetName').value.trim()); data.append('image', $('targetFile').files[0]);
@@ -178,15 +194,34 @@
         $('startBtn').disabled = false; $('enrollBtn').textContent = '✓ 目标已登记';
       } catch (error) { fail(error.message); $('enrollBtn').disabled = false; $('enrollBtn').textContent = '01 · 重新登记'; }
     });
+    $('batchStartBtn').addEventListener('click', async () => {
+      fail(''); $('batchStartBtn').disabled = true;
+      const names = $('batchNames').value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
+      const files = [...$('batchFiles').files];
+      const data = new FormData();
+      data.append('targets', JSON.stringify(names.map((name, index) => ({name, image_filename: files[index].name}))));
+      data.append('source', JSON.stringify({type:'rtsp', uri:$('rtspUri').value.trim()}));
+      if ($('batchTimeout').value) data.append('timeout_seconds', $('batchTimeout').value);
+      files.forEach(file => data.append('images', file));
+      try {
+        const response = await fetch('/v1/batch-searches', {method:'POST', body:data});
+        const body = await response.json(); if (!response.ok) throw new Error(problem(body, '批量搜索启动失败'));
+        searchId = body.search_id; targetName = `${body.found_count}/${body.total_count} 人`; bestSimilarity = -1;
+        renderTargets(body.targets); updateBatchAvailability();
+        $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
+        $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
+        $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
+        connectEvents(); pollStatus();
+      } catch (error) { fail(error.message); $('batchStartBtn').disabled = false; }
+    });
     $('startBtn').addEventListener('click', async () => {
       fail(''); $('startBtn').disabled = true;
-      const source = $('sourceType').value === 'rtsp'
-        ? {type:'rtsp', uri:$('rtspUri').value.trim()}
-        : {type:'camera', device_index:Number($('cameraIndex').value)};
+      const source = {type:'rtsp', uri:$('rtspUri').value.trim()};
       try {
         const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, source})});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));
         searchId = body.search_id; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
+        updateBatchAvailability();
         $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
         $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
         connectEvents(); pollStatus();
@@ -200,6 +235,7 @@
       if (socket) socket.close(); clearTimeout(pollTimer); setState('stopped');
       $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('emptyState').style.display = 'block'; $('scanline').style.display = 'none';
       $('stopBtn').disabled = true; $('startBtn').disabled = true; targetId = null; targetName = ''; searchId = null; bestSimilarity = -1;
+      renderTargets();
       $('targetInfo').textContent = '任务已结束，请重新登记目标'; $('banner').textContent = '● 已停止';
     }
     function connectEvents() {
@@ -211,7 +247,8 @@
         if (event.type === 'candidate' || event.type === 'confirmed') {
           bestSimilarity = Math.max(bestSimilarity, event.data.similarity); $('similarityMetric').textContent = bestSimilarity.toFixed(3);
         }
-        if (event.type === 'confirmed') { $('banner').textContent = `✓ 已找到 · ${event.data.target_name || targetName} · 轨迹 #${event.data.track_id}`; $('banner').classList.add('found'); }
+        if (event.type === 'confirmed' || event.type === 'target_found') { $('banner').textContent = `✓ 已找到 · ${event.data.target_name || targetName} · 轨迹 #${event.data.track_id}`; $('banner').classList.add('found'); }
+        if (event.type === 'all_found') { $('banner').textContent = '✓ 全部目标已找到'; $('banner').classList.add('found'); }
         if (event.type === 'lost') { $('banner').textContent = '● 目标暂时离开画面'; $('banner').classList.remove('found'); }
       };
     }
@@ -228,10 +265,17 @@
     }
     async function pollStatus() {
       if (!searchId) return;
+      let terminal = false;
       try {
         const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
-        if (response.ok) { setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`; if (body.error) fail(body.error); }
-      } finally { pollTimer = setTimeout(pollStatus, 1200); }
+        if (response.ok) {
+          setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
+          if (body.total_count) { targetName = `${body.found_count}/${body.total_count} 人`; renderTargets(body.targets); }
+          if (body.error) fail(body.error);
+          terminal = ['completed', 'timed_out', 'stopped', 'failed'].includes(body.status);
+          if (terminal) { $('stopBtn').disabled = true; $('scanline').style.display = 'none'; searchId = null; updateBatchAvailability(); }
+        }
+      } finally { if (!terminal) pollTimer = setTimeout(pollStatus, 1200); }
     }
   </script>
 </body>

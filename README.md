@@ -15,7 +15,7 @@ RTSP / USB
   -> REST + WebSocket API
 ```
 
-首版一次只允许一个搜索任务。目标照片和 embedding 只保存在进程内存，搜索停止后自动清除。RTSP URI 在 API 响应中会脱敏。
+服务一次只运行一个搜索任务，每个任务可包含最多 20 个目标。目标照片和 embedding 只保存在进程内存，搜索停止后自动清除。RTSP URI 在 API 响应中会脱敏。
 
 InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近距离大脸，640 负责视频中的较小人脸。可用 `PERSON_SEARCH_FACE_DETECTION_SIZE` 强制单一尺寸，但通常不建议覆盖默认值。
 
@@ -303,10 +303,13 @@ PY
 
 VLC 占用摄像头期间，搜索请求应使用 RTSP source，不能同时使用 `camera/device_index=0`。
 
+监控页面只提供 RTSP 视频源，默认地址为 `rtsp://192.168.31.241:8554/camera`。
+
 主要接口：
 
 - `POST /v1/targets`：multipart 字段 `name` 和 `image`；姓名必填，照片必须恰好包含一张质量合格的人脸。姓名会出现在监控页的找到横幅和事件列表中。
 - `POST /v1/searches`：启动 RTSP 或 USB 搜索。
+- `POST /v1/batch-searches`：一次上传最多 20 组姓名与照片并启动异步搜索。
 - `GET /v1/searches/{search_id}`：查询状态、provider、FPS 和 P95 延迟。
 - `GET /v1/searches/{search_id}/preview.mjpg`：获取后端画框后的实时 MJPEG 预览。
 - `WS /v1/searches/{search_id}/events?after_seq=0`：订阅 `candidate`、`confirmed`、`lost` 和 `search_status`。
@@ -337,6 +340,21 @@ USB 摄像头使用：
   "source": {"type": "camera", "device_index": 0}
 }
 ```
+
+批量接口使用 `multipart/form-data`。`targets` 与 `source` 是 JSON 字符串，`images`
+为重复文件字段；`image_filename` 必须与上传文件名一致：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/batch-searches \
+  -F 'targets=[{"name":"张三","image_filename":"zhangsan.jpg"},{"name":"李四","image_filename":"lisi.jpg"}]' \
+  -F 'source={"type":"rtsp","uri":"rtsp://192.168.31.241:8554/camera"}' \
+  -F 'images=@zhangsan.jpg' \
+  -F 'images=@lisi.jpg'
+```
+
+接口立即返回 `search_id`。每个目标首次确认后发布 `target_found`，并从后续匹配名单中移除；
+其他未找到目标继续搜索。全部找到后发布 `all_found` 并进入 `completed`。可选的
+`timeout_seconds` 超时后会进入 `timed_out`，查询响应中的 `unfound_target_ids` 给出未找到名单。
 
 ## 离线视频验证
 

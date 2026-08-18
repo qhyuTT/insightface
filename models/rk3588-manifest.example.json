@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "target": "rk3588",
+  "compiler": {
+    "toolkit": "rknn-toolkit2",
+    "version": "replace-with-board-validated-version"
+  },
+  "runtime": {
+    "package": "rknn-toolkit-lite2",
+    "version": "replace-with-board-validated-version",
+    "python": "replace-with-board-python-version"
+  },
+  "models": [
+    {
+      "name": "yolox_tiny",
+      "file": "yolox_tiny.rknn",
+      "sha256": "replace-with-sha256",
+      "precision": "int8",
+      "input": {
+        "shape": [1, 3, 416, 416],
+        "layout": "nchw",
+        "dtype": "float32",
+        "color_order": "bgr",
+        "value_range": [0, 255],
+        "letterbox_pad": 114
+      },
+      "output": {
+        "shape": [1, 3549, 85],
+        "dtype": "float32-dequantized",
+        "contract": "fused-raw-yolox"
+      }
+    },
+    {
+      "name": "scrfd",
+      "file": "scrfd.rknn",
+      "sha256": "replace-with-sha256",
+      "precision": "fp16-or-int8",
+      "input": "fixed-shape-see-conversion-report",
+      "output_contract": "scrfd-validated-adapter"
+    },
+    {
+      "name": "arcface",
+      "file": "arcface.rknn",
+      "sha256": "replace-with-sha256",
+      "precision": "fp16-or-int8",
+      "input": [1, 3, 112, 112],
+      "output_contract": "normalized_embedding"
+    }
+  ]
+}

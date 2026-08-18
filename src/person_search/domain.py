@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 from pydantic import BaseModel, Field, model_validator
@@ -71,7 +72,9 @@ class SearchView(BaseModel):
     provider: str | None = None
     processed_fps: float = 0.0
     p95_latency_ms: float = 0.0
+    p95_frame_age_ms: float = 0.0
     dropped_frames: int = 0
+    source_reconnects: int = 0
     error: str | None = None
     targets: list[TargetSearchView] = Field(default_factory=list)
     found_count: int = 0
@@ -138,10 +141,32 @@ class Target:
 
 @dataclass(slots=True)
 class SearchMetrics:
+    # Keep enough samples for a stable P95 while preventing a long-running
+    # edge process from retaining one latency value per frame forever.
+    MAX_LATENCY_SAMPLES: ClassVar[int] = 1000
+
     frame_count: int = 0
     dropped_frames: int = 0
+    source_reconnects: int = 0
     started_at: float = 0.0
-    latencies_ms: list[float] = field(default_factory=list)
+    latencies_ms: deque[float] = field(
+        default_factory=lambda: deque(maxlen=SearchMetrics.MAX_LATENCY_SAMPLES)
+    )
+    frame_age_ms: deque[float] = field(
+        default_factory=lambda: deque(maxlen=SearchMetrics.MAX_LATENCY_SAMPLES)
+    )
+
+    def __post_init__(self) -> None:
+        # Accept a list (or an unbounded deque) from callers for backwards
+        # compatibility, but normalize it to the bounded representation.
+        if not isinstance(self.latencies_ms, deque) or (
+            self.latencies_ms.maxlen != self.MAX_LATENCY_SAMPLES
+        ):
+            self.latencies_ms = deque(self.latencies_ms, maxlen=self.MAX_LATENCY_SAMPLES)
+        if not isinstance(self.frame_age_ms, deque) or (
+            self.frame_age_ms.maxlen != self.MAX_LATENCY_SAMPLES
+        ):
+            self.frame_age_ms = deque(self.frame_age_ms, maxlen=self.MAX_LATENCY_SAMPLES)
 
     def snapshot(self) -> dict[str, Any]:
         if not self.started_at:
@@ -150,5 +175,14 @@ class SearchMetrics:
             import time
 
             fps = self.frame_count / max(time.monotonic() - self.started_at, 1e-6)
-        p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
-        return {"processed_fps": fps, "p95_latency_ms": p95, "dropped_frames": self.dropped_frames}
+        samples = list(self.latencies_ms)
+        p95 = float(np.percentile(samples, 95)) if samples else 0.0
+        age_samples = list(self.frame_age_ms)
+        p95_age = float(np.percentile(age_samples, 95)) if age_samples else 0.0
+        return {
+            "processed_fps": fps,
+            "p95_latency_ms": p95,
+            "p95_frame_age_ms": p95_age,
+            "dropped_frames": self.dropped_frames,
+            "source_reconnects": self.source_reconnects,
+        }

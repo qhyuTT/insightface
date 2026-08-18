@@ -14,7 +14,7 @@ import numpy as np
 
 from .backends import FaceBackend, InsightFaceBackend
 from .config import Settings
-from .confirmation import TrackConfirmation, normalize_bbox
+from .confirmation import TrackConfirmation, associate_faces_to_tracks, normalize_bbox
 from .detector import PersonDetector, YoloXOnnxDetector
 from .domain import (
     FaceObservation,
@@ -31,10 +31,15 @@ from .domain import (
 )
 from .errors import EnrollmentError, ModelUnavailableError, PersonSearchError
 from .quality import normalize_embedding
+from .rknn_backend import RknnFaceBackend, RknnPersonDetector
 from .tracker import ByteTracker
 from .video import LatestFrameReader
 
 MAX_TARGET_NAME_LENGTH = 80
+# Terminal sessions are kept as lightweight, read-only archives so clients can
+# still fetch the final status/events immediately after a search finishes.  The
+# active-session map itself must not retain an unbounded number of sessions.
+MAX_FINISHED_SESSIONS = 32
 
 
 class EventHub:
@@ -114,7 +119,6 @@ class SearchSession:
         self._confirmations = {
             target.target_id: TrackConfirmation(self.settings) for target in self.targets
         }
-        self._all_targets = {target.target_id: target for target in self.targets}
         self._active_targets = {target.target_id: target for target in self.targets}
         self._target_status = {
             target.target_id: {"status": "searching", "found_at": None, "best_similarity": None}
@@ -125,6 +129,8 @@ class SearchSession:
         self._reader: LatestFrameReader | None = None
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
+        self._sensitive_data_released = False
+        self._last_preview_at = -1e9
 
     def start(self) -> None:
         self._worker = threading.Thread(
@@ -170,6 +176,31 @@ class SearchSession:
                 **metrics,
             )
 
+    def release_sensitive_data(self) -> None:
+        """Drop per-search inference state once the worker has terminated.
+
+        A finished session can remain available briefly for the status/events
+        endpoints, but it must not keep enrolled face embeddings, tracker
+        arrays, or other inference-only state alive indefinitely.
+        """
+
+        with self._lock:
+            if self._sensitive_data_released:
+                return
+            for target in self.targets:
+                embedding = np.asarray(target.embedding)
+                # Best-effort scrubbing also protects callers that still hold
+                # a reference to the original Target object/array.
+                if embedding.flags.writeable:
+                    embedding.fill(0)
+                target.embedding = np.empty(0, dtype=np.float32)
+            self._active_targets.clear()
+            self._confirmations.clear()
+            self._tracker.reset()
+            self._track_states.clear()
+            self._reader = None
+            self._sensitive_data_released = True
+
     def _run(self) -> None:
         self.metrics.started_at = time.monotonic()
         reader = LatestFrameReader(
@@ -182,14 +213,25 @@ class SearchSession:
         tracks: list[Track] = []
         last_person_at = -1e9
         last_face_at = -1e9
-        is_cuda = "CUDA" in (self.face_backend.provider_name + self.person_detector.provider_name)
-        person_hz = (
-            self.settings.person_detection_hz_cuda
-            if is_cuda
-            else self.settings.person_detection_hz_cpu
+        def provider_rate(provider: str, cpu: float, cuda: float, rknn: float) -> float:
+            normalized = provider.upper()
+            if "RKNN" in normalized:
+                return rknn
+            if "CUDA" in normalized:
+                return cuda
+            return cpu
+
+        person_hz = provider_rate(
+            self.person_detector.provider_name,
+            self.settings.person_detection_hz_cpu,
+            self.settings.person_detection_hz_cuda,
+            self.settings.person_detection_hz_rknn,
         )
-        face_hz = (
-            self.settings.face_detection_hz_cuda if is_cuda else self.settings.face_detection_hz_cpu
+        face_hz = provider_rate(
+            self.face_backend.provider_name,
+            self.settings.face_detection_hz_cpu,
+            self.settings.face_detection_hz_cuda,
+            self.settings.face_detection_hz_rknn,
         )
         try:
             reader.start()
@@ -214,6 +256,9 @@ class SearchSession:
                     continue
                 started = time.monotonic()
                 now = packet.captured_at
+                self.metrics.frame_age_ms.append(
+                    max(0.0, (time.monotonic() - packet.captured_at) * 1000.0)
+                )
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
                     detections = self.person_detector.detect(packet.frame)
                     tracks = self._tracker.update(detections)
@@ -222,28 +267,20 @@ class SearchSession:
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
                     faces = self.face_backend.analyze(packet.frame, enrollment=False)
                     last_face_at = now
-                faces_by_target: dict[str, list[FaceObservation]] = {
-                    target_id: [] for target_id in self._active_targets
-                }
-                for face in faces:
-                    if not face.accepted or not self._active_targets:
-                        continue
-                    target_id, similarity = max(
-                        (
-                            (target_id, float(np.dot(target.embedding, face.embedding)))
-                            for target_id, target in self._all_targets.items()
-                        ),
-                        key=lambda item: item[1],
-                    )
-                    if (
-                        target_id in self._active_targets
-                        and similarity >= self.settings.similarity_threshold
-                    ):
-                        faces_by_target[target_id].append(face)
+                faces_by_target = self._assign_faces_to_active_targets(faces)
+                face_track_associations = associate_faces_to_tracks(faces, tracks)
+                face_indices = {id(face): index for index, face in enumerate(faces)}
 
                 track_states: dict[int, tuple[str, float]] = {}
                 for target_id, target in list(self._active_targets.items()):
                     confirmation = self._confirmations[target_id]
+                    local_associations: dict[int, int] = {}
+                    for local_index, face in enumerate(faces_by_target[target_id]):
+                        original_index = face_indices.get(id(face))
+                        if original_index is not None:
+                            track_id = face_track_associations.get(original_index)
+                            if track_id is not None:
+                                local_associations[local_index] = track_id
                     decisions = confirmation.process(
                         frame_id=packet.frame_id,
                         timestamp=now,
@@ -251,6 +288,7 @@ class SearchSession:
                         tracks=tracks,
                         faces=faces_by_target[target_id],
                         target=target,
+                        face_track_associations=local_associations,
                     )
                     for decision in decisions:
                         event = SearchEvent(
@@ -287,13 +325,16 @@ class SearchSession:
                         ):
                             track_states[track_id] = (state.value, similarity)
                 self._track_states = track_states
-                if not self._active_targets:
+                all_targets_found = not self._active_targets
+                if self._preview_due(now):
+                    self._publish_preview(packet.frame, tracks, faces)
+                    self._last_preview_at = now
+                self.metrics.frame_count += 1
+                self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
+                if all_targets_found:
                     self._transition(SearchStatus.COMPLETED, None)
                     self.events.publish("all_found", {"search_id": self.search_id})
                     break
-                self._publish_preview(packet.frame, tracks, faces)
-                self.metrics.frame_count += 1
-                self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
         except Exception as exc:  # noqa: BLE001 - the worker must fail closed and release resources
             self._transition(SearchStatus.FAILED, _safe_error(exc))
         finally:
@@ -307,12 +348,63 @@ class SearchSession:
                 self._transition(SearchStatus.STOPPED, None)
             self.on_finished(self.search_id, [target.target_id for target in self.targets])
 
+    def _assign_faces_to_active_targets(
+        self, faces: list[FaceObservation]
+    ) -> dict[str, list[FaceObservation]]:
+        """Assign accepted faces to active targets with one matrix multiply.
+
+        Batch searches may contain up to twenty targets.  The previous nested
+        Python ``dot`` loop repeated work for every face; a small dense matrix
+        multiply is both faster on ARM and guarantees that a completed target
+        cannot win a face assignment.
+        """
+
+        active = list(self._active_targets.items())
+        result: dict[str, list[FaceObservation]] = {target_id: [] for target_id, _ in active}
+        accepted = [face for face in faces if face.accepted]
+        if not active or not accepted:
+            return result
+        target_ids = [target_id for target_id, _ in active]
+        target_embeddings = np.stack([target.embedding for _, target in active]).astype(
+            np.float32, copy=False
+        )
+        face_embeddings = np.stack([face.embedding for face in accepted]).astype(
+            np.float32, copy=False
+        )
+        similarities = face_embeddings @ target_embeddings.T
+        winners = np.argmax(similarities, axis=1)
+        best_scores = similarities[np.arange(len(accepted)), winners]
+        threshold = self.settings.similarity_threshold
+        for face, winner, similarity in zip(
+            accepted, winners.tolist(), best_scores.tolist(), strict=True
+        ):
+            if similarity >= threshold:
+                result[target_ids[winner]].append(face)
+        return result
+
     def _publish_preview(
         self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
     ) -> None:
-        canvas = frame.copy()
+        canvas = frame
+        scale = 1.0
+        settings = getattr(self, "settings", None)
+        max_width = int(getattr(settings, "preview_max_width", 960))
+        if max_width > 0 and frame.shape[1] > max_width:
+            scale = max_width / frame.shape[1]
+            canvas = cv2.resize(
+                frame,
+                (max_width, max(1, round(frame.shape[0] * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            # Drawing must never mutate the frame held by the capture queue.
+            canvas = frame.copy()
+
+        def scaled_box(box: np.ndarray) -> tuple[int, int, int, int]:
+            return tuple(round(float(value) * scale) for value in box)  # type: ignore[return-value]
+
         for track in tracks:
-            x1, y1, x2, y2 = (int(value) for value in track.bbox)
+            x1, y1, x2, y2 = scaled_box(track.bbox)
             state, similarity = self._track_states.get(track.track_id, ("tracking", 0.0))
             if state == "confirmed":
                 color, label = (60, 220, 95), f"FOUND  {similarity:.2f}"
@@ -321,7 +413,9 @@ class SearchSession:
             else:
                 continue
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 3)
-            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2)
+            (text_width, text_height), _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2
+            )
             top = max(0, y1 - text_height - 12)
             cv2.rectangle(canvas, (x1, top), (x1 + text_width + 14, y1), color, -1)
             cv2.putText(
@@ -335,11 +429,20 @@ class SearchSession:
                 cv2.LINE_AA,
             )
         for face in faces:
-            x1, y1, x2, y2 = (int(value) for value in face.bbox)
+            x1, y1, x2, y2 = scaled_box(face.bbox)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), (232, 232, 232), 1)
-        ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            canvas,
+            [cv2.IMWRITE_JPEG_QUALITY, int(getattr(settings, "preview_jpeg_quality", 82))],
+        )
         if ok:
             self.preview.publish(encoded.tobytes())
+
+    def _preview_due(self, timestamp: float) -> bool:
+        if not self.settings.preview_enabled or self.settings.preview_fps <= 0:
+            return False
+        return timestamp - self._last_preview_at >= 1.0 / self.settings.preview_fps
 
     def _on_drop(self) -> None:
         with self._lock:
@@ -358,6 +461,15 @@ class SearchSession:
                 return
             self.status = status
             self.error = error
+            if status == SearchStatus.SOURCE_LOST:
+                self.metrics.source_reconnects += 1
+                # Track IDs and evidence belong to the old video timeline;
+                # retaining them across a reconnect can produce a false
+                # confirmation when a different person appears first.
+                self._tracker.reset()
+                for confirmation in self._confirmations.values():
+                    confirmation.reset()
+                self._track_states.clear()
         self.events.publish(
             "search_status",
             {"search_id": self.search_id, "status": status.value, "error": error},
@@ -372,14 +484,23 @@ class SearchManager:
         person_detector: PersonDetector | None = None,
     ):
         self.settings = settings
-        self.face_backend = face_backend or InsightFaceBackend(settings)
-        self.person_detector = person_detector or YoloXOnnxDetector(settings)
+        if settings.inference_backend == "rknn":
+            self.face_backend = face_backend or RknnFaceBackend(settings)
+            self.person_detector = person_detector or RknnPersonDetector(settings)
+        else:
+            self.face_backend = face_backend or InsightFaceBackend(settings)
+            self.person_detector = person_detector or YoloXOnnxDetector(settings)
         self._targets: dict[str, Target] = {}
         self._sessions: dict[str, SearchSession] = {}
+        self._finished_sessions: dict[str, SearchSession] = {}
+        self._finished_session_order: deque[str] = deque()
         self._active_search_id: str | None = None
         self._lock = threading.RLock()
 
     def enroll(self, image: np.ndarray, name: str = "目标") -> TargetView:
+        with self._lock:
+            if len(self._targets) >= self.settings.max_enrolled_targets:
+                raise _target_capacity_error()
         target_name = _normalize_target_name(name)
         faces = self.face_backend.analyze(image, enrollment=True)
         if not faces:
@@ -407,6 +528,12 @@ class SearchManager:
             model=self.face_backend.model_name,
         )
         with self._lock:
+            # The expensive analysis runs outside the manager lock. Recheck
+            # here so simultaneous requests still cannot exceed the ceiling.
+            if len(self._targets) >= self.settings.max_enrolled_targets:
+                if embedding.flags.writeable:
+                    embedding.fill(0)
+                raise _target_capacity_error()
             self._targets[target_id] = Target(
                 target_id=target_id, embedding=embedding, view=view, name=target_name
             )
@@ -415,8 +542,10 @@ class SearchManager:
     def delete_target(self, target_id: str) -> bool:
         with self._lock:
             if self._active_search_id:
-                session = self._sessions[self._active_search_id]
-                if any(target.target_id == target_id for target in session.targets):
+                session = self._sessions.get(self._active_search_id)
+                if session is not None and any(
+                    target.target_id == target_id for target in session.targets
+                ):
                     raise PersonSearchError(
                         "target is used by an active search", code="target_in_use", status_code=409
                     )
@@ -428,6 +557,40 @@ class SearchManager:
         if target is None:
             raise PersonSearchError("target not found", code="target_not_found", status_code=404)
         return target
+
+    def readiness(self) -> tuple[bool, dict[str, Any]]:
+        """Load/check inference backends for an explicit readiness probe.
+
+        ``/healthz`` remains a cheap liveness endpoint.  This method is used by
+        ``/readyz`` and may perform model initialization, which is desirable
+        during deployment because a missing RKNN artifact should fail before a
+        search request arrives.
+        """
+
+        checks: dict[str, Any] = {
+            "backend": self.settings.inference_backend,
+            "face": {"provider": self.face_backend.provider_name, "ready": False},
+            "person": {"provider": self.person_detector.provider_name, "ready": False},
+        }
+        ready = True
+        for key, backend in (("face", self.face_backend), ("person", self.person_detector)):
+            ensure_ready = getattr(backend, "ensure_ready", None)
+            try:
+                if ensure_ready is not None:
+                    ensure_ready()
+                checks[key] = {
+                    "provider": backend.provider_name,
+                    "ready": True,
+                }
+            except Exception as exc:  # noqa: BLE001 - readiness must explain the failure
+                ready = False
+                checks[key] = {
+                    "provider": getattr(backend, "provider_name", "unknown"),
+                    "ready": False,
+                    "error": _safe_error(exc),
+                }
+        checks["ready"] = ready
+        return ready, checks
 
     def start_search(self, target_id: str, source: SourceConfig) -> SearchView:
         return self.start_batch_search([target_id], source)
@@ -496,11 +659,33 @@ class SearchManager:
         if active:
             self.stop_search(active)
         with self._lock:
+            for session in (*self._sessions.values(), *self._finished_sessions.values()):
+                session.release_sensitive_data()
             self._targets.clear()
+            self._sessions.clear()
+            self._finished_sessions.clear()
+            self._finished_session_order.clear()
+            self._active_search_id = None
+        # RKNN sessions own native runtime handles/NPU resources. Release them
+        # explicitly instead of relying on interpreter teardown, while keeping
+        # shutdown best-effort so one vendor backend cannot block the other.
+        released: set[int] = set()
+        for backend in (self.face_backend, self.person_detector):
+            if id(backend) in released:
+                continue
+            released.add(id(backend))
+            release = getattr(backend, "release", None)
+            if release is not None:
+                try:
+                    release()
+                except Exception:  # noqa: BLE001,S110 - shutdown is best effort
+                    pass
 
     def _get_session(self, search_id: str) -> SearchSession:
         with self._lock:
             session = self._sessions.get(search_id)
+            if session is None:
+                session = self._finished_sessions.get(search_id)
         if session is None:
             raise PersonSearchError("search not found", code="search_not_found", status_code=404)
         return session
@@ -511,6 +696,14 @@ class SearchManager:
                 self._active_search_id = None
             for target_id in target_ids:
                 self._targets.pop(target_id, None)
+            session = self._sessions.pop(search_id, None)
+            if session is not None:
+                session.release_sensitive_data()
+                self._finished_sessions[search_id] = session
+                self._finished_session_order.append(search_id)
+            while len(self._finished_session_order) > MAX_FINISHED_SESSIONS:
+                expired_id = self._finished_session_order.popleft()
+                self._finished_sessions.pop(expired_id, None)
 
 
 def _sanitize_source(source: SourceConfig) -> SourceConfig:
@@ -532,6 +725,14 @@ def _normalize_target_name(name: str) -> str:
             code="invalid_target_name",
         )
     return normalized
+
+
+def _target_capacity_error() -> PersonSearchError:
+    return PersonSearchError(
+        "enrolled target capacity exceeded; delete an unused target and retry",
+        code="target_capacity_exceeded",
+        status_code=429,
+    )
 
 
 def _safe_error(exc: Exception) -> str:

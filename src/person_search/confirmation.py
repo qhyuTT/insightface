@@ -66,6 +66,7 @@ class TrackConfirmation:
         tracks: list[Track],
         faces: list[FaceObservation],
         target: Target,
+        face_track_associations: dict[int, int] | None = None,
     ) -> list[MatchDecision]:
         decisions: list[MatchDecision] = []
         tracks_by_id = {track.track_id: track for track in tracks}
@@ -74,7 +75,11 @@ class TrackConfirmation:
             state.last_track_seen = timestamp
             state.last_bbox = track.bbox.copy()
 
-        associations = associate_faces_to_tracks(faces, tracks)
+        associations = (
+            face_track_associations
+            if face_track_associations is not None
+            else associate_faces_to_tracks(faces, tracks)
+        )
         # At most one face contributes to a track in a frame: keep the highest-quality face.
         best_by_track: dict[int, FaceObservation] = {}
         for face_index, track_id in associations.items():

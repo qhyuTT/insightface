@@ -45,7 +45,19 @@ class InsightFaceBackend:
             providers: list[str] = []
             if self.settings.prefer_cuda and "CUDAExecutionProvider" in available:
                 providers.append("CUDAExecutionProvider")
-            providers.append("CPUExecutionProvider")
+            if "CPUExecutionProvider" in available:
+                providers.append("CPUExecutionProvider")
+            if not providers:
+                raise ModelUnavailableError(
+                    f"ONNX Runtime has no supported execution provider; available={available}"
+                )
+            if not self.settings.insightface_allow_download:
+                model_dir = self.settings.insightface_root / "models" / self.settings.insightface_model
+                if not model_dir.is_dir():
+                    raise ModelUnavailableError(
+                        f"InsightFace model is not present at {model_dir}; "
+                        "offline mode forbids downloading it"
+                    )
             try:
                 app = FaceAnalysis(
                     name=self.settings.insightface_model,

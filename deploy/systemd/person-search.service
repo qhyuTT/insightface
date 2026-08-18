@@ -1,0 +1,50 @@
+[Unit]
+Description=Person Search API (RK3588 edge)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=person-search
+Group=person-search
+WorkingDirectory=/opt/person-search/app
+EnvironmentFile=/etc/person-search/person-search.env
+# OpenCV checks this before allocating decoded upload buffers. Keep it aligned
+# with MAX_IMAGE_PIXELS in person_search.api.
+Environment=OPENCV_IO_MAX_IMAGE_PIXELS=20000000
+# Starlette may spool multipart uploads. Keep those short-lived files in tmpfs
+# instead of repeatedly writing the board's eMMC/SSD.
+Environment=TMPDIR=/run/person-search
+ExecStart=/opt/person-search/venv/bin/person-search-api
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# Leave roughly 2 GiB for the OS, decoder, networking, and vendor services on
+# the 16 GiB EIS100. Tune only after measuring peak RSS on the actual image.
+MemoryHigh=12G
+MemoryMax=14G
+TasksMax=256
+LimitNOFILE=4096
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+StateDirectory=person-search
+StateDirectoryMode=0700
+RuntimeDirectory=person-search
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

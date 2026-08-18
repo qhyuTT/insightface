@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from person_search.detector import _decode_yolox, _nms, _preprocess
+from person_search.detector import _decode_yolox, _nms, _preprocess, _yolox_grid
 
 
 def test_preprocess_letterboxes_to_model_size() -> None:
@@ -18,6 +18,27 @@ def test_decode_yolox_builds_all_three_feature_grids() -> None:
     decoded = _decode_yolox(raw, (416, 416))
     assert decoded.shape == raw.shape
     np.testing.assert_allclose(decoded[0, :4], [0, 0, 8, 8])
+
+
+def test_decode_yolox_caches_grid_and_supports_in_place_decode() -> None:
+    prediction_count = 52 * 52 + 26 * 26 + 13 * 13
+    _yolox_grid.cache_clear()
+    raw = np.zeros((prediction_count, 85), dtype=np.float32)
+
+    decoded = _decode_yolox(raw, (416, 416), copy=False)
+    assert decoded is raw
+    assert _yolox_grid.cache_info().misses == 1
+
+    _decode_yolox(np.zeros_like(raw), (416, 416), copy=False)
+    assert _yolox_grid.cache_info().hits == 1
+
+
+def test_decode_yolox_preserves_input_when_copying_by_default() -> None:
+    prediction_count = 52 * 52 + 26 * 26 + 13 * 13
+    raw = np.zeros((prediction_count, 85), dtype=np.float32)
+    decoded = _decode_yolox(raw, (416, 416))
+    assert decoded is not raw
+    assert np.all(raw == 0)
 
 
 def test_nms_suppresses_overlapping_lower_score_box() -> None:

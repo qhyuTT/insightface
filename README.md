@@ -201,6 +201,30 @@ docker exec person-search python -c \
 
 若服务器 CUDA/cuDNN 版本与示例不匹配，应通过 `--build-arg CUDA_IMAGE=...` 选择对应的 NVIDIA CUDA 基础镜像，并通过 `--build-arg ONNXRUNTIME_GPU_VERSION=...` 选择匹配的 GPU runtime。首次登记 `buffalo_l` 仍可能需要从 InsightFace 上游下载模型；也可以把已下载的模型目录挂载到 `/models/.insightface`。
 
+### EIS100 / RK3588 边缘盒子
+
+RK3588 使用 RKNN Lite，不兼容上面的 CUDA/T4 Dockerfile。项目已提供可选
+`RknnSession`、RKNN YOLOX detector、显式后端选择、模型校验和边缘配置模板。
+开发机没有厂商运行时时仍可正常导入和运行 CPU 测试；设备配置为 `rknn` 后，
+缺少 runtime 或 `.rknn` 模型会直接失败，不会静默回退 CPU。
+
+```bash
+cp .env.rk3588.example .env
+export PERSON_SEARCH_INFERENCE_BACKEND=rknn
+```
+
+YOLOX、SCRFD 和 ArcFace 必须分别使用与板端匹配的 RKNN Toolkit2 转换。SCRFD
+输出和 anchor 配置可能随导出方式变化，因此人脸后端要求接入经过对齐测试的适配器，
+不能猜测输出顺序。当前 RKNN YOLOX 后端也只接受 fused、浮点 raw 输出，Rockchip
+model zoo 常见的三 head 输出不能直接混用。完整的模型 manifest、硬件解码、离线交付和验收流程见
+[EIS100-RK3588 部署说明](docs/rk3588-deployment.md)。
+
+边缘 API 默认只监听 `127.0.0.1`；如果通过反向代理提供远程访问，必须在代理层加 TLS、
+鉴权和限流，并在 `.env` 中设置 `PERSON_SEARCH_RTSP_ALLOWED_HOSTS`（精确摄像头主机/IP
+或网段），避免客户端把盒子当作任意 RTSP 探测器。`PERSON_SEARCH_MAX_ENROLLED_TARGETS`
+限制未使用目标的内存 embedding 数量。可直接使用 [systemd 单元](deploy/systemd/person-search.service)
+并按部署说明调整设备组和 cgroup 限制。
+
 ## 准备 YOLOX 模型
 
 行人检测模型不提交到代码仓库。使用项目命令从官方 [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) release 下载并校验：
@@ -311,6 +335,8 @@ FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时�
 
 主要接口：
 
+- `GET /healthz`：轻量存活检查，不加载模型。
+- `GET /readyz`：加载并验证实际推理后端；模型、RKNN runtime 或 provider 不可用时返回 503。
 - `POST /v1/targets`：multipart 字段 `name` 和 `image`；姓名必填，照片必须恰好包含一张质量合格的人脸。姓名会出现在监控页的找到横幅和事件列表中。
 - `POST /v1/searches`：启动 RTSP 或 USB 搜索。
 - `POST /v1/batch-searches`：一次上传最多 20 组姓名与照片并启动异步搜索。

@@ -23,6 +23,16 @@ def test_health_does_not_load_models() -> None:
         assert client.get("/healthz").json() == {"status": "ok"}
 
 
+def test_readiness_reports_inference_backend_state() -> None:
+    with client_with_face() as client:
+        response = client.get("/readyz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["face"]["ready"] is True
+    assert body["person"]["ready"] is True
+
+
 def test_monitor_page_is_available() -> None:
     with client_with_face() as client:
         response = client.get("/monitor")
@@ -145,3 +155,34 @@ def test_rejects_bad_media_type_and_invalid_rtsp_scheme() -> None:
             },
         )
         assert file_source.status_code == 422
+
+
+def test_rtsp_source_requires_host_and_honors_allowlist() -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    settings = Settings(rtsp_allowed_hosts="camera.test,192.168.31.0/24")
+    with TestClient(create_app(settings, manager)) as client:
+        missing_host = client.post(
+            "/v1/searches",
+            json={"target_id": "missing", "source": {"type": "rtsp", "uri": "rtsp:///live"}},
+        )
+        assert missing_host.status_code == 422
+        assert missing_host.json()["detail"]["code"] == "invalid_source"
+
+        disallowed = client.post(
+            "/v1/searches",
+            json={
+                "target_id": "missing",
+                "source": {"type": "rtsp", "uri": "rtsp://127.0.0.1:8554/live"},
+            },
+        )
+        assert disallowed.status_code == 422
+        assert disallowed.json()["detail"]["code"] == "source_host_not_allowed"
+
+        for uri in ("rtsp://camera.test/live", "rtsps://192.168.31.24/live"):
+            allowed = client.post(
+                "/v1/searches",
+                json={"target_id": "missing", "source": {"type": "rtsp", "uri": uri}},
+            )
+            # Host validation passed; the fake target lookup is the next check.
+            assert allowed.status_code == 404
+            assert allowed.json()["detail"]["code"] == "target_not_found"

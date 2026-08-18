@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -65,6 +66,11 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/readyz")
+    async def readiness() -> JSONResponse:
+        ready, details = await asyncio.to_thread(manager.readiness)
+        return JSONResponse(status_code=200 if ready else 503, content=details)
+
     @app.get("/", include_in_schema=False)
     @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
     async def monitor() -> HTMLResponse:
@@ -106,20 +112,7 @@ def create_app(
 
     @app.post("/v1/searches", response_model=SearchView, status_code=201)
     async def create_search(request: SearchCreate) -> SearchView:
-        if request.source.type == SourceType.FILE:
-            raise PersonSearchError(
-                "file sources are supported by person-search-eval, not the live API",
-                code="invalid_source",
-                status_code=422,
-            )
-        if request.source.type == SourceType.RTSP:
-            scheme = urlsplit(request.source.uri or "").scheme.lower()
-            if scheme not in {"rtsp", "rtsps"}:
-                raise PersonSearchError(
-                    "RTSP source URI must use rtsp:// or rtsps://",
-                    code="invalid_source",
-                    status_code=422,
-                )
+        _validate_live_source(request.source, settings)
         return await asyncio.to_thread(manager.start_search, request.target_id, request.source)
 
     @app.post("/v1/batch-searches", response_model=SearchView, status_code=201)
@@ -162,20 +155,7 @@ def create_app(
             raise PersonSearchError(
                 "invalid source", code="invalid_source", status_code=422
             ) from exc
-        if request_source.type == SourceType.FILE:
-            raise PersonSearchError(
-                "file sources are supported by person-search-eval, not the live API",
-                code="invalid_source",
-                status_code=422,
-            )
-        if request_source.type == SourceType.RTSP:
-            scheme = urlsplit(request_source.uri or "").scheme.lower()
-            if scheme not in {"rtsp", "rtsps"}:
-                raise PersonSearchError(
-                    "RTSP source URI must use rtsp:// or rtsps://",
-                    code="invalid_source",
-                    status_code=422,
-                )
+        _validate_live_source(request_source, settings)
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise PersonSearchError(
                 "timeout_seconds must be positive", code="invalid_timeout", status_code=422
@@ -314,3 +294,75 @@ async def _decode_upload(image: UploadFile) -> np.ndarray:
             "decoded image exceeds the pixel limit", code="image_too_large", status_code=413
         )
     return frame
+
+
+def _validate_live_source(source: SourceConfig, settings: Settings) -> None:
+    """Validate sources before they reach OpenCV/GStreamer.
+
+    An RTSP URI is server-side network input: accepting any host lets an API
+    client use the edge box to probe other reachable services.  The allowlist
+    is intentionally based on the URI host (without DNS resolution), which
+    avoids introducing request-time DNS and makes camera/VLAN policy explicit.
+    """
+
+    if source.type == SourceType.FILE:
+        raise PersonSearchError(
+            "file sources are supported by person-search-eval, not the live API",
+            code="invalid_source",
+            status_code=422,
+        )
+    if source.type != SourceType.RTSP:
+        return
+
+    uri = source.uri or ""
+    if len(uri) > 2048 or any(ord(character) < 32 for character in uri):
+        raise _invalid_rtsp_source()
+    try:
+        parts = urlsplit(uri)
+        # Accessing .port performs urllib's numeric/range validation.
+        _ = parts.port
+    except ValueError as exc:
+        raise _invalid_rtsp_source() from exc
+    host = parts.hostname
+    if parts.scheme.lower() not in {"rtsp", "rtsps"} or not host:
+        raise _invalid_rtsp_source()
+
+    rules = [rule.strip() for rule in settings.rtsp_allowed_hosts.split(",") if rule.strip()]
+    if rules and not _rtsp_host_allowed(host, rules):
+        raise PersonSearchError(
+            "RTSP source host is not permitted",
+            code="source_host_not_allowed",
+            status_code=422,
+        )
+
+
+def _rtsp_host_allowed(host: str, rules: list[str]) -> bool:
+    normalized_host = host.rstrip(".").casefold()
+    try:
+        host_address = ipaddress.ip_address(normalized_host)
+    except ValueError:
+        host_address = None
+
+    for rule in rules:
+        normalized_rule = rule.rstrip(".").casefold()
+        if normalized_host == normalized_rule:
+            return True
+        try:
+            network = ipaddress.ip_network(normalized_rule, strict=False)
+        except ValueError:
+            continue
+        if (
+            host_address is not None
+            and host_address.version == network.version
+            and host_address in network
+        ):
+            return True
+    return False
+
+
+def _invalid_rtsp_source() -> PersonSearchError:
+    return PersonSearchError(
+        "RTSP source URI must contain a valid rtsp:// or rtsps:// host",
+        code="invalid_source",
+        status_code=422,
+    )

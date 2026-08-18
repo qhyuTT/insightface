@@ -36,13 +36,24 @@ class ByteTracker:
         self._next_id = 1
 
     def reset(self) -> None:
+        """Drop all track state and restart track IDs from one.
+
+        A reader can be reconnected without constructing a new tracker.  The
+        explicit reset hook is also useful when a stream seek/discontinuity is
+        detected: predicted boxes from the old timeline must not be associated
+        with frames from the new one.
+        """
+
         self._tracks.clear()
         self._next_id = 1
 
     def update(self, detections: list[Detection]) -> list[Track]:
         memories = list(self._tracks.values())
         for memory in memories:
-            memory.bbox = memory.bbox + memory.velocity
+            # Prediction is an in-place add; allocating a new four-element
+            # array for every live track on every update is surprisingly costly
+            # at the frame rates used by edge cameras.
+            np.add(memory.bbox, memory.velocity, out=memory.bbox)
             memory.missed += 1
 
         high = [item for item in detections if item.score >= self.high_threshold]
@@ -70,7 +81,7 @@ class ByteTracker:
                 continue
             memory = _TrackMemory(
                 track_id=self._next_id,
-                bbox=detection.bbox.copy(),
+                bbox=np.array(detection.bbox, dtype=np.float32, copy=True),
                 score=detection.score,
                 velocity=np.zeros(4, dtype=np.float32),
             )
@@ -90,8 +101,19 @@ class ByteTracker:
 
     @staticmethod
     def _apply_match(memory: _TrackMemory, detection: Detection) -> None:
-        memory.velocity = detection.bbox.astype(np.float32) - memory.bbox.astype(np.float32)
-        memory.bbox = detection.bbox.copy()
+        # Detection boxes are normally float32 already.  Reuse the velocity
+        # buffer and copy the coordinates into the track-owned box so callers
+        # can safely reuse/mutate their Detection objects.
+        if memory.velocity.shape != detection.bbox.shape:
+            memory.velocity = np.empty_like(memory.bbox, dtype=np.float32)
+        np.subtract(
+            detection.bbox,
+            memory.bbox,
+            out=memory.velocity,
+            dtype=np.float32,
+            casting="unsafe",
+        )
+        np.copyto(memory.bbox, detection.bbox, casting="unsafe")
         memory.score = detection.score
         memory.missed = 0
 
@@ -101,25 +123,61 @@ def _associate(
 ) -> list[tuple[int, int]]:
     if not tracks or not detections:
         return []
-    ious = np.zeros((len(tracks), len(detections)), dtype=np.float32)
-    for track_index, track in enumerate(tracks):
-        for detection_index, detection in enumerate(detections):
-            ious[track_index, detection_index] = _iou(track.bbox, detection.bbox)
+
+    # Compute all pairwise IoUs with broadcasting.  The old nested Python loops
+    # became a measurable bottleneck once several people were visible in a
+    # 1080p stream; the resulting matrix is tiny compared with detector work
+    # and is much cheaper to build in NumPy.
+    track_boxes = np.stack([track.bbox for track in tracks]).astype(np.float32, copy=False)
+    detection_boxes = np.stack([item.bbox for item in detections]).astype(
+        np.float32, copy=False
+    )
+    top_left = np.maximum(track_boxes[:, None, :2], detection_boxes[None, :, :2])
+    bottom_right = np.minimum(track_boxes[:, None, 2:], detection_boxes[None, :, 2:])
+    wh = np.maximum(0.0, bottom_right - top_left)
+    intersection = wh[..., 0] * wh[..., 1]
+    track_wh = np.maximum(0.0, track_boxes[:, 2:] - track_boxes[:, :2])
+    detection_wh = np.maximum(0.0, detection_boxes[:, 2:] - detection_boxes[:, :2])
+    track_area = track_wh[:, 0] * track_wh[:, 1]
+    detection_area = detection_wh[:, 0] * detection_wh[:, 1]
+    ious = intersection / np.maximum(
+        track_area[:, None] + detection_area[None, :] - intersection, 1e-6
+    )
+
+    # Only valid edges should participate in assignment.  Assigning all edges
+    # first and filtering by threshold afterwards can discard a valid match
+    # when an invalid, higher-cost edge was selected by Hungarian assignment.
+    valid = ious >= threshold
     try:
         from scipy.optimize import linear_sum_assignment
 
-        rows, columns = linear_sum_assignment(1.0 - ious)
+        # Keep invalid edges prohibitively expensive.  The subsequent mask
+        # still protects against the rectangular-matrix edge case where the
+        # solver has to return an invalid pair.
+        cost = 1.0 - ious
+        cost = np.where(valid, cost, 1e6)
+        rows, columns = linear_sum_assignment(cost)
         pairs = zip(rows.tolist(), columns.tolist(), strict=True)
     except ImportError:
+        # Deterministic greedy fallback for installations without SciPy.  Sort
+        # only candidate edges, avoiding a copy/mutation of the full IoU matrix.
+        candidates = np.argwhere(valid)
+        if candidates.size == 0:
+            return []
+        candidate_scores = ious[candidates[:, 0], candidates[:, 1]]
+        order = np.argsort(-candidate_scores, kind="stable")
+        used_rows: set[int] = set()
+        used_columns: set[int] = set()
         pairs_list: list[tuple[int, int]] = []
-        work = ious.copy()
-        while work.size and float(work.max()) >= threshold:
-            row, column = np.unravel_index(int(work.argmax()), work.shape)
-            pairs_list.append((int(row), int(column)))
-            work[row, :] = -1
-            work[:, column] = -1
-        pairs = pairs_list
-    return [(row, column) for row, column in pairs if ious[row, column] >= threshold]
+        for candidate_index in order.tolist():
+            row, column = (int(value) for value in candidates[candidate_index])
+            if row in used_rows or column in used_columns:
+                continue
+            used_rows.add(row)
+            used_columns.add(column)
+            pairs_list.append((row, column))
+        return pairs_list
+    return [(row, column) for row, column in pairs if valid[row, column]]
 
 
 def _iou(first: np.ndarray, second: np.ndarray) -> float:

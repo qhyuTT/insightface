@@ -10,6 +10,7 @@ build/
 *.egg-info/
 models/*
 !models/README.md
+!models/rk3588-manifest.example.json
 artifacts/
 *.mp4
 .DS_Store

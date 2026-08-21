@@ -12,6 +12,7 @@ class SearchStatus(StrEnum):
     INITIALIZING = "initializing"
     RUNNING = "running"
     SOURCE_LOST = "source_lost"
+    STOPPING = "stopping"
     COMPLETED = "completed"
     TIMED_OUT = "timed_out"
     STOPPED = "stopped"
@@ -52,6 +53,9 @@ class SourceConfig(BaseModel):
 class SearchCreate(BaseModel):
     target_id: str
     source: SourceConfig
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    replace_active: bool = False
+    request_id: str | None = Field(default=None, max_length=128)
 
 
 class TargetSearchView(BaseModel):
@@ -78,6 +82,7 @@ class SearchView(BaseModel):
     total_count: int = 0
     unfound_target_ids: list[str] = Field(default_factory=list)
     timeout_seconds: float | None = None
+    request_id: str | None = None
 
 
 class TargetView(BaseModel):

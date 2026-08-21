@@ -117,5 +117,10 @@ class LatestFrameReader:
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
                 f"rtsp_transport;{self.settings.rtsp_transport}"
             )
-            return cv2.VideoCapture(str(self.source.uri), cv2.CAP_FFMPEG)
+            return cv2.VideoCapture(str(self.source.uri), cv2.CAP_FFMPEG, [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                int(self.settings.rtsp_open_timeout_seconds * 1000),
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                int(self.settings.rtsp_read_timeout_seconds * 1000),
+            ])
         return cv2.VideoCapture(str(self.source.uri))

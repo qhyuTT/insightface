@@ -29,12 +29,18 @@ from .domain import (
     TargetView,
     Track,
 )
-from .errors import EnrollmentError, ModelUnavailableError, PersonSearchError
+from .errors import (
+    EnrollmentError,
+    ModelUnavailableError,
+    PersonSearchError,
+    SearchStopTimeoutError,
+)
 from .quality import normalize_embedding
 from .tracker import ByteTracker
 from .video import LatestFrameReader
 
 MAX_TARGET_NAME_LENGTH = 80
+STOP_WAIT_SECONDS = 15.0
 
 
 class EventHub:
@@ -97,6 +103,7 @@ class SearchSession:
     on_finished: Callable[[str, list[str]], None]
     targets: list[Target] | None = None
     timeout_seconds: float | None = None
+    request_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.targets is None:
@@ -125,6 +132,9 @@ class SearchSession:
         self._reader: LatestFrameReader | None = None
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
+        self._finished = threading.Event()
+        self._stop_requested = False
+        self._deferred_events: list[tuple[str, dict[str, Any]]] = []
 
     def start(self) -> None:
         self._worker = threading.Thread(
@@ -132,13 +142,20 @@ class SearchSession:
         )
         self._worker.start()
 
-    def stop(self) -> None:
+    @property
+    def finished(self) -> threading.Event:
+        return self._finished
+
+    def stop(self, timeout: float = STOP_WAIT_SECONDS) -> None:
         self._stop.set()
+        self._stop_requested = True
+        self._transition(SearchStatus.STOPPING, None)
         if self._reader:
             self._reader.stop()
-        if self._worker and self._worker is not threading.current_thread():
-            self._worker.join(timeout=5.0)
-        self._transition(SearchStatus.STOPPED, None)
+        if self._worker and self._worker is not threading.current_thread() and not self._finished.wait(timeout=timeout):
+            raise SearchStopTimeoutError(
+                "搜索线程未能在停止时限内退出；请稍后重试或重启识别服务"
+            )
 
     def view(self) -> SearchView:
         with self._lock:
@@ -167,6 +184,7 @@ class SearchSession:
                     item.target_id for item in target_views if item.status != "found"
                 ],
                 timeout_seconds=self.timeout_seconds,
+                request_id=self.request_id,
                 **metrics,
             )
 
@@ -198,14 +216,7 @@ class SearchSession:
                     self.timeout_seconds is not None
                     and time.monotonic() - self.metrics.started_at >= self.timeout_seconds
                 ):
-                    self._transition(SearchStatus.TIMED_OUT, None)
-                    self.events.publish(
-                        "search_timeout",
-                        {
-                            "search_id": self.search_id,
-                            "unfound_target_ids": list(self._active_targets),
-                        },
-                    )
+                    self._transition(SearchStatus.TIMED_OUT, None, publish=False)
                     break
                 packet = reader.get(timeout=0.5)
                 if packet is None:
@@ -276,7 +287,7 @@ class SearchSession:
                             if decision.state.value == "confirmed":
                                 current["status"] = "found"
                                 current["found_at"] = payload["timestamp_ms"]
-                                self.events.publish("target_found", payload)
+                                self._deferred_events.append(("target_found", payload))
                                 self._active_targets.pop(target_id, None)
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
                         previous = track_states.get(track_id)
@@ -288,24 +299,27 @@ class SearchSession:
                             track_states[track_id] = (state.value, similarity)
                 self._track_states = track_states
                 if not self._active_targets:
-                    self._transition(SearchStatus.COMPLETED, None)
-                    self.events.publish("all_found", {"search_id": self.search_id})
+                    self._transition(SearchStatus.COMPLETED, None, publish=False)
                     break
                 self._publish_preview(packet.frame, tracks, faces)
                 self.metrics.frame_count += 1
                 self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
         except Exception as exc:  # noqa: BLE001 - the worker must fail closed and release resources
-            self._transition(SearchStatus.FAILED, _safe_error(exc))
+            self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
         finally:
             reader.stop()
-            if self.status not in (
+            if self._stop_requested or self.status not in (
                 SearchStatus.FAILED,
                 SearchStatus.STOPPED,
                 SearchStatus.COMPLETED,
                 SearchStatus.TIMED_OUT,
             ):
-                self._transition(SearchStatus.STOPPED, None)
-            self.on_finished(self.search_id, [target.target_id for target in self.targets])
+                self._transition(SearchStatus.STOPPED, None, publish=False)
+            try:
+                self.on_finished(self.search_id, [target.target_id for target in self.targets])
+            finally:
+                self._publish_terminal_event()
+                self._finished.set()
 
     def _publish_preview(
         self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
@@ -345,7 +359,9 @@ class SearchSession:
         with self._lock:
             self.metrics.dropped_frames += 1
 
-    def _transition(self, status: SearchStatus, error: str | None) -> None:
+    def _transition(
+        self, status: SearchStatus, error: str | None, *, publish: bool = True
+    ) -> None:
         with self._lock:
             if self.status in (
                 SearchStatus.STOPPED,
@@ -358,10 +374,31 @@ class SearchSession:
                 return
             self.status = status
             self.error = error
+        if publish:
+            self.events.publish(
+                "search_status",
+                {"search_id": self.search_id, "status": status.value, "error": error},
+            )
+
+    def _publish_terminal_event(self) -> None:
+        status = self.status
         self.events.publish(
             "search_status",
-            {"search_id": self.search_id, "status": status.value, "error": error},
+            {"search_id": self.search_id, "status": status.value, "error": self.error},
         )
+        for event_type, payload in self._deferred_events:
+            self.events.publish(event_type, payload)
+        self._deferred_events.clear()
+        if status == SearchStatus.COMPLETED:
+            self.events.publish("all_found", {"search_id": self.search_id})
+        elif status == SearchStatus.TIMED_OUT:
+            self.events.publish(
+                "search_timeout",
+                {
+                    "search_id": self.search_id,
+                    "unfound_target_ids": list(self._active_targets),
+                },
+            )
 
 
 class SearchManager:
@@ -378,6 +415,7 @@ class SearchManager:
         self._sessions: dict[str, SearchSession] = {}
         self._active_search_id: str | None = None
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
 
     def enroll(self, image: np.ndarray, name: str = "目标") -> TargetView:
         target_name = _normalize_target_name(name)
@@ -437,6 +475,8 @@ class SearchManager:
         target_ids: list[str],
         source: SourceConfig,
         timeout_seconds: float | None = None,
+        replace_active: bool = False,
+        request_id: str | None = None,
     ) -> SearchView:
         if not target_ids:
             raise PersonSearchError(
@@ -446,21 +486,28 @@ class SearchManager:
             raise PersonSearchError(
                 "timeout_seconds must be positive", code="invalid_timeout", status_code=422
             )
-        with self._lock:
-            targets: list[Target] = []
-            for target_id in target_ids:
-                target = self._targets.get(target_id)
-                if target is None:
+        with self._lifecycle_lock:
+            with self._lock:
+                active_id = self._active_search_id
+                active_session = self._sessions.get(active_id) if active_id else None
+                if request_id and active_session and active_session.request_id == request_id:
+                    return active_session.view()
+                targets: list[Target] = []
+                for target_id in target_ids:
+                    target = self._targets.get(target_id)
+                    if target is None:
+                        raise PersonSearchError(
+                            "target not found", code="target_not_found", status_code=404
+                        )
+                    targets.append(target)
+            if active_id is not None:
+                if not replace_active:
                     raise PersonSearchError(
-                        "target not found", code="target_not_found", status_code=404
+                        "only one search may run at a time",
+                        code="search_capacity_exceeded",
+                        status_code=409,
                     )
-                targets.append(target)
-            if self._active_search_id is not None:
-                raise PersonSearchError(
-                    "only one search may run at a time",
-                    code="search_capacity_exceeded",
-                    status_code=409,
-                )
+                self.stop_search(active_id)
             ensure_ready = getattr(self.person_detector, "ensure_ready", None)
             if ensure_ready:
                 ensure_ready()
@@ -475,10 +522,19 @@ class SearchManager:
                 on_finished=self._on_finished,
                 targets=targets,
                 timeout_seconds=timeout_seconds,
+                request_id=request_id,
             )
-            self._sessions[search_id] = session
-            self._active_search_id = search_id
-            session.start()
+            with self._lock:
+                self._sessions[search_id] = session
+                self._active_search_id = search_id
+            try:
+                session.start()
+            except Exception:
+                with self._lock:
+                    self._sessions.pop(search_id, None)
+                    if self._active_search_id == search_id:
+                        self._active_search_id = None
+                raise
             return session.view()
 
     def get_search(self, search_id: str) -> SearchView:
@@ -487,14 +543,53 @@ class SearchManager:
     def get_session(self, search_id: str) -> SearchSession:
         return self._get_session(search_id)
 
+    def search_by_request_id(self, request_id: str) -> SearchView | None:
+        """Return the session associated with an idempotency key, if retained.
+
+        Search sessions are kept in memory after they reach a terminal state so
+        callers can still inspect their final view and event history.  This
+        lookup lets a control-plane client reconcile a POST whose response was
+        lost even when the search finished before the reconciliation request.
+        No image data is persisted by this index; it only scans the existing
+        in-memory session metadata.
+        """
+        normalized = request_id.strip()
+        if not normalized:
+            return None
+        with self._lock:
+            session = next(
+                (
+                    candidate
+                    for candidate in self._sessions.values()
+                    if candidate.request_id == normalized
+                ),
+                None,
+            )
+        return session.view() if session is not None else None
+
     def stop_search(self, search_id: str) -> None:
-        self._get_session(search_id).stop()
+        with self._lifecycle_lock:
+            session = self._get_session(search_id)
+            if session.finished.is_set():
+                return
+            session.stop()
+
+    def active_search(self) -> SearchView | None:
+        with self._lock:
+            active = self._active_search_id
+            session = self._sessions.get(active) if active else None
+        return session.view() if session else None
 
     def shutdown(self) -> None:
         with self._lock:
             active = self._active_search_id
         if active:
-            self.stop_search(active)
+            try:
+                self.stop_search(active)
+            except SearchStopTimeoutError:
+                # Keep the process alive until the worker can release its slot; the
+                # caller will still see a clear timeout if this is an API stop.
+                pass
         with self._lock:
             self._targets.clear()
 

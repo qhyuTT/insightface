@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     candidate_emit_interval_seconds: float = 0.5
     rtsp_transport: Literal["tcp", "udp"] = "tcp"
     rtsp_reconnect_max_seconds: float = 10.0
+    rtsp_open_timeout_seconds: float = Field(default=5.0, gt=0)
+    rtsp_read_timeout_seconds: float = Field(default=5.0, gt=0)
 
 
 @lru_cache

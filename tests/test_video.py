@@ -23,5 +23,16 @@ def test_rtsp_capture_uses_configured_ffmpeg_transport(monkeypatch) -> None:
     )
 
     assert reader._open() is capture
-    assert calls == [("rtsp://camera.test/live", cv2.CAP_FFMPEG)]
+    assert calls == [
+        (
+            "rtsp://camera.test/live",
+            cv2.CAP_FFMPEG,
+            [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                5000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                5000,
+            ],
+        )
+    ]
     assert os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] == "rtsp_transport;tcp"

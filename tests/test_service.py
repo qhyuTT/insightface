@@ -9,7 +9,7 @@ import pytest
 from conftest import FakeFaceBackend, FakePersonDetector, make_face
 
 from person_search.config import Settings
-from person_search.domain import Detection, SourceConfig, Target, TargetView, Track
+from person_search.domain import Detection, SearchStatus, SourceConfig, Target, TargetView, Track
 from person_search.errors import EnrollmentError, PersonSearchError
 from person_search.service import PreviewHub, SearchManager, SearchSession
 
@@ -135,3 +135,151 @@ def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> No
     view = session.view()
     assert view.found_count == 1
     assert view.unfound_target_ids == ["target-2"]
+
+
+def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+
+    def fail_start(_: SearchSession) -> None:
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(SearchSession, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        manager.start_batch_search(
+            [target.target_id],
+            SourceConfig(type="camera", device_index=0),
+            request_id="request-start-failure",
+        )
+
+    assert manager.active_search() is None
+    assert manager._sessions == {}
+    assert manager.get_target(target.target_id).target_id == target.target_id
+
+
+def test_active_search_is_idempotent_by_request_id(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    starts: list[str] = []
+    monkeypatch.setattr(SearchSession, "start", lambda session: starts.append(session.search_id))
+
+    first = manager.start_batch_search(
+        [target.target_id],
+        SourceConfig(type="camera", device_index=0),
+        request_id="request-idempotent",
+    )
+    repeated = manager.start_batch_search(
+        [target.target_id],
+        SourceConfig(type="camera", device_index=0),
+        request_id="request-idempotent",
+    )
+
+    assert repeated.search_id == first.search_id
+    assert repeated.request_id == "request-idempotent"
+    assert starts == [first.search_id]
+    assert list(manager._sessions) == [first.search_id]
+
+
+def test_search_lookup_by_request_id_survives_terminal_transition(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    monkeypatch.setattr(SearchSession, "start", lambda session: None)
+
+    created = manager.start_batch_search(
+        [target.target_id],
+        SourceConfig(type="camera", device_index=0),
+        request_id="request-lookup",
+    )
+    session = manager.get_session(created.search_id)
+    session._transition(SearchStatus.TIMED_OUT, None, publish=False)
+    manager._on_finished(created.search_id, [target.target_id])
+
+    found = manager.search_by_request_id(" request-lookup ")
+    assert found is not None
+    assert found.search_id == created.search_id
+    assert found.request_id == "request-lookup"
+    assert found.status == SearchStatus.TIMED_OUT
+    assert manager.search_by_request_id("missing") is None
+
+
+def test_terminal_target_found_event_can_immediately_start_next_search(monkeypatch) -> None:
+    frame = np.zeros((120, 120, 3), dtype=np.uint8)
+
+    class ControlledReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.source = source
+            self.ended = threading.Event()
+            self.stopped = threading.Event()
+            self.returned_frame = False
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if self.source.device_index == 0 and not self.returned_frame:
+                self.returned_frame = True
+                return SimpleNamespace(frame_id=1, captured_at=1.0, frame=frame)
+            self.stopped.wait(0.01)
+            return None
+
+        def stop(self) -> None:
+            self.stopped.set()
+            self.ended.set()
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", ControlledReader)
+    settings = Settings(evidence_required=1)
+    detector = FakePersonDetector(
+        [Detection(np.asarray([0, 0, 110, 119], dtype=np.float32), 0.99)]
+    )
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), detector)
+    enrollment_frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    first_target = manager.enroll(enrollment_frame, "张三")
+    next_target = manager.enroll(enrollment_frame, "李四")
+    original_start = SearchSession.start
+    active_at_terminal_event = []
+    replacement_views = []
+    replacement_errors: list[Exception] = []
+
+    def start_with_terminal_hook(session: SearchSession) -> None:
+        if session.source.device_index == 0:
+            original_publish = session.events.publish
+
+            def publish(event_type: str, data: dict):
+                if event_type == "target_found" and not active_at_terminal_event:
+                    active_at_terminal_event.append(manager.active_search())
+                    try:
+                        replacement_views.append(
+                            manager.start_batch_search(
+                                [next_target.target_id],
+                                SourceConfig(type="camera", device_index=1),
+                                replace_active=True,
+                                request_id="request-next",
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 - asserted below
+                        replacement_errors.append(exc)
+                return original_publish(event_type, data)
+
+            session.events.publish = publish  # type: ignore[method-assign]
+        original_start(session)
+
+    monkeypatch.setattr(SearchSession, "start", start_with_terminal_hook)
+    first = manager.start_batch_search(
+        [first_target.target_id],
+        SourceConfig(type="camera", device_index=0),
+        request_id="request-first",
+    )
+    first_session = manager.get_session(first.search_id)
+
+    assert first_session.finished.wait(timeout=2.0)
+    assert active_at_terminal_event == [None]
+    assert replacement_errors == []
+    assert len(replacement_views) == 1
+    replacement = replacement_views[0]
+    assert manager.active_search().search_id == replacement.search_id  # type: ignore[union-attr]
+    assert [
+        event["type"] for event in first_session.events.after(0, timeout=0)
+    ][-3:] == ["search_status", "target_found", "all_found"]
+
+    manager.stop_search(replacement.search_id)
+    assert manager.active_search() is None

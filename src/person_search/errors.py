@@ -26,3 +26,8 @@ class EnrollmentError(PersonSearchError):
 class SourceError(PersonSearchError):
     code = "source_unavailable"
     status_code = 503
+
+
+class SearchStopTimeoutError(PersonSearchError):
+    code = "search_stop_timeout"
+    status_code = 503

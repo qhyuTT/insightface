@@ -62,8 +62,19 @@ def create_app(
         return _problem(422, "validation_error", "request validation failed", exc.errors())
 
     @app.get("/healthz")
-    async def health() -> dict[str, str]:
-        return {"status": "ok"}
+    async def health() -> dict[str, Any]:
+        active = manager.active_search()
+        return {
+            "status": "ok",
+            "api_version": "0.2.0",
+            "capabilities": [
+                "replace_active",
+                "active_search",
+                "search_timeout",
+                "request_lookup",
+            ],
+            "active_search": active is not None,
+        }
 
     @app.get("/", include_in_schema=False)
     @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
@@ -120,7 +131,14 @@ def create_app(
                     code="invalid_source",
                     status_code=422,
                 )
-        return await asyncio.to_thread(manager.start_search, request.target_id, request.source)
+        return await asyncio.to_thread(
+            manager.start_batch_search,
+            [request.target_id],
+            request.source,
+            request.timeout_seconds,
+            request.replace_active,
+            request.request_id,
+        )
 
     @app.post("/v1/batch-searches", response_model=SearchView, status_code=201)
     async def create_batch_search(
@@ -217,7 +235,12 @@ def create_app(
                 target = await asyncio.to_thread(manager.enroll, frame, spec["name"])
                 enrolled_ids.append(target.target_id)
             return await asyncio.to_thread(
-                manager.start_batch_search, enrolled_ids, request_source, timeout_seconds
+                manager.start_batch_search,
+                enrolled_ids,
+                request_source,
+                timeout_seconds,
+                False,
+                None,
             )
         except Exception:
             for target_id in enrolled_ids:
@@ -226,6 +249,14 @@ def create_app(
                 except PersonSearchError:
                     pass
             raise
+
+    @app.get("/v1/searches/active", response_model=SearchView | None)
+    async def active_search() -> SearchView | None:
+        return manager.active_search()
+
+    @app.get("/v1/searches/by-request/{request_id}", response_model=SearchView | None)
+    async def search_by_request(request_id: str) -> SearchView | None:
+        return manager.search_by_request_id(request_id)
 
     @app.get("/v1/searches/{search_id}", response_model=SearchView)
     async def get_search(search_id: str) -> SearchView:
@@ -253,6 +284,13 @@ def create_app(
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
+
+    @app.delete("/v1/searches/active", status_code=204)
+    async def delete_active_search() -> Response:
+        active = manager.active_search()
+        if active is not None:
+            await asyncio.to_thread(manager.stop_search, active.search_id)
+        return Response(status_code=204)
 
     @app.delete("/v1/searches/{search_id}", status_code=204)
     async def delete_search(search_id: str) -> Response:

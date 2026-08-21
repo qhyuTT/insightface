@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import cv2
 import numpy as np
@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from person_search.api import create_app
 from person_search.config import Settings
-from person_search.domain import SearchStatus
+from person_search.domain import SearchStatus, SourceConfig
 from person_search.service import PreviewHub, SearchManager, SearchSession
 
 
@@ -20,7 +20,17 @@ def client_with_face() -> TestClient:
 
 def test_health_does_not_load_models() -> None:
     with client_with_face() as client:
-        assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.get("/healthz").json() == {
+            "status": "ok",
+            "api_version": "0.2.0",
+            "capabilities": [
+                "replace_active",
+                "active_search",
+                "search_timeout",
+                "request_lookup",
+            ],
+            "active_search": False,
+        }
 
 
 def test_monitor_page_is_available() -> None:
@@ -77,6 +87,53 @@ def test_create_target_and_unknown_search() -> None:
         )
         assert unknown.status_code == 404
         assert unknown.json()["detail"]["code"] == "target_not_found"
+
+
+def test_delete_active_search_returns_503_until_worker_really_finishes(monkeypatch) -> None:
+    settings = Settings()
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    active_target = manager.enroll(frame, "张三")
+    replacement_target = manager.enroll(frame, "李四")
+
+    def start_stuck_worker(session: SearchSession) -> None:
+        session._worker = object()  # type: ignore[assignment]
+
+    monkeypatch.setattr(SearchSession, "start", start_stuck_worker)
+    search = manager.start_batch_search(
+        [active_target.target_id],
+        source=SourceConfig(type="camera", device_index=0),
+        request_id="request-stuck",
+    )
+    session = manager.get_session(search.search_id)
+    original_stop = SearchSession.stop
+    session.stop = MethodType(  # type: ignore[method-assign]
+        lambda current: original_stop(current, timeout=0),
+        session,
+    )
+
+    with TestClient(create_app(settings, manager)) as client:
+        response = client.delete("/v1/searches/active")
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "search_stop_timeout"
+        active = client.get("/v1/searches/active").json()
+        assert active["search_id"] == search.search_id
+        assert active["status"] == "stopping"
+
+        replacement = client.post(
+            "/v1/searches",
+            json={
+                "target_id": replacement_target.target_id,
+                "source": {"type": "camera", "device_index": 1},
+                "replace_active": True,
+                "request_id": "request-replacement",
+            },
+        )
+        assert replacement.status_code == 503
+        assert replacement.json()["detail"]["code"] == "search_stop_timeout"
+        assert client.get("/v1/searches/active").json()["search_id"] == search.search_id
+        assert len(manager._sessions) == 1
 
 
 def test_target_name_is_required() -> None:
@@ -145,3 +202,29 @@ def test_rejects_bad_media_type_and_invalid_rtsp_scheme() -> None:
             },
         )
         assert file_source.status_code == 422
+
+
+def test_search_can_be_reconciled_by_request_id_after_terminal_state(monkeypatch) -> None:
+    monkeypatch.setattr(SearchSession, "start", lambda self: None)
+    settings = Settings()
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    search = manager.start_batch_search(
+        [target.target_id],
+        SourceConfig(type="camera", device_index=0),
+        request_id="request-terminal-lookup",
+    )
+    session = manager.get_session(search.search_id)
+    session._transition(SearchStatus.COMPLETED, None, publish=False)
+    manager._on_finished(search.search_id, [target.target_id])
+
+    with TestClient(create_app(settings, manager)) as client:
+        response = client.get("/v1/searches/by-request/request-terminal-lookup")
+        assert response.status_code == 200
+        assert response.json()["search_id"] == search.search_id
+        assert response.json()["request_id"] == "request-terminal-lookup"
+        assert response.json()["status"] == "completed"
+
+        missing = client.get("/v1/searches/by-request/does-not-exist")
+        assert missing.status_code == 200
+        assert missing.json() is None

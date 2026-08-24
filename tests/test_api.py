@@ -45,6 +45,9 @@ def test_monitor_page_is_available() -> None:
         assert 'id="cameraIndex"' not in response.text
         assert 'id="debugPreview" type="checkbox"' in response.text
         assert "debug_preview" in response.text
+        assert "MATCH COUNTS" in response.text
+        assert "tiny_shadow_lost" in response.text
+        assert "SHADOW 命中已失效" in response.text
 
 
 def test_preview_stream_returns_latest_annotated_jpeg() -> None:

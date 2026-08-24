@@ -49,18 +49,23 @@ def assess_face(
     crop = frame[y1i:y2i, x1i:x2i]
 
     reasons: list[str] = []
-    minimum_size = settings.min_enrollment_face_px if enrollment else settings.min_search_face_px
+    minimum_size = (
+        settings.min_enrollment_face_px if enrollment else settings.effective_search_min_face_px
+    )
     minimum_blur = (
-        settings.min_enrollment_blur_variance
-        if enrollment
-        else settings.min_search_blur_variance
+        settings.min_enrollment_blur_variance if enrollment else settings.min_search_blur_variance
     )
     if min(face_width, face_height) < minimum_size:
         reasons.append("face_too_small")
     minimum_detection_score = (
         max(settings.face_detection_threshold, settings.min_enrollment_detection_score)
         if enrollment
-        else settings.face_detection_threshold
+        else (
+            max(settings.face_detection_threshold, settings.tiny_face_detection_threshold)
+            if settings.tiny_face_enabled
+            and min(face_width, face_height) < settings.min_search_face_px
+            else settings.face_detection_threshold
+        )
     )
     if detection_score < minimum_detection_score:
         reasons.append("detection_score_low")
@@ -93,15 +98,17 @@ def assess_face(
         pose_score *= max(0.0, 1.0 - abs(roll) / 45.0)
     if yaw is not None:
         pose_score *= max(0.0, 1.0 - abs(yaw))
-    score = float(np.clip(
-        0.25 * detection_score
-        + 0.25 * size_score
-        + 0.27 * blur_score
-        + 0.15 * exposure_score
-        + 0.08 * pose_score,
-        0.0,
-        1.0,
-    ))
+    score = float(
+        np.clip(
+            0.25 * detection_score
+            + 0.25 * size_score
+            + 0.27 * blur_score
+            + 0.15 * exposure_score
+            + 0.08 * pose_score,
+            0.0,
+            1.0,
+        )
+    )
     return QualityResult(
         accepted=not reasons,
         score=score,

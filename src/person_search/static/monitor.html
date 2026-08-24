@@ -92,9 +92,17 @@
     .event { display: grid; grid-template-columns: 86px 1fr auto; gap: 12px; padding: 8px 0; border-bottom: 1px solid #1b2a25; font: 11px Menlo, monospace; }
     .event .kind { color: var(--signal); }
     .event.confirmed .kind { color: var(--found); }
+    .event.tiny_shadow_confirmed .kind { color: #d26ef5; }
+    .event.tiny_shadow_lost .kind { color: #a889b2; }
     .event.search_status .kind { color: #72bce7; }
+    .diagnostics { margin-top: 22px; padding: 20px; }
+    .diagnostic-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); }
+    .diagnostic-cell { min-width: 0; padding: 13px 15px; border-right: 1px solid var(--line); }
+    .diagnostic-cell:last-child { border-right: 0; }
+    .diagnostic-cell small { display: block; color: var(--signal); font: 9px Menlo, monospace; letter-spacing: .1em; margin-bottom: 7px; }
+    .diagnostic-cell output { display: block; color: var(--muted); font: 10px/1.65 Menlo, monospace; overflow-wrap: anywhere; }
     .notice { min-height: 20px; color: var(--danger); font: 11px/1.5 Menlo, monospace; margin-top: 12px; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .controls { order: 2; } .stage { order: 1; } .meta { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .controls { order: 2; } .stage { order: 1; } .meta, .diagnostic-grid { grid-template-columns: 1fr 1fr; } .diagnostic-cell:nth-child(2) { border-right: 0; } .diagnostic-cell:nth-child(-n+2) { border-bottom: 1px solid var(--line); } }
   </style>
 </head>
 <body>
@@ -155,6 +163,15 @@
         <div class="panel events" data-index="03 / EVENT LOG">
           <h2>识别事件</h2><div class="event-list" id="eventList"><div class="empty">检测结果会实时显示在这里</div></div>
         </div>
+        <div class="panel diagnostics" data-index="04 / INFERENCE LEDGER">
+          <h2>远距离诊断</h2>
+          <div class="diagnostic-grid">
+            <div class="diagnostic-cell"><small>FACE SIZE</small><output id="faceSizeDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>DETECTION SOURCE</small><output id="faceSourceDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>MATCH COUNTS</small><output id="matchStageDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>STAGE P95 / HZ</small><output id="stageTimingDiag">尚无样本</output></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -178,7 +195,23 @@
       };
     }
     function renderTargets(targets = []) {
-      $('batchInfo').textContent = targets.map(item => `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}`).join('\n');
+      $('batchInfo').textContent = targets.map(item => {
+        const progress = item.required_evidence ? ` · ${item.evidence_count}/${item.required_evidence}帧` : '';
+        const pixels = item.last_face_px ? ` · ${item.last_face_px}px` : '';
+        return `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}${pixels}${progress}`;
+      }).join('\n');
+    }
+    function countText(values = {}) {
+      const entries = Object.entries(values);
+      return entries.length ? entries.map(([key, value]) => `${key} ${value}`).join('  /  ') : '尚无样本';
+    }
+    function renderDiagnostics(diagnostics = {}) {
+      $('faceSizeDiag').textContent = countText(diagnostics.face_size_counts);
+      $('faceSourceDiag').textContent = countText(diagnostics.face_source_counts);
+      $('matchStageDiag').textContent = countText(diagnostics.match_stage_counts);
+      const latency = Object.fromEntries(Object.entries(diagnostics.stage_p95_latency_ms || {}).map(([key, value]) => [key, `${Number(value).toFixed(0)}ms`]));
+      const rates = Object.fromEntries(Object.entries(diagnostics.effective_hz || {}).map(([key, value]) => [key, `${Number(value).toFixed(1)}Hz`]));
+      $('stageTimingDiag').textContent = [countText(latency), countText(rates)].join('  |  ');
     }
 
     function updateEnrollAvailability() {
@@ -257,10 +290,12 @@
       socket.onmessage = ({data}) => {
         const event = JSON.parse(data); addEvent(event);
         if (event.type === 'search_status') setState(event.data.status);
-        if (event.type === 'candidate' || event.type === 'confirmed') {
+        if (event.type === 'candidate' || event.type === 'confirmed' || event.type === 'tiny_shadow_confirmed') {
           bestSimilarity = Math.max(bestSimilarity, event.data.similarity); $('similarityMetric').textContent = bestSimilarity.toFixed(3);
         }
         if (event.type === 'confirmed' || event.type === 'target_found') { $('banner').textContent = `✓ 已找到 · ${event.data.target_name || targetName} · 轨迹 #${event.data.track_id}`; $('banner').classList.add('found'); }
+        if (event.type === 'tiny_shadow_confirmed') { $('banner').textContent = `◇ SHADOW 命中 · ${event.data.target_name || targetName} · 不驱动机器人`; $('banner').classList.remove('found'); }
+        if (event.type === 'tiny_shadow_lost') { $('banner').textContent = `◇ SHADOW 命中已失效 · ${event.data.target_name || targetName} · 继续寻找`; $('banner').classList.remove('found'); }
         if (event.type === 'all_found') { $('banner').textContent = '✓ 全部目标已找到'; $('banner').classList.add('found'); }
         if (event.type === 'lost') { $('banner').textContent = '● 目标暂时离开画面'; $('banner').classList.remove('found'); }
       };
@@ -283,7 +318,14 @@
         const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
         if (response.ok) {
           setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
-          if (body.total_count) { targetName = `${body.found_count}/${body.total_count} 人`; renderTargets(body.targets); }
+          renderDiagnostics(body);
+          if (body.total_count) {
+            targetName = `${body.found_count}/${body.total_count} 人`; renderTargets(body.targets);
+            const limited = body.targets.find(item => item.status !== 'found' && (item.last_rejection_reason || '').includes('face_too_small'));
+            if (body.status === 'running' && limited?.last_face_px) {
+              $('banner').textContent = `● 已检测 ${limited.name} · ${limited.last_face_px}px · 分辨率不足`;
+            }
+          }
           if (body.error) fail(body.error);
           terminal = ['completed', 'timed_out', 'stopped', 'failed'].includes(body.status);
           if (terminal) { $('stopBtn').disabled = true; $('scanline').style.display = 'none'; searchId = null; updateBatchAvailability(); }

@@ -81,13 +81,91 @@ def test_search_face_size_boundary(short_side: int, accepted: bool) -> None:
     assert ("face_too_small" in result.reasons) is not accepted
 
 
+def test_tiny_face_size_can_be_enabled_without_changing_default_boundary() -> None:
+    checker = np.indices((160, 160)).sum(axis=0) % 2
+    frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    tiny = assess_face(
+        frame,
+        np.asarray([20, 20, 68, 68]),
+        None,
+        0.65,
+        Settings(
+            tiny_face_enabled=True,
+            min_search_blur_variance=0.0,
+            min_brightness=0.0,
+            max_brightness=255.0,
+        ),
+        enrollment=False,
+    )
+    default = assess_face(
+        frame,
+        np.asarray([20, 20, 68, 68]),
+        None,
+        0.65,
+        Settings(
+            min_search_blur_variance=0.0,
+            min_brightness=0.0,
+            max_brightness=255.0,
+        ),
+        enrollment=False,
+    )
+
+    assert tiny.accepted
+    assert not default.accepted
+    assert "face_too_small" in default.reasons
+
+
+@pytest.mark.parametrize(("short_side", "accepted"), [(47, False), (48, True)])
+def test_tiny_face_hard_size_boundary(short_side: int, accepted: bool) -> None:
+    checker = np.indices((80, 80)).sum(axis=0) % 2
+    frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    result = assess_face(
+        frame,
+        np.asarray([10, 10, 10 + short_side, 10 + short_side]),
+        None,
+        0.99,
+        Settings(
+            tiny_face_enabled=True,
+            min_search_blur_variance=0.0,
+            min_brightness=0.0,
+            max_brightness=255.0,
+        ),
+        enrollment=False,
+    )
+
+    assert result.accepted is accepted
+    assert ("face_too_small" in result.reasons) is not accepted
+
+
+def test_quality_keeps_hard_floor_when_settings_validation_is_bypassed() -> None:
+    checker = np.indices((80, 80)).sum(axis=0) % 2
+    frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    settings = Settings.model_construct(
+        tiny_face_enabled=True,
+        tiny_face_min_px=1,
+        min_search_blur_variance=0.0,
+        min_brightness=0.0,
+        max_brightness=255.0,
+    )
+
+    result = assess_face(
+        frame,
+        np.asarray([10, 10, 57, 57]),
+        None,
+        0.99,
+        settings,
+        enrollment=False,
+    )
+
+    assert not result.accepted
+    assert "face_too_small" in result.reasons
+
+
 def test_search_accepts_pose_and_score_that_enrollment_rejects() -> None:
     checker = np.indices((200, 200)).sum(axis=0) % 2
     frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
     bbox = np.asarray([20, 20, 180, 180])
-    side_landmarks = np.asarray(
-        [[60, 80], [140, 80], [130, 110], [70, 140], [130, 140]]
-    )
+    side_landmarks = np.asarray([[60, 80], [140, 80], [130, 110], [70, 140], [130, 140]])
     settings = Settings(
         min_enrollment_blur_variance=1,
         min_search_blur_variance=1,
@@ -95,9 +173,7 @@ def test_search_accepts_pose_and_score_that_enrollment_rejects() -> None:
         max_brightness=255,
     )
 
-    enrollment = assess_face(
-        frame, bbox, side_landmarks, 0.5, settings, enrollment=True
-    )
+    enrollment = assess_face(frame, bbox, side_landmarks, 0.5, settings, enrollment=True)
     search = assess_face(frame, bbox, side_landmarks, 0.5, settings, enrollment=False)
 
     assert not enrollment.accepted

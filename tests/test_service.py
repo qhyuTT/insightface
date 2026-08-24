@@ -9,7 +9,16 @@ import pytest
 from conftest import FakeFaceBackend, FakePersonDetector, make_face
 
 from person_search.config import Settings
-from person_search.domain import Detection, SearchStatus, SourceConfig, Target, TargetView, Track
+from person_search.confirmation import MatchDecision
+from person_search.domain import (
+    Detection,
+    MatchState,
+    SearchStatus,
+    SourceConfig,
+    Target,
+    TargetView,
+    Track,
+)
 from person_search.errors import EnrollmentError, PersonSearchError
 from person_search.service import (
     PreviewHub,
@@ -125,6 +134,19 @@ def test_person_roi_pass_uses_top_eight_valid_tracks_by_score() -> None:
     assert backend.calls == 8
 
 
+def test_roi_selection_is_per_track_and_not_suppressed_by_an_unrelated_near_face() -> None:
+    session = SimpleNamespace(settings=Settings(preferred_search_face_px=80))
+    tracks = [
+        Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.9),
+        Track(2, np.asarray([200, 0, 320, 240], dtype=np.float32), 0.8),
+    ]
+    near_face = make_face(bbox=(10, 10, 100, 100))
+
+    selected = SearchSession._tracks_needing_roi_face_pass(session, [near_face], tracks)
+
+    assert [track.track_id for track in selected] == [2]
+
+
 def test_merge_faces_replaces_duplicate_with_higher_quality_roi_result() -> None:
     full_frame = make_face(bbox=(10, 10, 70, 70), quality=0.6)
     better_roi = make_face(bbox=(12, 12, 72, 72), quality=0.9)
@@ -157,6 +179,8 @@ def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_opti
             accepted_faces=0,
             small_faces=0,
             rejection_counts={},
+            face_size_counts={},
+            match_stage_counts={},
         ),
     )
     small = make_face(bbox=(0, 0, 64, 70))
@@ -168,6 +192,11 @@ def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_opti
     assert session.metrics.accepted_faces == 1
     assert session.metrics.small_faces == 1
     assert session.metrics.rejection_counts == {"face_blurry": 1}
+    assert session.metrics.face_size_counts == {"48_63": 1, "64_79": 1}
+    assert session.metrics.match_stage_counts == {
+        "detected": 2,
+        "quality_accepted": 1,
+    }
 
     sanitized = _sanitize_source(
         SourceConfig(
@@ -178,6 +207,79 @@ def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_opti
     )
     assert sanitized.uri == "rtsp://camera.test:8554/***"
     assert sanitized.debug_preview is True
+
+
+def test_matchable_face_guard_keeps_48px_hard_floor_after_unvalidated_settings() -> None:
+    settings = Settings.model_construct(tiny_face_enabled=True, tiny_face_min_px=1)
+    session = SimpleNamespace(settings=settings)
+
+    assert not SearchSession._is_face_matchable(session, make_face(bbox=(20, 20, 67, 67)))
+    assert SearchSession._is_face_matchable(session, make_face(bbox=(20, 20, 68, 68)))
+
+
+def test_associated_low_similarity_normal_face_is_not_evidence_eligible(
+    monkeypatch,
+) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [SimpleNamespace(frame_id=0, captured_at=0.0, frame=frame)]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view = TargetView(
+        target_id="target-low",
+        name="低相似度目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-low",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "低相似度目标",
+    )
+    similarity = 0.3
+    face = make_face(
+        embedding=(similarity, float(np.sqrt(1.0 - similarity**2))),
+        bbox=(20, 20, 100, 100),
+    )
+    session = SearchSession(
+        search_id="search-low-similarity",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(),
+        face_backend=FakeFaceBackend([face]),
+        person_detector=FakePersonDetector(
+            [Detection(np.asarray([0, 0, 140, 159], dtype=np.float32), 0.99)]
+        ),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    counts = session.metrics.match_stage_counts
+    assert counts["associated"] == 1
+    assert counts["evidence_policy_rejected"] == 1
+    assert counts.get("evidence_eligible", 0) == 0
+    assert counts["evidence_collected"] == 0
+    assert session.view().targets[0].last_rejection_reason == "similarity_low"
 
 
 def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> None:
@@ -225,7 +327,7 @@ def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> No
         targets=targets,
         source=SourceConfig(type="camera", device_index=0),
         settings=Settings(evidence_required=1),
-        face_backend=FakeFaceBackend([make_face()]),
+        face_backend=FakeFaceBackend([make_face(bbox=(20, 20, 100, 100))]),
         person_detector=detector,
         on_finished=lambda search_id, target_ids: None,
     )
@@ -239,6 +341,95 @@ def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> No
     view = session.view()
     assert view.found_count == 1
     assert view.unfound_target_ids == ["target-2"]
+
+
+def test_found_target_remains_an_identity_competitor_until_real_runner_up_appears(
+    monkeypatch,
+) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=index * 0.25, frame=frame)
+        for index in range(13)
+    ]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    class SequenceFaceBackend:
+        model_name = "fake-arcface"
+        provider_name = "CPUExecutionProvider"
+
+        def __init__(self, observations):
+            self.observations = list(observations)
+            self.calls = 0
+
+        def analyze(self, frame, *, enrollment=False):
+            observation = self.observations[self.calls]
+            self.calls += 1
+            return [observation]
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view_a = TargetView(
+        target_id="target-a",
+        name="A",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target_view_b = target_view_a.model_copy(update={"target_id": "target-b", "name": "B"})
+    b_embedding = np.asarray([0.75, np.sqrt(1.0 - 0.75**2)], dtype=np.float32)
+    targets = [
+        Target("target-a", np.asarray([1.0, 0.0], dtype=np.float32), target_view_a, "A"),
+        Target("target-b", b_embedding, target_view_b, "B"),
+    ]
+    near_a = make_face(bbox=(20, 20, 100, 100))
+    tiny_a = make_face(bbox=(20, 20, 68, 68))
+    tiny_b = make_face(embedding=tuple(b_embedding), bbox=(20, 20, 68, 68))
+    backend = SequenceFaceBackend([near_a, *([tiny_a] * 6), *([tiny_b] * 6)])
+    session = SearchSession(
+        search_id="search-identity-gallery",
+        target=targets[0],
+        targets=targets,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(
+            evidence_required=1,
+            tiny_face_enabled=True,
+            tiny_face_shadow_mode=False,
+        ),
+        face_backend=backend,
+        person_detector=FakePersonDetector(
+            [Detection(np.asarray([0, 0, 140, 159], dtype=np.float32), 0.99)]
+        ),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    found = [
+        event["data"]["target_id"]
+        for event in session.events.after(0, timeout=0)
+        if event["type"] == "target_found"
+    ]
+    assert found == ["target-a", "target-b"]
+    assert backend.calls == 13
+    assert set(session._identity_targets) == {"target-a", "target-b"}
+    assert session.metrics.match_stage_counts["inactive_identity_top1"] == 6
+    assert session.status == SearchStatus.COMPLETED
 
 
 def test_unassociated_small_face_confirms_through_face_fallback(monkeypatch) -> None:
@@ -310,6 +501,276 @@ def test_unassociated_small_face_confirms_through_face_fallback(monkeypatch) -> 
     assert view.small_faces == 4
     assert view.unassociated_faces == 0
     assert view.association_counts == {"face_fallback": 4}
+
+
+@pytest.mark.parametrize(
+    ("shadow_mode", "event_type"),
+    [(True, "tiny_shadow_confirmed"), (False, "confirmed")],
+)
+def test_tiny_face_confirms_only_on_a_strict_person_track(
+    monkeypatch, shadow_mode: bool, event_type: str
+) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=index * 0.25, frame=frame) for index in range(6)
+    ]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view = TargetView(
+        target_id="target-tiny",
+        name="张三",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-tiny",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "张三",
+    )
+    similarity = 0.75
+    tiny_face = make_face(
+        embedding=(similarity, float(np.sqrt(1.0 - similarity**2))),
+        bbox=(20, 20, 68, 68),
+    )
+    session = SearchSession(
+        search_id="search-tiny",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(
+            tiny_face_enabled=True,
+            tiny_face_shadow_mode=shadow_mode,
+        ),
+        face_backend=FakeFaceBackend([tiny_face]),
+        person_detector=FakePersonDetector(
+            [Detection(np.asarray([0, 0, 140, 150], dtype=np.float32), 0.99)]
+        ),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    events = session.events.after(0, timeout=0)
+    confirmed = [event for event in events if event["type"] == event_type]
+    assert len(confirmed) == 1
+    assert confirmed[0]["data"]["association"] == "person_strict"
+    assert confirmed[0]["data"]["evidence_count"] == 6
+    assert not any(event["type"] == "candidate" for event in events)
+    if shadow_mode:
+        assert confirmed[0]["data"]["state"] == "shadow_confirmed"
+        assert not any(event["type"] == "confirmed" for event in events)
+        assert session.status == SearchStatus.STOPPED
+    else:
+        assert confirmed[0]["data"]["state"] == "confirmed"
+        assert session.status == SearchStatus.COMPLETED
+    view = session.view()
+    assert view.targets[0].last_face_px == 48
+    assert view.targets[0].best_observed_similarity == pytest.approx(0.75)
+    assert view.targets[0].evidence_count == 6
+    assert view.targets[0].status.value == ("searching" if shadow_mode else "found")
+    assert session.metrics.match_stage_counts["evidence_eligible"] == 6
+    assert session.metrics.match_stage_counts["evidence_collected"] == 6
+
+
+def test_ambiguous_identity_margin_records_rejection_on_both_targets(monkeypatch) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [SimpleNamespace(frame_id=0, captured_at=0.0, frame=frame)]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view_1 = TargetView(
+        target_id="target-1",
+        name="张三",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target_view_2 = target_view_1.model_copy(update={"target_id": "target-2", "name": "李四"})
+    # Orthogonal targets with a face exactly between them: both score 0.707, so the
+    # top1/top2 margin is 0.0 and the 48px face is too ambiguous to become evidence.
+    targets = [
+        Target("target-1", np.asarray([1.0, 0.0], dtype=np.float32), target_view_1, "张三"),
+        Target("target-2", np.asarray([0.0, 1.0], dtype=np.float32), target_view_2, "李四"),
+    ]
+    half = float(np.sqrt(0.5))
+    session = SearchSession(
+        search_id="search-ambiguous",
+        target=targets[0],
+        targets=targets,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(tiny_face_enabled=True),
+        face_backend=FakeFaceBackend([make_face(embedding=(half, half), bbox=(20, 20, 68, 68))]),
+        person_detector=FakePersonDetector(
+            [Detection(np.asarray([0, 0, 140, 150], dtype=np.float32), 0.99)]
+        ),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    assert session.metrics.match_stage_counts["ambiguous_identity"] == 1
+    assert "evidence_eligible" not in session.metrics.match_stage_counts
+    view = session.view()
+    reasons = {item.target_id: item.last_rejection_reason for item in view.targets}
+    assert reasons == {
+        "target-1": "identity_margin_low",
+        "target-2": "identity_margin_low",
+    }
+    assert all(item.best_observed_similarity == pytest.approx(half) for item in view.targets)
+    assert all(item.last_face_px == 48 for item in view.targets)
+    assert view.found_count == 0
+
+
+def test_shadow_lost_event_does_not_mark_target_found() -> None:
+    target_view = TargetView(
+        target_id="target-shadow",
+        name="Shadow 目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-shadow",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "Shadow 目标",
+    )
+    session = SearchSession(
+        search_id="search-shadow-lost",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(tiny_face_enabled=True),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    base = {
+        "track_id": 7,
+        "bbox": np.asarray([0, 0, 100, 150], dtype=np.float32),
+        "similarity": 0.75,
+        "quality": 0.8,
+        "evidence_count": 6,
+        "association": "person_strict",
+        "shadow": True,
+    }
+
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [MatchDecision(state=MatchState.CONFIRMED, **base)],
+        (160, 160, 3),
+    )
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [MatchDecision(state=MatchState.LOST, **base)],
+        (160, 160, 3),
+    )
+
+    events = session.events.after(0, timeout=0)
+    assert [event["type"] for event in events] == [
+        "tiny_shadow_confirmed",
+        "tiny_shadow_lost",
+    ]
+    assert events[-1]["data"]["state"] == "shadow_lost"
+    assert session.view().targets[0].status.value == "searching"
+    assert session.view().targets[0].last_rejection_reason == "shadow_lost"
+    assert session.view().found_count == 0
+    assert session._shadow_tracks == set()
+
+
+def test_tiny_face_does_not_use_face_only_fallback(monkeypatch) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=index * 0.25, frame=frame) for index in range(6)
+    ]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view = TargetView(
+        target_id="target-tiny",
+        name="张三",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-tiny",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "张三",
+    )
+    session = SearchSession(
+        search_id="search-tiny-unassociated",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(tiny_face_enabled=True),
+        face_backend=FakeFaceBackend([make_face(embedding=(1.0, 0.0), bbox=(20, 20, 68, 68))]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    events = session.events.after(0, timeout=0)
+    assert not any(event["type"] in {"candidate", "confirmed"} for event in events)
+    assert session.view().unassociated_faces == 6
+    assert session.view().association_counts == {}
 
 
 def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:
@@ -403,10 +864,12 @@ def test_terminal_target_found_event_can_immediately_start_next_search(monkeypat
 
     monkeypatch.setattr("person_search.service.LatestFrameReader", ControlledReader)
     settings = Settings(evidence_required=1)
-    detector = FakePersonDetector(
-        [Detection(np.asarray([0, 0, 110, 119], dtype=np.float32), 0.99)]
+    detector = FakePersonDetector([Detection(np.asarray([0, 0, 110, 119], dtype=np.float32), 0.99)])
+    manager = SearchManager(
+        settings,
+        FakeFaceBackend([make_face(bbox=(20, 20, 100, 100))]),
+        detector,
     )
-    manager = SearchManager(settings, FakeFaceBackend([make_face()]), detector)
     enrollment_frame = np.zeros((200, 200, 3), dtype=np.uint8)
     first_target = manager.enroll(enrollment_frame, "张三")
     next_target = manager.enroll(enrollment_frame, "李四")
@@ -452,9 +915,11 @@ def test_terminal_target_found_event_can_immediately_start_next_search(monkeypat
     assert len(replacement_views) == 1
     replacement = replacement_views[0]
     assert manager.active_search().search_id == replacement.search_id  # type: ignore[union-attr]
-    assert [
-        event["type"] for event in first_session.events.after(0, timeout=0)
-    ][-3:] == ["search_status", "target_found", "all_found"]
+    assert [event["type"] for event in first_session.events.after(0, timeout=0)][-3:] == [
+        "search_status",
+        "target_found",
+        "all_found",
+    ]
 
     manager.stop_search(replacement.search_id)
     assert manager.active_search() is None

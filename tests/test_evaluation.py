@@ -63,6 +63,83 @@ def test_manifest_rejects_overlapping_intervals(tmp_path) -> None:
         load_manifest(manifest)
 
 
+def test_manifest_v2_loads_bucketed_interval_objects(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "cases": [
+                    {
+                        "id": "distance-buckets",
+                        "photo": "target.jpg",
+                        "video": "office.mp4",
+                        "target_name": "Alice",
+                        "expected_intervals_seconds": [
+                            {"start": 1.0, "end": 3.0, "face_px_bucket": "48-55"},
+                            {"start": 5.0, "end": 8.0, "face_px_bucket": "64-79"},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    case = load_manifest(manifest)[0]
+    assert case.expected_intervals_seconds == ((1.0, 3.0), (5.0, 8.0))
+    assert case.expected_face_px_buckets == ("48-55", "64-79")
+
+
+def test_manifest_v2_requires_bucket_and_object_shape(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "cases": [
+                    {
+                        "id": "bad-v2",
+                        "photo": "target.jpg",
+                        "video": "office.mp4",
+                        "target_name": "Alice",
+                        "expected_intervals_seconds": [{"start": 1.0, "end": 3.0}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="face_px_bucket"):
+        load_manifest(manifest)
+
+
+def test_manifest_v2_rejects_unknown_face_px_bucket(tmp_path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "cases": [
+                    {
+                        "id": "bad-bucket",
+                        "photo": "target.jpg",
+                        "video": "office.mp4",
+                        "target_name": "Alice",
+                        "expected_intervals_seconds": [
+                            {"start": 1.0, "end": 3.0, "face_px_bucket": "tiny"}
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be one of"):
+        load_manifest(manifest)
+
+
 def test_summarizes_interval_recall_false_confirmations_and_latency() -> None:
     events = [
         {"state": "confirmed", "timestamp_seconds": 12.0},
@@ -83,6 +160,117 @@ def test_adjacent_intervals_do_not_share_boundary_confirmation() -> None:
     assert result["confirmation_latencies_seconds"] == [0.0]
 
 
+def test_summarizes_and_aggregates_metrics_by_face_px_bucket() -> None:
+    events = [
+        {"state": "confirmed", "timestamp_seconds": 12.0},
+        {"state": "confirmed", "timestamp_seconds": 45.0},
+    ]
+    metrics = summarize_events(
+        events,
+        ((10.0, 20.0), (30.0, 40.0), (40.0, 50.0)),
+        100.0,
+        ("48-55", "48-55", "64-79"),
+    )
+
+    small = metrics["face_px_buckets"]["48-55"]
+    assert small["expected_intervals"] == 2
+    assert small["detected_intervals"] == 1
+    assert small["interval_recall"] == 0.5
+    assert small["mean_confirmation_latency_seconds"] == 2.0
+    assert small["p95_confirmation_latency_seconds"] == 2.0
+
+    key = threshold_key(0.6)
+    aggregate = aggregate_threshold_results(
+        [{"threshold_results": {key: {"metrics": metrics}}}], (0.6,)
+    )[key]
+    assert aggregate["face_px_buckets"]["48-55"]["interval_recall"] == 0.5
+    assert aggregate["face_px_buckets"]["64-79"]["mean_confirmation_latency_seconds"] == 5.0
+
+
+def test_below_floor_interval_requires_rejection_and_counts_confirmation_as_false() -> None:
+    metrics = summarize_events(
+        [
+            {"state": "confirmed", "timestamp_seconds": 12.0},
+            {"state": "confirmed", "timestamp_seconds": 32.0},
+        ],
+        ((10.0, 20.0), (30.0, 40.0)),
+        100.0,
+        ("<48", "48-55"),
+    )
+
+    assert metrics["expected_intervals"] == 1
+    assert metrics["detected_intervals"] == 1
+    assert metrics["interval_recall"] == 1.0
+    assert metrics["false_confirmations"] == 1
+    assert metrics["negative_exposure_seconds"] == 90.0
+    assert metrics["face_px_buckets"]["<48"] == {
+        "expected_intervals": 1,
+        "unexpected_confirmations": 1,
+        "passed": False,
+    }
+
+
+def test_shadow_events_are_isolated_from_production_metrics() -> None:
+    events = [
+        {"state": "shadow_confirmed", "timestamp_seconds": 12.0},
+        {"state": "shadow_lost", "timestamp_seconds": 15.0},
+        {"state": "confirmed", "timestamp_seconds": 32.0},
+    ]
+    intervals = ((10.0, 20.0), (30.0, 40.0))
+    buckets = ("48-55", ">=80")
+
+    production = summarize_events(events, intervals, 100.0, buckets)
+    shadow = summarize_events(
+        events,
+        intervals,
+        100.0,
+        buckets,
+        confirmation_state="shadow_confirmed",
+    )
+
+    assert production["detected_intervals"] == 1
+    assert production["confirmation_latencies_seconds"] == [2.0]
+    assert shadow["detected_intervals"] == 1
+    assert shadow["confirmation_latencies_seconds"] == [2.0]
+
+
+def test_shadow_aggregate_cannot_influence_production_recommendation() -> None:
+    key = threshold_key(0.6)
+    common = {
+        "expected_intervals": 10,
+        "false_confirmations": 0,
+        "negative_exposure_seconds": 360000.0,
+        "false_confirmations_per_hour": 0.0,
+        "face_px_buckets": {},
+    }
+    case_results = [
+        {
+            "threshold_results": {
+                key: {
+                    "metrics": {
+                        **common,
+                        "detected_intervals": 0,
+                        "interval_recall": 0.0,
+                        "confirmation_latencies_seconds": [],
+                    },
+                    "shadow_metrics": {
+                        **common,
+                        "detected_intervals": 10,
+                        "interval_recall": 1.0,
+                        "confirmation_latencies_seconds": [0.5] * 10,
+                    },
+                }
+            }
+        }
+    ]
+
+    production = aggregate_threshold_results(case_results, (0.6,))
+    shadow = aggregate_threshold_results(case_results, (0.6,), metrics_key="shadow_metrics")
+
+    assert recommend_threshold(production) is None
+    assert shadow[key]["passed"]
+
+
 def test_recommends_only_threshold_meeting_recall_rate_and_exposure() -> None:
     thresholds = (0.55, 0.6)
     case_results = [
@@ -93,7 +281,7 @@ def test_recommends_only_threshold_meeting_recall_rate_and_exposure() -> None:
                         "expected_intervals": 10,
                         "detected_intervals": 10,
                         "false_confirmations": 2,
-                        "negative_exposure_seconds": 36000.0,
+                        "negative_exposure_seconds": 360000.0,
                         "confirmation_latencies_seconds": [0.5] * 10,
                     }
                 },
@@ -101,8 +289,8 @@ def test_recommends_only_threshold_meeting_recall_rate_and_exposure() -> None:
                     "metrics": {
                         "expected_intervals": 10,
                         "detected_intervals": 9,
-                        "false_confirmations": 1,
-                        "negative_exposure_seconds": 36000.0,
+                        "false_confirmations": 0,
+                        "negative_exposure_seconds": 360000.0,
                         "confirmation_latencies_seconds": [0.8] * 9,
                     }
                 },
@@ -124,7 +312,7 @@ def test_insufficient_negative_exposure_never_recommends_threshold() -> None:
                         "expected_intervals": 1,
                         "detected_intervals": 1,
                         "false_confirmations": 0,
-                        "negative_exposure_seconds": 35999.0,
+                        "negative_exposure_seconds": 359999.0,
                         "confirmation_latencies_seconds": [0.5],
                     }
                 }

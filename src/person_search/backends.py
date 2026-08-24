@@ -14,6 +14,8 @@ from .quality import assess_face, normalize_embedding
 class FaceBackend(Protocol):
     model_name: str
     provider_name: str
+    detection_provider_name: str
+    recognition_provider_name: str
 
     def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]: ...
 
@@ -23,6 +25,8 @@ class InsightFaceBackend:
         self.settings = settings
         self.model_name = settings.insightface_model
         self.provider_name = "uninitialized"
+        self.detection_provider_name = "uninitialized"
+        self.recognition_provider_name = "uninitialized"
         self._app = None
         self._lock = threading.Lock()
 
@@ -57,14 +61,20 @@ class InsightFaceBackend:
                 app.prepare(
                     ctx_id=0 if providers[0] == "CUDAExecutionProvider" else -1,
                     det_thresh=self.settings.face_detection_threshold,
-                    det_size=None
-                    if detection_size <= 0
-                    else (detection_size, detection_size),
+                    det_size=None if detection_size <= 0 else (detection_size, detection_size),
                 )
             except Exception as exc:
                 raise ModelUnavailableError(f"failed to load InsightFace model: {exc}") from exc
             self._app = app
-            self.provider_name = providers[0]
+            self.detection_provider_name = _model_provider_name(app, "detection")
+            self.recognition_provider_name = _model_provider_name(app, "recognition")
+            if self.detection_provider_name == self.recognition_provider_name:
+                self.provider_name = self.detection_provider_name
+            else:
+                self.provider_name = (
+                    f"detection={self.detection_provider_name},"
+                    f"recognition={self.recognition_provider_name}"
+                )
 
     def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]:
         self.ensure_ready()
@@ -96,3 +106,27 @@ class InsightFaceBackend:
                 )
             )
         return observations
+
+
+def _model_provider_name(app: object, task_name: str) -> str:
+    """Return the provider selected by the model's real ONNX Runtime session."""
+    models = getattr(app, "models", {})
+    model = models.get(task_name) if isinstance(models, dict) else None
+    if model is None and isinstance(models, dict):
+        model = next(
+            (
+                candidate
+                for candidate in models.values()
+                if getattr(candidate, "taskname", None) == task_name
+            ),
+            None,
+        )
+    if model is None and task_name == "detection":
+        model = getattr(app, "det_model", None)
+
+    session = getattr(model, "session", None)
+    get_providers = getattr(session, "get_providers", None)
+    if not callable(get_providers):
+        return "unknown"
+    actual_providers = get_providers()
+    return str(actual_providers[0]) if actual_providers else "unknown"

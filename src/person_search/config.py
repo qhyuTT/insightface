@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+HARD_MIN_SEARCH_FACE_PX = 48
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="PERSON_SEARCH_", env_file=".env", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_prefix="PERSON_SEARCH_", env_file=".env", extra="ignore")
 
     host: str = "127.0.0.1"
     port: int = 8000
@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     min_enrollment_face_px: int = 100
     min_search_face_px: int = 64
     preferred_search_face_px: int = 80
+    tiny_face_enabled: bool = False
+    tiny_face_shadow_mode: bool = True
+    tiny_face_min_px: int = Field(default=HARD_MIN_SEARCH_FACE_PX, ge=HARD_MIN_SEARCH_FACE_PX)
+    tiny_face_detection_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     min_enrollment_blur_variance: float = 5.0
     min_search_blur_variance: float = 45.0
     min_brightness: float = 35.0
@@ -53,6 +57,13 @@ class Settings(BaseSettings):
     evidence_window_seconds: float = 1.5
     small_face_evidence_required: int = Field(default=4, ge=1)
     small_face_evidence_window_seconds: float = Field(default=2.0, gt=0)
+    tiny_face_similarity_threshold: float = Field(default=0.64, ge=-1.0, le=1.0)
+    tiny_face_aggregate_similarity_threshold: float = Field(default=0.68, ge=-1.0, le=1.0)
+    tiny_face_evidence_required: int = Field(default=6, ge=1)
+    tiny_face_consistent_votes_required: int = Field(default=5, ge=1)
+    tiny_face_evidence_window_seconds: float = Field(default=3.0, gt=0)
+    tiny_face_evidence_min_interval_seconds: float = Field(default=0.2, ge=0)
+    tiny_face_min_top1_margin: float = Field(default=0.08, ge=0.0, le=2.0)
     confirmed_track_grace_seconds: float = 2.0
     candidate_emit_interval_seconds: float = 0.5
     face_track_iou_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
@@ -62,10 +73,30 @@ class Settings(BaseSettings):
     roi_face_detection_hz_cpu: float = Field(default=0.0, ge=0.0)
     roi_max_tracks_per_pass: int = Field(default=8, ge=1)
     roi_min_person_height_px: int = Field(default=120, ge=1)
+    roi_person_fraction: float = Field(default=0.5, gt=0.0, le=1.0)
     rtsp_transport: Literal["tcp", "udp"] = "tcp"
     rtsp_reconnect_max_seconds: float = 10.0
     rtsp_open_timeout_seconds: float = Field(default=5.0, gt=0)
     rtsp_read_timeout_seconds: float = Field(default=5.0, gt=0)
+
+    @model_validator(mode="after")
+    def validate_face_tiers(self) -> Self:
+        if not self.tiny_face_min_px < self.min_search_face_px <= self.preferred_search_face_px:
+            raise ValueError(
+                "face size tiers must satisfy tiny_face_min_px < "
+                "min_search_face_px <= preferred_search_face_px"
+            )
+        if self.tiny_face_consistent_votes_required > self.tiny_face_evidence_required:
+            raise ValueError(
+                "tiny_face_consistent_votes_required cannot exceed tiny_face_evidence_required"
+            )
+        return self
+
+    @property
+    def effective_search_min_face_px(self) -> int:
+        """Return the configured search limit without crossing the safety floor."""
+        configured = self.tiny_face_min_px if self.tiny_face_enabled else self.min_search_face_px
+        return max(HARD_MIN_SEARCH_FACE_PX, configured)
 
 
 @lru_cache

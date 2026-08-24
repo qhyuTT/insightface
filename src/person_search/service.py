@@ -133,9 +133,22 @@ class SearchSession:
         self._confirmations = {
             target.target_id: TrackConfirmation(self.settings) for target in self.targets
         }
-        self._active_targets = {target.target_id: target for target in self.targets}
+        # The identity gallery is immutable for the lifetime of the session. Found
+        # targets leave only the active set so they remain negative competitors for
+        # every target that is still searching.
+        self._identity_targets = {target.target_id: target for target in self.targets}
+        self._active_targets = dict(self._identity_targets)
         self._target_status = {
-            target.target_id: {"status": "searching", "found_at": None, "best_similarity": None}
+            target.target_id: {
+                "status": "searching",
+                "found_at": None,
+                "best_similarity": None,
+                "best_observed_similarity": None,
+                "last_face_px": None,
+                "evidence_count": 0,
+                "required_evidence": 0,
+                "last_rejection_reason": None,
+            }
             for target in self.targets
         }
         self._stop = threading.Event()
@@ -143,6 +156,7 @@ class SearchSession:
         self._reader: LatestFrameReader | None = None
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
+        self._shadow_tracks: set[int] = set()
         self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
         self._stop_requested = False
@@ -164,10 +178,12 @@ class SearchSession:
         self._transition(SearchStatus.STOPPING, None)
         if self._reader:
             self._reader.stop()
-        if self._worker and self._worker is not threading.current_thread() and not self._finished.wait(timeout=timeout):
-            raise SearchStopTimeoutError(
-                "搜索线程未能在停止时限内退出；请稍后重试或重启识别服务"
-            )
+        if (
+            self._worker
+            and self._worker is not threading.current_thread()
+            and not self._finished.wait(timeout=timeout)
+        ):
+            raise SearchStopTimeoutError("搜索线程未能在停止时限内退出；请稍后重试或重启识别服务")
 
     def view(self) -> SearchView:
         with self._lock:
@@ -213,18 +229,24 @@ class SearchSession:
         last_person_at = -1e9
         last_face_at = -1e9
         last_roi_face_at = -1e9
-        is_cuda = "CUDA" in (self.face_backend.provider_name + self.person_detector.provider_name)
+        face_detection_provider = getattr(
+            self.face_backend, "detection_provider_name", self.face_backend.provider_name
+        )
+        face_is_cuda = "CUDA" in face_detection_provider
+        person_is_cuda = "CUDA" in self.person_detector.provider_name
         person_hz = (
             self.settings.person_detection_hz_cuda
-            if is_cuda
+            if person_is_cuda
             else self.settings.person_detection_hz_cpu
         )
         face_hz = (
-            self.settings.face_detection_hz_cuda if is_cuda else self.settings.face_detection_hz_cpu
+            self.settings.face_detection_hz_cuda
+            if face_is_cuda
+            else self.settings.face_detection_hz_cpu
         )
         roi_face_hz = (
             self.settings.roi_face_detection_hz_cuda
-            if is_cuda
+            if face_is_cuda
             else self.settings.roi_face_detection_hz_cpu
         )
         try:
@@ -244,44 +266,60 @@ class SearchSession:
                 started = time.monotonic()
                 now = packet.captured_at
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
+                    stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
                     tracks = self._tracker.update(detections)
+                    self._record_stage("person", stage_started)
                     last_person_at = now
                 faces = []
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
+                    stage_started = time.monotonic()
                     faces = self.face_backend.analyze(packet.frame, enrollment=False)
+                    self._record_stage("face_full", stage_started)
+                    self._record_face_source("full_frame", len(faces))
                     last_face_at = now
+                    roi_tracks = self._tracks_needing_roi_face_pass(faces, tracks)
                     if (
                         roi_face_hz > 0
                         and now - last_roi_face_at >= 1.0 / roi_face_hz
-                        and self._needs_roi_face_pass(faces, tracks)
+                        and roi_tracks
                     ):
-                        roi_faces = self._analyze_person_rois(packet.frame, tracks)
+                        stage_started = time.monotonic()
+                        roi_faces = self._analyze_person_rois(packet.frame, roi_tracks)
+                        self._record_stage("face_roi", stage_started)
+                        self._record_face_source("roi", len(roi_faces))
                         faces = _merge_faces(faces, roi_faces)
                         last_roi_face_at = now
                     self._record_face_metrics(faces)
+                    self._record_target_observations(faces)
 
-                accepted_faces = [face for face in faces if face.accepted]
+                accepted_faces = [
+                    face for face in faces if SearchSession._is_face_matchable(self, face)
+                ]
                 detailed = associate_faces_to_tracks_detailed(accepted_faces, tracks)
                 association_by_face = {
                     face_index: track_id for face_index, (track_id, _) in detailed.items()
                 }
-                modes_by_face = {
-                    face_index: mode for face_index, (_, mode) in detailed.items()
-                }
+                modes_by_face = {face_index: mode for face_index, (_, mode) in detailed.items()}
                 all_tracks = list(tracks)
                 fallback_policy = fallback_face_match_policy(self.settings)
                 policies_by_face: dict[int, FaceMatchPolicy] = {
                     face_index: default_face_match_policy(face, self.settings)
                     for face_index, face in enumerate(accepted_faces)
                 }
-                for face_index, mode in modes_by_face.items():
+                for face_index, mode in list(modes_by_face.items()):
+                    if policies_by_face[face_index].requires_strict_association:
+                        if mode != "person_strict":
+                            association_by_face.pop(face_index, None)
+                            modes_by_face.pop(face_index, None)
+                        continue
                     if mode == "person_relaxed":
                         policies_by_face[face_index] = fallback_policy
                 unassociated_indices = [
                     face_index
                     for face_index, face in enumerate(accepted_faces)
                     if face_index not in association_by_face
+                    and not policies_by_face[face_index].requires_strict_association
                     and face.detection_score >= self.settings.fallback_face_detection_threshold
                 ]
                 if self.settings.face_fallback_enabled and unassociated_indices:
@@ -304,6 +342,10 @@ class SearchSession:
                         self.metrics.association_counts[mode] = (
                             self.metrics.association_counts.get(mode, 0) + 1
                         )
+                    self.metrics.match_stage_counts["associated"] = (
+                        self.metrics.match_stage_counts.get("associated", 0)
+                        + len(association_by_face)
+                    )
 
                 self._debug_faces = []
                 faces_by_target: dict[str, list[tuple[int, FaceObservation]]] = {
@@ -312,21 +354,68 @@ class SearchSession:
                 for face_index, face in enumerate(accepted_faces):
                     if not self._active_targets:
                         break
-                    target_id, similarity = max(
-                        (
-                            (target_id, float(np.dot(target.embedding, face.embedding)))
-                            for target_id, target in self._active_targets.items()
-                        ),
-                        key=lambda item: item[1],
+                    ranked_matches = self._rank_identity_matches(face)
+                    target_id, similarity = ranked_matches[0]
+                    top1_margin = (
+                        similarity - ranked_matches[1][1]
+                        if len(ranked_matches) > 1
+                        else float("inf")
                     )
                     mode = modes_by_face.get(face_index, "unassociated")
                     self._debug_faces.append((face, mode, similarity))
                     policy = policies_by_face[face_index]
-                    if (
-                        similarity >= policy.threshold
-                        and face_index in association_by_face
-                    ):
-                        faces_by_target[target_id].append((face_index, face))
+                    if similarity >= policy.threshold:
+                        with self._lock:
+                            self.metrics.match_stage_counts["above_threshold"] = (
+                                self.metrics.match_stage_counts.get("above_threshold", 0) + 1
+                            )
+                    if top1_margin < policy.min_top1_margin:
+                        with self._lock:
+                            self.metrics.match_stage_counts["ambiguous_identity"] = (
+                                self.metrics.match_stage_counts.get("ambiguous_identity", 0) + 1
+                            )
+                            # The runner-up lost this face to the ambiguity too, so it
+                            # must see the reason instead of a silent diagnostic gap.
+                            for ambiguous_id, _ in ranked_matches[:2]:
+                                if ambiguous_id in self._active_targets:
+                                    self._target_status[ambiguous_id]["last_rejection_reason"] = (
+                                        "identity_margin_low"
+                                    )
+                        continue
+                    if face_index not in association_by_face:
+                        with self._lock:
+                            if target_id in self._active_targets:
+                                self._target_status[target_id]["last_rejection_reason"] = (
+                                    "unassociated"
+                                )
+                        continue
+                    if target_id not in self._active_targets:
+                        with self._lock:
+                            self.metrics.match_stage_counts["inactive_identity_top1"] = (
+                                self.metrics.match_stage_counts.get("inactive_identity_top1", 0) + 1
+                            )
+                        continue
+                    if not policy.accepts_observation(face.detection_score, similarity):
+                        with self._lock:
+                            self.metrics.match_stage_counts["evidence_policy_rejected"] = (
+                                self.metrics.match_stage_counts.get("evidence_policy_rejected", 0)
+                                + 1
+                            )
+                            reason = (
+                                "detection_score_low"
+                                if face.detection_score < policy.min_detection_score
+                                else "similarity_low"
+                            )
+                            self._target_status[target_id]["last_rejection_reason"] = reason
+                        continue
+                    faces_by_target[target_id].append((face_index, face))
+                    with self._lock:
+                        self.metrics.match_stage_counts["evidence_eligible"] = (
+                            self.metrics.match_stage_counts.get("evidence_eligible", 0) + 1
+                        )
+                        self._target_status[target_id]["last_rejection_reason"] = (
+                            None if similarity >= policy.threshold else "similarity_low"
+                        )
 
                 track_states: dict[int, tuple[str, float]] = {}
                 for target_id, target in list(self._active_targets.items()):
@@ -345,7 +434,7 @@ class SearchSession:
                         for local_index, (global_index, _) in enumerate(target_faces)
                     }
                     confirmation = self._confirmations[target_id]
-                    decisions = confirmation.process(
+                    confirmation_result = confirmation.process_with_stats(
                         frame_id=packet.frame_id,
                         timestamp=now,
                         frame_shape=packet.frame.shape,
@@ -356,17 +445,38 @@ class SearchSession:
                         association_modes=local_modes,
                         face_policies=local_policies,
                     )
-                    self._handle_decisions(
-                        target_id, target, decisions, packet.frame.shape
-                    )
+                    decisions = confirmation_result.decisions
+                    with self._lock:
+                        self.metrics.match_stage_counts["evidence_collected"] = (
+                            self.metrics.match_stage_counts.get("evidence_collected", 0)
+                            + confirmation_result.evidence_collected
+                        )
+                    self._handle_decisions(target_id, target, decisions, packet.frame.shape)
+                    progress = confirmation.track_progress()
+                    if progress:
+                        _, (evidence_count, required_evidence) = max(
+                            progress.items(), key=lambda item: item[1][0]
+                        )
+                        with self._lock:
+                            current = self._target_status[target_id]
+                            current["evidence_count"] = evidence_count
+                            current["required_evidence"] = required_evidence
+                    else:
+                        with self._lock:
+                            self._target_status[target_id]["evidence_count"] = 0
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
+                        state_value = (
+                            "shadow"
+                            if track_id in self._shadow_tracks and state.value == "confirmed"
+                            else state.value
+                        )
                         previous = track_states.get(track_id)
                         if (
                             previous is None
-                            or state.value == "confirmed"
+                            or state_value in {"confirmed", "shadow"}
                             or previous[0] != "confirmed"
                         ):
-                            track_states[track_id] = (state.value, similarity)
+                            track_states[track_id] = (state_value, similarity)
                 self._track_states = track_states
                 if not self._active_targets:
                     self._transition(SearchStatus.COMPLETED, None, publish=False)
@@ -401,6 +511,8 @@ class SearchSession:
             state, similarity = self._track_states.get(track.track_id, ("tracking", 0.0))
             if state == "confirmed":
                 color, label = (60, 220, 95), f"FOUND  {similarity:.2f}"
+            elif state == "shadow":
+                color, label = (210, 110, 245), f"SHADOW  {similarity:.2f}"
             elif state == "candidate":
                 color, label = (0, 184, 255), f"CANDIDATE  {similarity:.2f}"
             else:
@@ -468,43 +580,136 @@ class SearchSession:
                 association=decision.association,
             )
             payload = event.model_dump(mode="json")
-            self.events.publish(decision.state.value, payload)
+            if decision.shadow:
+                event_type = f"tiny_shadow_{decision.state.value}"
+                payload["state"] = event_type.removeprefix("tiny_")
+            else:
+                event_type = decision.state.value
+            self.events.publish(event_type, payload)
             with self._lock:
                 current = self._target_status[target_id]
                 current["best_similarity"] = max(
                     decision.similarity, current["best_similarity"] or -1.0
                 )
-                if decision.state.value == "confirmed":
+                if decision.shadow and decision.state.value == "confirmed":
+                    self._shadow_tracks.add(decision.track_id)
+                    current["evidence_count"] = decision.evidence_count
+                    current["required_evidence"] = decision.evidence_count
+                    current["last_rejection_reason"] = "shadow_only"
+                    self.metrics.match_stage_counts["shadow_confirmed"] = (
+                        self.metrics.match_stage_counts.get("shadow_confirmed", 0) + 1
+                    )
+                elif decision.shadow and decision.state.value == "lost":
+                    self._shadow_tracks.discard(decision.track_id)
+                    current["evidence_count"] = 0
+                    current["last_rejection_reason"] = "shadow_lost"
+                elif decision.state.value == "confirmed":
+                    self._shadow_tracks.discard(decision.track_id)
                     current["status"] = "found"
                     current["found_at"] = payload["timestamp_ms"]
+                    current["evidence_count"] = decision.evidence_count
+                    current["required_evidence"] = decision.evidence_count
                     self._deferred_events.append(("target_found", payload))
                     self._active_targets.pop(target_id, None)
+                    self.metrics.match_stage_counts["confirmed"] = (
+                        self.metrics.match_stage_counts.get("confirmed", 0) + 1
+                    )
 
     def _record_face_metrics(self, faces: list[FaceObservation]) -> None:
         with self._lock:
             self.metrics.face_observations += len(faces)
-            self.metrics.accepted_faces += sum(face.accepted for face in faces)
+            self.metrics.accepted_faces += sum(
+                SearchSession._is_face_matchable(self, face) for face in faces
+            )
             self.metrics.small_faces += sum(
-                face.accepted and face.short_side < self.settings.preferred_search_face_px
+                SearchSession._is_face_matchable(self, face)
+                and face.short_side < self.settings.preferred_search_face_px
                 for face in faces
             )
             for face in faces:
+                bucket = _face_size_bucket(face.short_side)
+                self.metrics.face_size_counts[bucket] = (
+                    self.metrics.face_size_counts.get(bucket, 0) + 1
+                )
                 for reason in face.rejection_reasons:
                     self.metrics.rejection_counts[reason] = (
                         self.metrics.rejection_counts.get(reason, 0) + 1
                     )
+            self.metrics.match_stage_counts["detected"] = self.metrics.match_stage_counts.get(
+                "detected", 0
+            ) + len(faces)
+            self.metrics.match_stage_counts["quality_accepted"] = (
+                self.metrics.match_stage_counts.get("quality_accepted", 0)
+                + sum(SearchSession._is_face_matchable(self, face) for face in faces)
+            )
 
-    def _needs_roi_face_pass(self, faces: list[FaceObservation], tracks: list[Track]) -> bool:
-        accepted = [face for face in faces if face.accepted]
-        if not tracks:
-            return False
-        return not accepted or all(
-            face.short_side < self.settings.preferred_search_face_px for face in accepted
+    def _record_face_source(self, source: str, count: int) -> None:
+        with self._lock:
+            self.metrics.face_source_counts[source] = (
+                self.metrics.face_source_counts.get(source, 0) + count
+            )
+
+    def _record_stage(self, stage: str, started: float) -> None:
+        latency_ms = (time.monotonic() - started) * 1000.0
+        with self._lock:
+            self.metrics.stage_latencies_ms.setdefault(stage, []).append(latency_ms)
+            self.metrics.stage_call_counts[stage] = self.metrics.stage_call_counts.get(stage, 0) + 1
+
+    def _record_target_observations(self, faces: list[FaceObservation]) -> None:
+        if not faces or not self._active_targets:
+            return
+        best_in_frame: dict[str, tuple[float, FaceObservation]] = {}
+        for face in faces:
+            for target_id, similarity in self._rank_identity_matches(face):
+                if target_id not in self._active_targets:
+                    continue
+                previous = best_in_frame.get(target_id)
+                if previous is None or similarity > previous[0]:
+                    best_in_frame[target_id] = (similarity, face)
+        with self._lock:
+            for target_id, (similarity, face) in best_in_frame.items():
+                current = self._target_status[target_id]
+                previous_best = current["best_observed_similarity"]
+                current["best_observed_similarity"] = max(
+                    similarity, previous_best if previous_best is not None else -1.0
+                )
+                current["last_face_px"] = face.short_side
+                if not face.accepted:
+                    current["last_rejection_reason"] = ",".join(face.rejection_reasons)
+
+    def _rank_identity_matches(self, face: FaceObservation) -> list[tuple[str, float]]:
+        """Rank against the immutable batch gallery, including found targets."""
+        return sorted(
+            (
+                (target_id, float(np.dot(target.embedding, face.embedding)))
+                for target_id, target in self._identity_targets.items()
+            ),
+            key=lambda item: item[1],
+            reverse=True,
         )
 
-    def _analyze_person_rois(
-        self, frame: np.ndarray, tracks: list[Track]
-    ) -> list[FaceObservation]:
+    def _is_face_matchable(self, face: FaceObservation) -> bool:
+        return bool(face.accepted and face.short_side >= self.settings.effective_search_min_face_px)
+
+    def _needs_roi_face_pass(self, faces: list[FaceObservation], tracks: list[Track]) -> bool:
+        return bool(self._tracks_needing_roi_face_pass(faces, tracks))
+
+    def _tracks_needing_roi_face_pass(
+        self, faces: list[FaceObservation], tracks: list[Track]
+    ) -> list[Track]:
+        """Return tracks that do not own a preferred-size full-frame face."""
+        if not tracks:
+            return []
+        accepted = [face for face in faces if SearchSession._is_face_matchable(self, face)]
+        associations = associate_faces_to_tracks_detailed(accepted, tracks)
+        satisfied_track_ids = {
+            track_id
+            for face_index, (track_id, _) in associations.items()
+            if accepted[face_index].short_side >= self.settings.preferred_search_face_px
+        }
+        return [track for track in tracks if track.track_id not in satisfied_track_ids]
+
+    def _analyze_person_rois(self, frame: np.ndarray, tracks: list[Track]) -> list[FaceObservation]:
         height, width = frame.shape[:2]
         ranked = sorted(tracks, key=lambda track: track.score, reverse=True)
         observations: list[FaceObservation] = []
@@ -518,19 +723,17 @@ class SearchSession:
             if analyzed_tracks >= self.settings.roi_max_tracks_per_pass:
                 break
             analyzed_tracks += 1
-            roi_bottom = min(y2, y1 + int(0.75 * (y2 - y1)))
+            roi_bottom = min(y2, y1 + max(1, int(self.settings.roi_person_fraction * (y2 - y1))))
             roi = frame[y1:roi_bottom, x1:x2]
             for face in self.face_backend.analyze(roi, enrollment=False):
                 observations.append(
                     replace(
                         face,
-                        bbox=face.bbox
-                        + np.asarray([x1, y1, x1, y1], dtype=np.float32),
+                        bbox=face.bbox + np.asarray([x1, y1, x1, y1], dtype=np.float32),
                         landmarks=(
                             None
                             if face.landmarks is None
-                            else face.landmarks
-                            + np.asarray([x1, y1], dtype=np.float32)
+                            else face.landmarks + np.asarray([x1, y1], dtype=np.float32)
                         ),
                     )
                 )
@@ -540,9 +743,7 @@ class SearchSession:
         with self._lock:
             self.metrics.dropped_frames += 1
 
-    def _transition(
-        self, status: SearchStatus, error: str | None, *, publish: bool = True
-    ) -> None:
+    def _transition(self, status: SearchStatus, error: str | None, *, publish: bool = True) -> None:
         with self._lock:
             if self.status in (
                 SearchStatus.STOPPED,
@@ -795,9 +996,7 @@ def _sanitize_source(source: SourceConfig) -> SourceConfig:
     parts = urlsplit(source.uri)
     host = parts.hostname or "source"
     port = f":{parts.port}" if parts.port else ""
-    return source.model_copy(
-        update={"uri": f"{parts.scheme}://{host}{port}/***"}
-    )
+    return source.model_copy(update={"uri": f"{parts.scheme}://{host}{port}/***"})
 
 
 def _normalize_target_name(name: str) -> str:
@@ -852,3 +1051,13 @@ def _bbox_iou(first: np.ndarray, second: np.ndarray) -> float:
     area_first = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
     area_second = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
     return float(intersection / max(area_first + area_second - intersection, 1e-6))
+
+
+def _face_size_bucket(short_side: int) -> str:
+    if short_side < 48:
+        return "lt48"
+    if short_side < 64:
+        return "48_63"
+    if short_side < 80:
+        return "64_79"
+    return "gte80"

@@ -65,6 +65,11 @@ class TargetSearchView(BaseModel):
     status: TargetSearchStatus = TargetSearchStatus.SEARCHING
     found_at: int | None = None
     best_similarity: float | None = None
+    best_observed_similarity: float | None = None
+    last_face_px: int | None = None
+    evidence_count: int = 0
+    required_evidence: int = 0
+    last_rejection_reason: str | None = None
 
 
 class SearchView(BaseModel):
@@ -83,6 +88,11 @@ class SearchView(BaseModel):
     unassociated_faces: int = 0
     rejection_counts: dict[str, int] = Field(default_factory=dict)
     association_counts: dict[str, int] = Field(default_factory=dict)
+    face_size_counts: dict[str, int] = Field(default_factory=dict)
+    face_source_counts: dict[str, int] = Field(default_factory=dict)
+    match_stage_counts: dict[str, int] = Field(default_factory=dict)
+    stage_p95_latency_ms: dict[str, float] = Field(default_factory=dict)
+    effective_hz: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
     targets: list[TargetSearchView] = Field(default_factory=list)
     found_count: int = 0
@@ -165,15 +175,27 @@ class SearchMetrics:
     unassociated_faces: int = 0
     rejection_counts: dict[str, int] = field(default_factory=dict)
     association_counts: dict[str, int] = field(default_factory=dict)
+    face_size_counts: dict[str, int] = field(default_factory=dict)
+    face_source_counts: dict[str, int] = field(default_factory=dict)
+    match_stage_counts: dict[str, int] = field(default_factory=dict)
+    stage_latencies_ms: dict[str, list[float]] = field(default_factory=dict)
+    stage_call_counts: dict[str, int] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
+        elapsed = 0.0
         if not self.started_at:
             fps = 0.0
         else:
             import time
 
-            fps = self.frame_count / max(time.monotonic() - self.started_at, 1e-6)
+            elapsed = max(time.monotonic() - self.started_at, 1e-6)
+            fps = self.frame_count / elapsed
         p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
+        stage_p95_latency_ms = {
+            stage: float(np.percentile(latencies[-1000:], 95))
+            for stage, latencies in sorted(self.stage_latencies_ms.items())
+            if latencies
+        }
         return {
             "processed_fps": fps,
             "p95_latency_ms": p95,
@@ -184,4 +206,12 @@ class SearchMetrics:
             "unassociated_faces": self.unassociated_faces,
             "rejection_counts": dict(sorted(self.rejection_counts.items())),
             "association_counts": dict(sorted(self.association_counts.items())),
+            "face_size_counts": dict(sorted(self.face_size_counts.items())),
+            "face_source_counts": dict(sorted(self.face_source_counts.items())),
+            "match_stage_counts": dict(sorted(self.match_stage_counts.items())),
+            "stage_p95_latency_ms": stage_p95_latency_ms,
+            "effective_hz": {
+                stage: count / elapsed if elapsed else 0.0
+                for stage, count in sorted(self.stage_call_counts.items())
+            },
         }

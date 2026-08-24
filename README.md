@@ -27,15 +27,18 @@ InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近�
 
 - 普通人脸（短边 `>= 80 px`）：相似度至少 `0.55`，在 `1.5 s` 内取得 `3` 帧证据后确认；确认前可以发布 `candidate` 事件。
 - 小人脸（短边 `64-79 px`）：相似度至少 `0.60`，在 `2 s` 内取得 `4` 帧证据后确认；为控制误报，不发布 `candidate` 事件。
-- 短边 `< 64 px`：标记为 `face_too_small`，不进入身份确认。检测框可见只表示模型检测到了人脸，不代表该帧通过尺寸、清晰度、曝光度和检测分门控。
+- 超小人脸（短边 `48-63 px`）：默认关闭；开启 `PERSON_SEARCH_TINY_FACE_ENABLED=true` 后，仅接受检测分 `>=0.65` 且严格关联到人体轨迹的脸，在 `3 s` 内取得 `6` 帧，至少 `5` 帧相似度 `>=0.64`，且质量加权聚合相似度 `>=0.68` 才命中。多目标时 Top1/Top2 差值还必须 `>=0.08`，不发布 `candidate`。默认 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true`，命中只发布 `tiny_shadow_confirmed` 诊断事件，不将目标标记为已找到。`PERSON_SEARCH_TINY_FACE_MIN_PX` 只允许向上收紧，不能配置到 `48` 以下。
+- 短边 `<48 px`：始终标记为 `face_too_small`，不进入身份确认。超小脸开关关闭时，`<64 px` 仍按原有逻辑拒绝。
 
 人脸与人体轨迹按以下顺序关联，避免把拥挤画面中的脸分配给错误旅客：
 
 1. 主规则检查人脸中心是否位于人体框的横向范围和上方 `60%` 区域；多个人体框同时满足时选择面积最小的包含框，事件中的 `association` 为 `person_strict`。
 2. 坐姿、遮挡或人体框截断导致主规则失败时，只有在人脸中心被唯一一个完整人体框包含的情况下才放宽关联，记为 `person_relaxed`；若同时落入多个人体框则拒绝猜测。
-3. 仍无法关联人体时，可用人脸框 IoU 建立短时兜底轨迹，轨迹 ID 为负数，记为 `face_fallback`。放宽关联和人脸兜底都使用更严格的 `0.60 / 4 帧 / 2 s` 策略，并抑制 `candidate` 事件。
+3. 仍无法关联人体时，可用人脸框 IoU 建立短时兜底轨迹，轨迹 ID 为负数，记为 `face_fallback`。放宽关联和人脸兜底都使用更严格的 `0.60 / 4 帧 / 2 s` 策略；`48-63 px` 超小脸不允许走这两条兜底路径。
 
-CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。当全帧没有合格人脸或只有小人脸时，系统最多选择 `8` 个高置信人体框，在人体上方 `75%` 区域做额外的人脸检测；T4 上该 ROI 通道默认 `4 Hz`，CPU 默认关闭。机场部署建议使用真实 `1920x1080` 输入并保留原始画质，低分辨率转码会直接缩小人脸短边，使远处或坐姿旅客更容易落到 `64 px` 以下。
+批量搜索会区分“完整身份竞争集”和“仍待确认目标集”：目标找到后不再累计证据，但仍保留在 Top1/Top2 身份竞争中。已找到目标继续出现在画面时，其人脸不会降级分配给剩余目标。
+
+CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px` 合格人脸的人体轨迹都会独立进入头肩 ROI 候选，不会被画面中的无关近脸关闭；每轮最多检测 `8` 个人体上方 `50%` 区域，T4 默认 `4 Hz`，CPU 默认关闭。ROI 只能改善检测和关键点稳定性，不会增加原始身份纹理。
 
 ## 使用 uv 安装
 
@@ -261,7 +264,7 @@ uv run person-search-api
 
 当前摄像头已按正方向输出，服务直接使用原始视频帧推理，不额外做旋转处理。若后续更换摄像头或转码链路，先在 RTSP 客户端确认画面方向和分辨率一致，再接入识别服务。
 
-勾选监控页的调试标注，或在接口中设置 `source.debug_preview=true`，预览会在人脸框旁显示短边像素、质量拒绝原因或 `ok`、关联方式以及相似度。白色人脸框表示通过质量门控，红色框表示被拒绝。`GET /v1/searches/{search_id}` 还返回累计诊断字段 `face_observations`、`accepted_faces`、`small_faces`、`unassociated_faces`、`rejection_counts` 和 `association_counts`，用于区分“未检测到脸”“脸太小或质量不足”“无法关联人体”和“相似度不足”。
+勾选监控页的调试标注，或在接口中设置 `source.debug_preview=true`，预览会在人脸框旁显示短边像素、质量拒绝原因或 `ok`、关联方式以及相似度。白色人脸框表示通过质量门控，红色框表示被拒绝。`GET /v1/searches/{search_id}` 还返回尺寸分桶、全帧/ROI 来源、匹配阶段计数、阶段 P95/实际频率以及每个目标各自的最佳观测相似度、最近脸宽和证据进度。`evidence_eligible` 表示通过静态门控并送入确认器，`evidence_collected` 表示经过帧去重和最小时间间隔后真正写入证据窗口；监控页的“远距离诊断”区会直接展示这些数据。
 
 RTSP 默认通过 FFmpeg 的 TCP transport 拉流，避免局域网丢包导致 H.264 花屏。只在网络可靠且更看重最低延迟时，才设置 `PERSON_SEARCH_RTSP_TRANSPORT=udp` 改回 UDP。
 
@@ -399,18 +402,21 @@ uv run person-search-eval \
 
 输出 `annotated.mp4` 和 `report.json`。默认相似度阈值 `0.55` 只用于跑通流程，不能作为机器人动作的生产阈值。应使用真实摄像头采集目标与非目标轨迹，按“可接受的每小时误确认数”重新标定 `PERSON_SEARCH_SIMILARITY_THRESHOLD`。
 
-批量标定使用版本 1 manifest。路径相对 manifest 文件解析；`expected_intervals_seconds` 是目标实际出现在视频中的起止秒数，空列表表示纯负样本：
+批量标定兼容版本 1 manifest。远距离回归建议使用版本 2，将每个目标区间标记为 `<48`、`48-55`、`56-63`、`64-79` 或 `>=80` 像素档；空列表仍表示纯负样本：
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "cases": [
     {
       "id": "gate-a-positive",
       "photo": "media/target.jpg",
       "video": "media/gate-a.mp4",
       "target_name": "张三",
-      "expected_intervals_seconds": [[12.4, 28.7], [51.0, 63.2]]
+      "expected_intervals_seconds": [
+        {"start": 12.4, "end": 28.7, "face_px_bucket": "48-55"},
+        {"start": 51.0, "end": 63.2, "face_px_bucket": "56-63"}
+      ]
     },
     {
       "id": "gate-b-negative",
@@ -430,11 +436,12 @@ uv run person-search-eval \
   --output-dir artifacts/airport-eval
 ```
 
-每个 case 会生成独立的 `annotated.mp4` 和 `report.json`，根目录报告汇总区间召回率、确认延迟、区间外误确认和非目标暴露时长。只有区间召回率至少 90%、误确认不超过每小时 0.1 次，并累计至少 10 小时非目标视频时才推荐阈值；数据不足或没有阈值通过时不会给出生产推荐。阈值扫描共用同一次模型推理，不会在报告中保存人脸 embedding。
+每个 case 会生成独立的 `annotated.mp4` 和 schema v2 `report.json`，根目录报告按尺寸档汇总召回率和平均/P95 确认延迟。`aggregate` 和 `recommended_similarity_threshold` 只统计真实生产确认；Shadow 命中使用 `shadow_confirmed` 状态并单独进入 `shadow_metrics` / `shadow_aggregate`，绝不会据此生成生产阈值推荐。只有生产整体召回率至少 90%、误确认不超过每小时 0.01 次，并累计至少 100 小时非目标视频时才推荐阈值；数据不足或没有阈值通过时不会给出生产推荐。评测会复用线上的 ROI、详细关联、尺寸分层和人脸兜底策略。
 
 ## 当前边界
 
 - ArcFace 无法识别背身或不可见的人脸；当前要求上游提供方向正确的视频帧。ByteTrack 只在短时间内延续人体轨迹，人脸 IoU 兜底也只用于短时连续画面，不能替代 Person ReID。
+- `48-63 px` 超小脸功能默认关闭，必须先完成尺寸分桶正负样本标定，再保持 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true` 验证；只有验收通过后才可设为 `false` 并驱动机器人身份动作。
 - 未实现 Person ReID 和活体检测，照片或屏幕重放可能命中。
 - `buffalo_l` 预训练模型仅限非商业研究用途。代码可以用于内部 PoC，但产品化或客户交付前必须取得模型授权或替换成权利清晰的模型。
 - 当前为单进程内存状态，只能使用一个 Uvicorn worker；多机器人扩展需要外部任务队列和状态存储。

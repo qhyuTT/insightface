@@ -10,6 +10,7 @@ from person_search.confirmation import (
     associate_faces_to_tracks,
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
+    tiny_face_match_policy,
 )
 from person_search.domain import MatchState, Target, TargetView, Track
 
@@ -35,6 +36,22 @@ def _face_with_similarity(short_side: int, similarity: float):
         embedding=(similarity, float(np.sqrt(1.0 - similarity**2))),
         bbox=(10, 10, 10 + short_side, 10 + short_side),
     )
+
+
+def _face_with_embedding(
+    short_side: int,
+    embedding: tuple[float, float],
+    *,
+    detection_score: float = 0.99,
+    quality: float = 0.9,
+):
+    face = make_face(
+        embedding=embedding,
+        bbox=(10, 10, 10 + short_side, 10 + short_side),
+        quality=quality,
+    )
+    face.detection_score = detection_score
+    return face
 
 
 def test_three_separated_frames_confirm_then_face_timeout_loses() -> None:
@@ -108,6 +125,79 @@ def test_duplicate_or_too_close_frames_do_not_accumulate() -> None:
     assert not any(item.state == MatchState.CONFIRMED for item in second)
 
 
+def test_normal_low_similarity_is_not_collected_as_evidence() -> None:
+    settings = Settings(similarity_threshold=0.8, evidence_required=2)
+    matcher = TrackConfirmation(settings)
+    policy = default_face_match_policy(_face_with_similarity(80, 0.79), settings)
+
+    result = matcher.process_with_stats(
+        frame_id=1,
+        timestamp=0.0,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[_face_with_similarity(80, 0.79)],
+        target=_target(),
+        face_policies={0: policy},
+    )
+
+    assert not policy.accepts_observation(0.99, 0.79)
+    assert result.decisions == []
+    assert result.evidence_collected == 0
+    assert matcher.track_progress() == {}
+
+
+def test_tiny_low_similarity_is_collected_as_negative_evidence() -> None:
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+
+    result = matcher.process_with_stats(
+        frame_id=1,
+        timestamp=0.0,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[_face_with_similarity(48, 0.50)],
+        target=_target(),
+        face_policies={0: policy},
+    )
+
+    assert policy.accepts_observation(0.99, 0.50)
+    assert result.decisions == []
+    assert result.evidence_collected == 1
+    assert matcher.track_progress() == {7: (1, 6)}
+
+
+def test_eligible_observation_inside_minimum_interval_is_not_collected() -> None:
+    settings = Settings(similarity_threshold=0.8, evidence_required=3)
+    matcher = TrackConfirmation(settings)
+    face = _face_with_similarity(80, 0.90)
+    policy = default_face_match_policy(face, settings)
+
+    first = matcher.process_with_stats(
+        frame_id=1,
+        timestamp=0.0,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[face],
+        target=_target(),
+        face_policies={0: policy},
+    )
+    too_close = matcher.process_with_stats(
+        frame_id=2,
+        timestamp=0.1,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[face],
+        target=_target(),
+        face_policies={0: policy},
+    )
+
+    assert policy.accepts_observation(0.99, 0.90)
+    assert first.evidence_collected == 1
+    assert too_close.evidence_collected == 0
+    assert matcher.track_progress() == {7: (1, 3)}
+
+
 def test_face_associates_to_smallest_upper_body_box() -> None:
     face = make_face(bbox=(40, 20, 60, 50))
     large = Track(1, np.asarray([0, 0, 100, 200]), 0.9)
@@ -131,9 +221,7 @@ def test_strict_association_includes_the_upper_sixty_percent_boundary() -> None:
 def test_seated_face_uses_relaxed_association_for_one_containing_track() -> None:
     face = make_face(bbox=(40, 150, 60, 170))
 
-    assert associate_faces_to_tracks_detailed([face], [_track()]) == {
-        0: (7, "person_relaxed")
-    }
+    assert associate_faces_to_tracks_detailed([face], [_track()]) == {0: (7, "person_relaxed")}
 
 
 def test_relaxed_association_rejects_multiple_containing_tracks() -> None:
@@ -249,6 +337,253 @@ def test_preferred_size_face_uses_normal_three_frame_policy() -> None:
     confirmed = [item for item in decisions if item.state == MatchState.CONFIRMED]
     assert len(confirmed) == 1
     assert confirmed[0].evidence_count == 3
+
+
+@pytest.mark.parametrize("short_side", [48, 55, 56, 63])
+def test_tiny_face_policy_is_opt_in(short_side: int) -> None:
+    disabled = Settings(tiny_face_enabled=False)
+    enabled = Settings(tiny_face_enabled=True)
+    face = _face_with_similarity(short_side, 0.70)
+
+    disabled_policy = default_face_match_policy(face, disabled)
+    enabled_policy = default_face_match_policy(face, enabled)
+
+    assert disabled_policy.threshold == disabled.similarity_threshold
+    assert enabled_policy == tiny_face_match_policy(enabled)
+    assert enabled_policy.evidence_required == 6
+    assert enabled_policy.consistent_votes_required == 5
+    assert enabled_policy.evidence_window_seconds == 3.0
+    assert enabled_policy.min_observation_interval_seconds == 0.2
+    assert enabled_policy.min_detection_score == 0.65
+    assert enabled_policy.min_top1_margin == 0.08
+    assert enabled_policy.suppress_candidate
+    assert enabled_policy.collect_all_observations
+    assert enabled_policy.requires_strict_association
+    assert enabled_policy.shadow_eligible
+
+
+def test_face_below_tiny_minimum_has_no_match_policy() -> None:
+    settings = Settings(tiny_face_enabled=True)
+
+    with pytest.raises(ValueError, match="below the effective search size floor"):
+        default_face_match_policy(_face_with_similarity(47, 0.90), settings)
+
+
+def test_tiny_face_collects_six_observations_and_requires_five_consistent_votes() -> None:
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+    decisions = []
+
+    # The first low-scoring observation is retained as negative evidence instead of
+    # being discarded before the six-frame vote.
+    similarities = (0.50, 0.75, 0.75, 0.75, 0.75, 0.75)
+    for frame_id, (timestamp, similarity) in enumerate(
+        zip((0.0, 0.2, 0.4, 0.6, 0.8, 1.0), similarities, strict=True)
+    ):
+        face = _face_with_similarity(48, similarity)
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[face],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    assert not any(item.state == MatchState.CANDIDATE for item in decisions)
+    confirmed = [item for item in decisions if item.state == MatchState.CONFIRMED]
+    assert len(confirmed) == 1
+    assert confirmed[0].evidence_count == 6
+    assert matcher.track_progress() == {7: (6, 6)}
+
+
+def test_tiny_face_rejects_four_of_six_consistent_votes() -> None:
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+
+    decisions = []
+    for frame_id, similarity in enumerate((0.50, 0.50, 0.85, 0.85, 0.85, 0.85)):
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=frame_id * 0.2,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[_face_with_similarity(48, similarity)],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    assert not any(item.state == MatchState.CONFIRMED for item in decisions)
+
+
+def test_tiny_face_requires_quality_weighted_aggregate_similarity() -> None:
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+
+    # Every individual target similarity clears 0.64, while the normalized
+    # quality-weighted aggregate stays below the stricter 0.68 threshold.
+    faces = [_face_with_embedding(48, (0.65, 0.76), quality=1.0) for _ in range(6)]
+    decisions = []
+    for frame_id, face in enumerate(faces):
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=frame_id * 0.2,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[face],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    assert not any(item.state == MatchState.CONFIRMED for item in decisions)
+
+
+def test_tiny_face_rejects_detection_score_below_point_six_five() -> None:
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+    assert not policy.accepts_observation(0.64, 1.0)
+
+    decisions = []
+    for frame_id in range(6):
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=frame_id * 0.2,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[_face_with_embedding(48, (1.0, 0.0), detection_score=0.64)],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    assert decisions == []
+    assert matcher.active_track_states() == {}
+
+
+def test_shadow_confirmed_tiny_track_can_transition_to_normal_confirmation() -> None:
+    settings = Settings(tiny_face_enabled=True, evidence_required=1)
+    matcher = TrackConfirmation(settings)
+    tiny_policy = tiny_face_match_policy(settings)
+
+    shadow_decisions = []
+    for frame_id in range(6):
+        shadow_decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=frame_id * 0.2,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[_face_with_similarity(48, 0.75)],
+                target=_target(),
+                face_policies={0: tiny_policy},
+            )
+        )
+
+    shadow_confirmed = [item for item in shadow_decisions if item.state == MatchState.CONFIRMED]
+    assert len(shadow_confirmed) == 1
+    assert shadow_confirmed[0].shadow
+    assert matcher.active_track_states()[7][0] == MatchState.CONFIRMED
+
+    close_face = _face_with_similarity(80, 0.75)
+    close_decisions = matcher.process(
+        frame_id=6,
+        timestamp=1.2,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[close_face],
+        target=_target(),
+        face_policies={0: default_face_match_policy(close_face, settings)},
+    )
+
+    assert any(item.state == MatchState.LOST and item.shadow for item in close_decisions)
+    assert any(item.state == MatchState.CONFIRMED and not item.shadow for item in close_decisions)
+
+
+def test_confirmed_track_keeps_last_matching_similarity_when_face_drops_below_threshold() -> None:
+    settings = Settings(similarity_threshold=0.55, evidence_required=3)
+    matcher = TrackConfirmation(settings)
+    face = _face_with_similarity(80, 0.70)
+    policy = default_face_match_policy(face, settings)
+
+    for frame_id, timestamp in enumerate((0.0, 0.25, 0.5)):
+        matcher.process(
+            frame_id=frame_id,
+            timestamp=timestamp,
+            frame_shape=(200, 100, 3),
+            tracks=[_track()],
+            faces=[face],
+            target=_target(),
+            face_policies={0: policy},
+        )
+
+    assert matcher.active_track_states()[7][0] == MatchState.CONFIRMED
+    assert matcher.active_track_states()[7][1] == pytest.approx(0.70, abs=1e-6)
+
+    # A glancing frame far below the threshold is not a sighting: it must not be
+    # reported as the track's similarity, or the preview shows "FOUND 0.30".
+    matcher.process(
+        frame_id=3,
+        timestamp=0.75,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[_face_with_similarity(80, 0.30)],
+        target=_target(),
+        face_policies={0: policy},
+    )
+
+    assert matcher.active_track_states()[7][1] == pytest.approx(0.70, abs=1e-6)
+
+
+def test_shadow_confirmed_tiny_track_is_lost_after_grace_when_similarity_stays_low() -> None:
+    settings = Settings(tiny_face_enabled=True, confirmed_track_grace_seconds=2.0)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+
+    for frame_id in range(6):
+        matcher.process(
+            frame_id=frame_id,
+            timestamp=frame_id * 0.2,
+            frame_shape=(200, 100, 3),
+            tracks=[_track()],
+            faces=[_face_with_similarity(48, 0.75)],
+            target=_target(),
+            face_policies={0: policy},
+        )
+
+    assert matcher.active_track_states()[7][0] == MatchState.CONFIRMED
+
+    # Sub-threshold tiny samples still enter the evidence window, but they must not
+    # keep refreshing the grace timer, or a shadow track never reports LOST.
+    decisions = []
+    for offset, frame_id in enumerate(range(6, 24)):
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=1.2 + offset * 0.2,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[_face_with_similarity(48, 0.30)],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    lost = [item for item in decisions if item.state == MatchState.LOST]
+    assert len(lost) == 1
+    assert lost[0].shadow
+    assert matcher.active_track_states() == {}
 
 
 def test_candidate_state_disappears_when_evidence_expires() -> None:

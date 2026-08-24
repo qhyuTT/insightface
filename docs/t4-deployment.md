@@ -182,3 +182,19 @@ curl http://127.0.0.1:8000/v1/searches/SEARCH_ID
 ```
 
 响应中的 `provider` 应同时表明 face 和 person detector 使用 `CUDAExecutionProvider`。
+
+### 6. 超小脸 shadow 验证
+
+`48-63px` 超小脸策略默认关闭。先在 T4 上开启策略但保持 shadow 模式；该模式只发布 `tiny_shadow_confirmed`，不会将目标标记为已找到：
+
+```bash
+docker run --rm --gpus all \
+  --name person-search \
+  -e PERSON_SEARCH_TINY_FACE_ENABLED=true \
+  -e PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true \
+  -p 8000:8000 \
+  -v person-search-models:/models \
+  person-search:t4
+```
+
+开启后，`GET /v1/searches/{search_id}` 的 `face_size_counts`、`face_source_counts`、`match_stage_counts`、`stage_p95_latency_ms` 和 `effective_hz` 必须持续采集。其中 `evidence_eligible` 是送入确认器的观测数，`evidence_collected` 才是去重和时间间隔后实际入窗数。离线 schema v2 报告将生产 `aggregate` 与 `shadow_aggregate` 分开，Shadow 通过不能生成生产阈值推荐。只有离线生产回归与 Shadow 报告都满足按尺寸分桶召回率、至少 100 小时负样本且误确认率不高于 `0.01/h` 后，才能设置 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false`。低于 `48px` 的人脸仍会被硬拒绝，`PERSON_SEARCH_TINY_FACE_MIN_PX` 不能下调突破该底线。

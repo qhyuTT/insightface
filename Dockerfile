@@ -7,9 +7,13 @@ ARG ONNXRUNTIME_GPU_VERSION=1.23.2
 ARG YOLOX_MODEL_URL=https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx
 ARG YOLOX_MODEL_SHA256=427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7
 
+# UV_HTTP_TIMEOUT is raised from the 30s default because the onnxruntime-gpu
+# wheel is ~290 MB: a mirror that stalls mid-transfer otherwise fails the
+# dependency layer and throws away every cached layer above it.
 ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     PIP_INDEX_URL=${PIP_INDEX_URL} \
     UV_INDEX_URL=${PIP_INDEX_URL} \
+    UV_HTTP_TIMEOUT=300 \
     PYTHONUNBUFFERED=1 \
     PATH=/app/.venv/bin:${PATH} \
     PERSON_SEARCH_HOST=0.0.0.0 \

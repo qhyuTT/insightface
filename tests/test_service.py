@@ -11,7 +11,13 @@ from conftest import FakeFaceBackend, FakePersonDetector, make_face
 from person_search.config import Settings
 from person_search.domain import Detection, SearchStatus, SourceConfig, Target, TargetView, Track
 from person_search.errors import EnrollmentError, PersonSearchError
-from person_search.service import PreviewHub, SearchManager, SearchSession
+from person_search.service import (
+    PreviewHub,
+    SearchManager,
+    SearchSession,
+    _merge_faces,
+    _sanitize_source,
+)
 
 
 def test_enroll_requires_exactly_one_face() -> None:
@@ -76,6 +82,104 @@ def test_preview_only_draws_active_match_tracks(state: str) -> None:
     assert np.max(visible_frame) > 0
 
 
+def test_person_roi_faces_translate_bbox_and_landmarks_to_frame_coordinates() -> None:
+    face = make_face(bbox=(5, 7, 45, 47))
+    face.landmarks = np.asarray([[10, 12], [30, 12], [20, 22]], dtype=np.float32)
+    backend = FakeFaceBackend([face])
+    session = SimpleNamespace(
+        settings=Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120),
+        face_backend=backend,
+    )
+    frame = np.zeros((400, 500, 3), dtype=np.uint8)
+    track = Track(7, np.asarray([100, 80, 300, 320], dtype=np.float32), 0.9)
+
+    observations = SearchSession._analyze_person_rois(session, frame, [track])
+
+    assert backend.calls == 1
+    np.testing.assert_array_equal(observations[0].bbox, [105, 87, 145, 127])
+    np.testing.assert_array_equal(
+        observations[0].landmarks,
+        [[110, 92], [130, 92], [120, 102]],
+    )
+    np.testing.assert_array_equal(face.bbox, [5, 7, 45, 47])
+
+
+def test_person_roi_pass_uses_top_eight_valid_tracks_by_score() -> None:
+    backend = FakeFaceBackend([])
+    session = SimpleNamespace(
+        settings=Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120),
+        face_backend=backend,
+    )
+    frame = np.zeros((500, 500, 3), dtype=np.uint8)
+    tracks = [
+        Track(
+            track_id=index,
+            bbox=np.asarray([index * 10, 10, index * 10 + 50, 210], dtype=np.float32),
+            score=float(index),
+        )
+        for index in range(10)
+    ]
+
+    SearchSession._analyze_person_rois(session, frame, tracks)
+
+    assert backend.calls == 8
+
+
+def test_merge_faces_replaces_duplicate_with_higher_quality_roi_result() -> None:
+    full_frame = make_face(bbox=(10, 10, 70, 70), quality=0.6)
+    better_roi = make_face(bbox=(12, 12, 72, 72), quality=0.9)
+    distinct = make_face(bbox=(120, 20, 180, 80), quality=0.7)
+
+    merged = _merge_faces([full_frame], [better_roi, distinct])
+
+    assert len(merged) == 2
+    assert merged[0] is better_roi
+    assert merged[1] is distinct
+
+
+def test_merge_faces_prefers_accepted_observation_over_higher_scored_rejection() -> None:
+    accepted = make_face(bbox=(10, 10, 70, 70), quality=0.5)
+    rejected = make_face(bbox=(11, 11, 71, 71), accepted=False, quality=0.99)
+
+    merged = _merge_faces([accepted], [rejected])
+    replaced = _merge_faces([rejected], [accepted])
+
+    assert merged[0] is accepted
+    assert replaced[0] is accepted
+
+
+def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_options() -> None:
+    session = SimpleNamespace(
+        _lock=threading.RLock(),
+        settings=Settings(preferred_search_face_px=80),
+        metrics=SimpleNamespace(
+            face_observations=0,
+            accepted_faces=0,
+            small_faces=0,
+            rejection_counts={},
+        ),
+    )
+    small = make_face(bbox=(0, 0, 64, 70))
+    rejected = make_face(accepted=False)
+
+    SearchSession._record_face_metrics(session, [small, rejected])
+
+    assert session.metrics.face_observations == 2
+    assert session.metrics.accepted_faces == 1
+    assert session.metrics.small_faces == 1
+    assert session.metrics.rejection_counts == {"face_blurry": 1}
+
+    sanitized = _sanitize_source(
+        SourceConfig(
+            type="rtsp",
+            uri="rtsp://user:secret@camera.test:8554/live/path?token=hidden",
+            debug_preview=True,
+        )
+    )
+    assert sanitized.uri == "rtsp://camera.test:8554/***"
+    assert sanitized.debug_preview is True
+
+
 def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> None:
     frame = np.zeros((120, 120, 3), dtype=np.uint8)
     packets = [
@@ -135,6 +239,77 @@ def test_found_target_is_removed_while_other_targets_continue(monkeypatch) -> No
     view = session.view()
     assert view.found_count == 1
     assert view.unfound_target_ids == ["target-2"]
+
+
+def test_unassociated_small_face_confirms_through_face_fallback(monkeypatch) -> None:
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=timestamp, frame=frame)
+        for index, timestamp in enumerate((0.0, 0.25, 0.5, 0.75))
+    ]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view = TargetView(
+        target_id="target-1",
+        name="张三",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-1",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "张三",
+    )
+    session = SearchSession(
+        search_id="search-fallback",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(
+            small_face_evidence_required=4,
+            small_face_evidence_window_seconds=2.0,
+        ),
+        face_backend=FakeFaceBackend([make_face(bbox=(20, 20, 84, 84))]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    events = session.events.after(0, timeout=0)
+    assert not any(event["type"] == "candidate" for event in events)
+    confirmed = [event for event in events if event["type"] == "confirmed"]
+    assert len(confirmed) == 1
+    assert confirmed[0]["data"]["association"] == "face_fallback"
+    assert confirmed[0]["data"]["track_id"] < 0
+    assert confirmed[0]["data"]["evidence_count"] == 4
+    assert session._track_states[confirmed[0]["data"]["track_id"]][0] == "confirmed"
+    assert session.status == SearchStatus.COMPLETED
+    view = session.view()
+    assert view.face_observations == 4
+    assert view.accepted_faces == 4
+    assert view.small_faces == 4
+    assert view.unassociated_faces == 0
+    assert view.association_counts == {"face_fallback": 4}
 
 
 def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:

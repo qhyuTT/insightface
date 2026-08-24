@@ -43,6 +43,8 @@ def test_monitor_page_is_available() -> None:
         assert "rtsp://192.168.31.241:8554/camera" in response.text
         assert 'id="sourceType"' not in response.text
         assert 'id="cameraIndex"' not in response.text
+        assert 'id="debugPreview" type="checkbox"' in response.text
+        assert "debug_preview" in response.text
 
 
 def test_preview_stream_returns_latest_annotated_jpeg() -> None:

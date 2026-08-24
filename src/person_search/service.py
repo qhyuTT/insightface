@@ -5,7 +5,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -14,7 +14,14 @@ import numpy as np
 
 from .backends import FaceBackend, InsightFaceBackend
 from .config import Settings
-from .confirmation import TrackConfirmation, normalize_bbox
+from .confirmation import (
+    FaceMatchPolicy,
+    TrackConfirmation,
+    associate_faces_to_tracks_detailed,
+    default_face_match_policy,
+    fallback_face_match_policy,
+    normalize_bbox,
+)
 from .detector import PersonDetector, YoloXOnnxDetector
 from .domain import (
     FaceObservation,
@@ -35,6 +42,7 @@ from .errors import (
     PersonSearchError,
     SearchStopTimeoutError,
 )
+from .face_tracking import FaceTracker
 from .quality import normalize_embedding
 from .tracker import ByteTracker
 from .video import LatestFrameReader
@@ -118,10 +126,13 @@ class SearchSession:
         self.events = EventHub()
         self.preview = PreviewHub()
         self._tracker = ByteTracker()
+        self._face_tracker = FaceTracker(
+            iou_threshold=self.settings.face_track_iou_threshold,
+            buffer_seconds=self.settings.face_track_buffer_seconds,
+        )
         self._confirmations = {
             target.target_id: TrackConfirmation(self.settings) for target in self.targets
         }
-        self._all_targets = {target.target_id: target for target in self.targets}
         self._active_targets = {target.target_id: target for target in self.targets}
         self._target_status = {
             target.target_id: {"status": "searching", "found_at": None, "best_similarity": None}
@@ -132,6 +143,7 @@ class SearchSession:
         self._reader: LatestFrameReader | None = None
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
+        self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
         self._stop_requested = False
         self._deferred_events: list[tuple[str, dict[str, Any]]] = []
@@ -200,6 +212,7 @@ class SearchSession:
         tracks: list[Track] = []
         last_person_at = -1e9
         last_face_at = -1e9
+        last_roi_face_at = -1e9
         is_cuda = "CUDA" in (self.face_backend.provider_name + self.person_detector.provider_name)
         person_hz = (
             self.settings.person_detection_hz_cuda
@@ -208,6 +221,11 @@ class SearchSession:
         )
         face_hz = (
             self.settings.face_detection_hz_cuda if is_cuda else self.settings.face_detection_hz_cpu
+        )
+        roi_face_hz = (
+            self.settings.roi_face_detection_hz_cuda
+            if is_cuda
+            else self.settings.roi_face_detection_hz_cpu
         )
         try:
             reader.start()
@@ -233,62 +251,114 @@ class SearchSession:
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
                     faces = self.face_backend.analyze(packet.frame, enrollment=False)
                     last_face_at = now
-                faces_by_target: dict[str, list[FaceObservation]] = {
+                    if (
+                        roi_face_hz > 0
+                        and now - last_roi_face_at >= 1.0 / roi_face_hz
+                        and self._needs_roi_face_pass(faces, tracks)
+                    ):
+                        roi_faces = self._analyze_person_rois(packet.frame, tracks)
+                        faces = _merge_faces(faces, roi_faces)
+                        last_roi_face_at = now
+                    self._record_face_metrics(faces)
+
+                accepted_faces = [face for face in faces if face.accepted]
+                detailed = associate_faces_to_tracks_detailed(accepted_faces, tracks)
+                association_by_face = {
+                    face_index: track_id for face_index, (track_id, _) in detailed.items()
+                }
+                modes_by_face = {
+                    face_index: mode for face_index, (_, mode) in detailed.items()
+                }
+                all_tracks = list(tracks)
+                fallback_policy = fallback_face_match_policy(self.settings)
+                policies_by_face: dict[int, FaceMatchPolicy] = {
+                    face_index: default_face_match_policy(face, self.settings)
+                    for face_index, face in enumerate(accepted_faces)
+                }
+                for face_index, mode in modes_by_face.items():
+                    if mode == "person_relaxed":
+                        policies_by_face[face_index] = fallback_policy
+                unassociated_indices = [
+                    face_index
+                    for face_index, face in enumerate(accepted_faces)
+                    if face_index not in association_by_face
+                    and face.detection_score >= self.settings.fallback_face_detection_threshold
+                ]
+                if self.settings.face_fallback_enabled and unassociated_indices:
+                    fallback_faces = [accepted_faces[index] for index in unassociated_indices]
+                    fallback_tracks = self._face_tracker.update(fallback_faces, now)
+                    all_tracks.extend(track for track in fallback_tracks if track is not None)
+                    for fallback_index, fallback_track in enumerate(fallback_tracks):
+                        if fallback_track is None:
+                            continue
+                        original_index = unassociated_indices[fallback_index]
+                        association_by_face[original_index] = fallback_track.track_id
+                        modes_by_face[original_index] = "face_fallback"
+                        policies_by_face[original_index] = fallback_policy
+                with self._lock:
+                    self.metrics.unassociated_faces += sum(
+                        face_index not in association_by_face
+                        for face_index in range(len(accepted_faces))
+                    )
+                    for mode in modes_by_face.values():
+                        self.metrics.association_counts[mode] = (
+                            self.metrics.association_counts.get(mode, 0) + 1
+                        )
+
+                self._debug_faces = []
+                faces_by_target: dict[str, list[tuple[int, FaceObservation]]] = {
                     target_id: [] for target_id in self._active_targets
                 }
-                for face in faces:
-                    if not face.accepted or not self._active_targets:
-                        continue
+                for face_index, face in enumerate(accepted_faces):
+                    if not self._active_targets:
+                        break
                     target_id, similarity = max(
                         (
                             (target_id, float(np.dot(target.embedding, face.embedding)))
-                            for target_id, target in self._all_targets.items()
+                            for target_id, target in self._active_targets.items()
                         ),
                         key=lambda item: item[1],
                     )
+                    mode = modes_by_face.get(face_index, "unassociated")
+                    self._debug_faces.append((face, mode, similarity))
+                    policy = policies_by_face[face_index]
                     if (
-                        target_id in self._active_targets
-                        and similarity >= self.settings.similarity_threshold
+                        similarity >= policy.threshold
+                        and face_index in association_by_face
                     ):
-                        faces_by_target[target_id].append(face)
+                        faces_by_target[target_id].append((face_index, face))
 
                 track_states: dict[int, tuple[str, float]] = {}
                 for target_id, target in list(self._active_targets.items()):
+                    target_faces = faces_by_target.get(target_id, [])
+                    local_faces = [face for _, face in target_faces]
+                    local_associations = {
+                        local_index: association_by_face[global_index]
+                        for local_index, (global_index, _) in enumerate(target_faces)
+                    }
+                    local_modes = {
+                        local_index: modes_by_face[global_index]
+                        for local_index, (global_index, _) in enumerate(target_faces)
+                    }
+                    local_policies = {
+                        local_index: policies_by_face[global_index]
+                        for local_index, (global_index, _) in enumerate(target_faces)
+                    }
                     confirmation = self._confirmations[target_id]
                     decisions = confirmation.process(
                         frame_id=packet.frame_id,
                         timestamp=now,
                         frame_shape=packet.frame.shape,
-                        tracks=tracks,
-                        faces=faces_by_target[target_id],
+                        tracks=all_tracks,
+                        faces=local_faces,
                         target=target,
+                        associations=local_associations,
+                        association_modes=local_modes,
+                        face_policies=local_policies,
                     )
-                    for decision in decisions:
-                        event = SearchEvent(
-                            search_id=self.search_id,
-                            target_id=target.target_id,
-                            target_name=target.name,
-                            state=decision.state,
-                            timestamp_ms=int(time.time() * 1000),
-                            track_id=decision.track_id,
-                            bbox=normalize_bbox(decision.bbox, packet.frame.shape),
-                            similarity=decision.similarity,
-                            quality=decision.quality,
-                            evidence_count=decision.evidence_count,
-                            model=self.face_backend.model_name,
-                        )
-                        payload = event.model_dump(mode="json")
-                        self.events.publish(decision.state.value, payload)
-                        with self._lock:
-                            current = self._target_status[target_id]
-                            current["best_similarity"] = max(
-                                decision.similarity, current["best_similarity"] or -1.0
-                            )
-                            if decision.state.value == "confirmed":
-                                current["status"] = "found"
-                                current["found_at"] = payload["timestamp_ms"]
-                                self._deferred_events.append(("target_found", payload))
-                                self._active_targets.pop(target_id, None)
+                    self._handle_decisions(
+                        target_id, target, decisions, packet.frame.shape
+                    )
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
                         previous = track_states.get(track_id)
                         if (
@@ -301,9 +371,10 @@ class SearchSession:
                 if not self._active_targets:
                     self._transition(SearchStatus.COMPLETED, None, publish=False)
                     break
-                self._publish_preview(packet.frame, tracks, faces)
-                self.metrics.frame_count += 1
-                self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
+                self._publish_preview(packet.frame, all_tracks, faces)
+                with self._lock:
+                    self.metrics.frame_count += 1
+                    self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
         except Exception as exc:  # noqa: BLE001 - the worker must fail closed and release resources
             self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
         finally:
@@ -350,10 +421,120 @@ class SearchSession:
             )
         for face in faces:
             x1, y1, x2, y2 = (int(value) for value in face.bbox)
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), (232, 232, 232), 1)
+            color = (232, 232, 232) if face.accepted else (70, 70, 230)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1)
+            if self.source.debug_preview:
+                debug = next((item for item in self._debug_faces if item[0] is face), None)
+                reasons = "ok" if face.accepted else ",".join(face.rejection_reasons)
+                mode = debug[1] if debug else "rejected"
+                similarity = "" if debug is None or debug[2] is None else f" sim={debug[2]:.2f}"
+                label = f"{face.short_side}px {reasons} {mode}{similarity}"
+                cv2.putText(
+                    canvas,
+                    label,
+                    (max(0, x1), max(12, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
         ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if ok:
             self.preview.publish(encoded.tobytes())
+
+    def _handle_decisions(
+        self,
+        target_id: str,
+        target: Target | None,
+        decisions: list,
+        frame_shape: tuple[int, ...],
+    ) -> None:
+        if target is None:
+            return
+        for decision in decisions:
+            event = SearchEvent(
+                search_id=self.search_id,
+                target_id=target.target_id,
+                target_name=target.name,
+                state=decision.state,
+                timestamp_ms=int(time.time() * 1000),
+                track_id=decision.track_id,
+                bbox=normalize_bbox(decision.bbox, frame_shape),
+                similarity=decision.similarity,
+                quality=decision.quality,
+                evidence_count=decision.evidence_count,
+                model=self.face_backend.model_name,
+                association=decision.association,
+            )
+            payload = event.model_dump(mode="json")
+            self.events.publish(decision.state.value, payload)
+            with self._lock:
+                current = self._target_status[target_id]
+                current["best_similarity"] = max(
+                    decision.similarity, current["best_similarity"] or -1.0
+                )
+                if decision.state.value == "confirmed":
+                    current["status"] = "found"
+                    current["found_at"] = payload["timestamp_ms"]
+                    self._deferred_events.append(("target_found", payload))
+                    self._active_targets.pop(target_id, None)
+
+    def _record_face_metrics(self, faces: list[FaceObservation]) -> None:
+        with self._lock:
+            self.metrics.face_observations += len(faces)
+            self.metrics.accepted_faces += sum(face.accepted for face in faces)
+            self.metrics.small_faces += sum(
+                face.accepted and face.short_side < self.settings.preferred_search_face_px
+                for face in faces
+            )
+            for face in faces:
+                for reason in face.rejection_reasons:
+                    self.metrics.rejection_counts[reason] = (
+                        self.metrics.rejection_counts.get(reason, 0) + 1
+                    )
+
+    def _needs_roi_face_pass(self, faces: list[FaceObservation], tracks: list[Track]) -> bool:
+        accepted = [face for face in faces if face.accepted]
+        if not tracks:
+            return False
+        return not accepted or all(
+            face.short_side < self.settings.preferred_search_face_px for face in accepted
+        )
+
+    def _analyze_person_rois(
+        self, frame: np.ndarray, tracks: list[Track]
+    ) -> list[FaceObservation]:
+        height, width = frame.shape[:2]
+        ranked = sorted(tracks, key=lambda track: track.score, reverse=True)
+        observations: list[FaceObservation] = []
+        analyzed_tracks = 0
+        for track in ranked:
+            x1, y1, x2, y2 = track.bbox.astype(int)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if y2 - y1 < self.settings.roi_min_person_height_px or x2 <= x1 or y2 <= y1:
+                continue
+            if analyzed_tracks >= self.settings.roi_max_tracks_per_pass:
+                break
+            analyzed_tracks += 1
+            roi_bottom = min(y2, y1 + int(0.75 * (y2 - y1)))
+            roi = frame[y1:roi_bottom, x1:x2]
+            for face in self.face_backend.analyze(roi, enrollment=False):
+                observations.append(
+                    replace(
+                        face,
+                        bbox=face.bbox
+                        + np.asarray([x1, y1, x1, y1], dtype=np.float32),
+                        landmarks=(
+                            None
+                            if face.landmarks is None
+                            else face.landmarks
+                            + np.asarray([x1, y1], dtype=np.float32)
+                        ),
+                    )
+                )
+        return observations
 
     def _on_drop(self) -> None:
         with self._lock:
@@ -614,7 +795,9 @@ def _sanitize_source(source: SourceConfig) -> SourceConfig:
     parts = urlsplit(source.uri)
     host = parts.hostname or "source"
     port = f":{parts.port}" if parts.port else ""
-    return SourceConfig(type=SourceType.RTSP, uri=f"{parts.scheme}://{host}{port}/***")
+    return source.model_copy(
+        update={"uri": f"{parts.scheme}://{host}{port}/***"}
+    )
 
 
 def _normalize_target_name(name: str) -> str:
@@ -633,3 +816,39 @@ def _safe_error(exc: Exception) -> str:
     if isinstance(exc, ModelUnavailableError):
         return exc.message
     return f"{type(exc).__name__}: processing failed"
+
+
+def _merge_faces(
+    primary: list[FaceObservation], secondary: list[FaceObservation], iou_threshold: float = 0.45
+) -> list[FaceObservation]:
+    """Merge full-frame and ROI face observations without double counting a face."""
+    merged = list(primary)
+    for candidate in secondary:
+        duplicate_index = next(
+            (
+                index
+                for index, existing in enumerate(merged)
+                if _bbox_iou(existing.bbox, candidate.bbox) >= iou_threshold
+            ),
+            None,
+        )
+        if duplicate_index is None:
+            merged.append(candidate)
+        elif _prefer_face(candidate, merged[duplicate_index]):
+            merged[duplicate_index] = candidate
+    return merged
+
+
+def _prefer_face(candidate: FaceObservation, existing: FaceObservation) -> bool:
+    if candidate.accepted != existing.accepted:
+        return candidate.accepted
+    return candidate.quality > existing.quality
+
+
+def _bbox_iou(first: np.ndarray, second: np.ndarray) -> float:
+    x1, y1 = max(first[0], second[0]), max(first[1], second[1])
+    x2, y2 = min(first[2], second[2]), min(first[3], second[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_first = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    area_second = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    return float(intersection / max(area_first + area_second - intersection, 1e-6))

@@ -40,6 +40,7 @@ class SourceConfig(BaseModel):
     type: SourceType
     uri: str | None = None
     device_index: int | None = Field(default=None, ge=0)
+    debug_preview: bool = False
 
     @model_validator(mode="after")
     def validate_source(self) -> SourceConfig:
@@ -76,6 +77,12 @@ class SearchView(BaseModel):
     processed_fps: float = 0.0
     p95_latency_ms: float = 0.0
     dropped_frames: int = 0
+    face_observations: int = 0
+    accepted_faces: int = 0
+    small_faces: int = 0
+    unassociated_faces: int = 0
+    rejection_counts: dict[str, int] = Field(default_factory=dict)
+    association_counts: dict[str, int] = Field(default_factory=dict)
     error: str | None = None
     targets: list[TargetSearchView] = Field(default_factory=list)
     found_count: int = 0
@@ -107,6 +114,7 @@ class SearchEvent(BaseModel):
     quality: float
     evidence_count: int
     model: str
+    association: str = "person_strict"
 
 
 @dataclass(slots=True)
@@ -132,6 +140,10 @@ class FaceObservation:
     accepted: bool = True
     rejection_reasons: tuple[str, ...] = ()
 
+    @property
+    def short_side(self) -> int:
+        return max(0, int(min(self.bbox[2] - self.bbox[0], self.bbox[3] - self.bbox[1])))
+
 
 @dataclass(slots=True)
 class Target:
@@ -147,6 +159,12 @@ class SearchMetrics:
     dropped_frames: int = 0
     started_at: float = 0.0
     latencies_ms: list[float] = field(default_factory=list)
+    face_observations: int = 0
+    accepted_faces: int = 0
+    small_faces: int = 0
+    unassociated_faces: int = 0
+    rejection_counts: dict[str, int] = field(default_factory=dict)
+    association_counts: dict[str, int] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         if not self.started_at:
@@ -156,4 +174,14 @@ class SearchMetrics:
 
             fps = self.frame_count / max(time.monotonic() - self.started_at, 1e-6)
         p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
-        return {"processed_fps": fps, "p95_latency_ms": p95, "dropped_frames": self.dropped_frames}
+        return {
+            "processed_fps": fps,
+            "p95_latency_ms": p95,
+            "dropped_frames": self.dropped_frames,
+            "face_observations": self.face_observations,
+            "accepted_faces": self.accepted_faces,
+            "small_faces": self.small_faces,
+            "unassociated_faces": self.unassociated_faces,
+            "rejection_counts": dict(sorted(self.rejection_counts.items())),
+            "association_counts": dict(sorted(self.association_counts.items())),
+        }

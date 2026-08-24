@@ -53,6 +53,34 @@ def test_face_quality_reports_small_dark_blurry_face() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("short_side", "accepted"),
+    [(63, False), (64, True)],
+)
+def test_search_face_size_boundary(short_side: int, accepted: bool) -> None:
+    checker = np.indices((160, 160)).sum(axis=0) % 2
+    frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    result = assess_face(
+        frame,
+        np.asarray([20, 20, 20 + short_side, 20 + short_side]),
+        None,
+        0.99,
+        Settings(
+            face_detection_threshold=0.0,
+            min_search_face_px=64,
+            min_search_blur_variance=0.0,
+            min_brightness=0.0,
+            max_brightness=255.0,
+        ),
+        enrollment=False,
+    )
+
+    assert result.accepted is accepted
+    assert result.face_width == short_side
+    assert result.face_height == short_side
+    assert ("face_too_small" in result.reasons) is not accepted
+
+
 def test_search_accepts_pose_and_score_that_enrollment_rejects() -> None:
     checker = np.indices((200, 200)).sum(axis=0) % 2
     frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)

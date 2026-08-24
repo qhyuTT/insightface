@@ -55,6 +55,8 @@
     }
     input:focus, textarea:focus { border-color: var(--signal); }
     textarea { resize: vertical; min-height: 78px; }
+    .check-option { display: flex; align-items: center; gap: 8px; min-height: 39px; margin: 16px 0 0; cursor: pointer; white-space: nowrap; }
+    .check-option input { accent-color: var(--signal); }
     .batch-tools input[type="file"] { width: 100%; color: var(--muted); font: 11px Menlo, monospace; }
     .file-drop { border: 1px dashed #52665e; min-height: 144px; display: grid; place-items: center; position: relative; overflow: hidden; cursor: pointer; }
     .file-drop:hover { border-color: var(--signal); }
@@ -126,6 +128,10 @@
 
         <label for="rtspUri">RTSP URI</label>
         <input id="rtspUri" type="text" value="rtsp://192.168.31.241:8554/camera">
+        <label class="check-option" for="debugPreview">
+          <input id="debugPreview" type="checkbox">
+          调试标注
+        </label>
         <button id="startBtn" disabled>02 · 开始实时寻找</button>
         <button id="stopBtn" class="secondary danger" disabled>停止本次搜索</button>
         <div class="notice" id="notice"></div>
@@ -164,6 +170,13 @@
       if (status === 'running') { $('scanline').style.display = 'block'; $('banner').textContent = '● 正在寻找目标'; }
     }
     function problem(body, fallback) { return body?.detail?.message || fallback; }
+    function sourceConfig() {
+      return {
+        type: 'rtsp',
+        uri: $('rtspUri').value.trim(),
+        debug_preview: $('debugPreview').checked,
+      };
+    }
     function renderTargets(targets = []) {
       $('batchInfo').textContent = targets.map(item => `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}`).join('\n');
     }
@@ -200,7 +213,7 @@
       const files = [...$('batchFiles').files];
       const data = new FormData();
       data.append('targets', JSON.stringify(names.map((name, index) => ({name, image_filename: files[index].name}))));
-      data.append('source', JSON.stringify({type:'rtsp', uri:$('rtspUri').value.trim()}));
+      data.append('source', JSON.stringify(sourceConfig()));
       if ($('batchTimeout').value) data.append('timeout_seconds', $('batchTimeout').value);
       files.forEach(file => data.append('images', file));
       try {
@@ -216,7 +229,7 @@
     });
     $('startBtn').addEventListener('click', async () => {
       fail(''); $('startBtn').disabled = true;
-      const source = {type:'rtsp', uri:$('rtspUri').value.trim()};
+      const source = sourceConfig();
       try {
         const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, source})});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));

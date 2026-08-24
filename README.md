@@ -21,6 +21,22 @@ InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近�
 
 登记照和视频帧使用不同门控：登记照至少需要 `0.60` 检测分，并保持严格的正脸姿态要求；视频检测从 `0.45` 开始，不因 roll/yaw 直接拒绝，而是将姿态作为质量软分。视频帧仍使用更严格的运动模糊过滤，避免低质量帧成为确认依据。`PERSON_SEARCH_MAX_ABS_ROLL_DEGREES` 和 `PERSON_SEARCH_MAX_YAW_PROXY` 只约束登记照。
 
+### 机场场景识别规则
+
+人脸尺寸使用推理输入原始帧中的人脸框短边，不是浏览器缩放后的预览尺寸。默认按以下规则累计同一轨迹的多帧证据：
+
+- 普通人脸（短边 `>= 80 px`）：相似度至少 `0.55`，在 `1.5 s` 内取得 `3` 帧证据后确认；确认前可以发布 `candidate` 事件。
+- 小人脸（短边 `64-79 px`）：相似度至少 `0.60`，在 `2 s` 内取得 `4` 帧证据后确认；为控制误报，不发布 `candidate` 事件。
+- 短边 `< 64 px`：标记为 `face_too_small`，不进入身份确认。检测框可见只表示模型检测到了人脸，不代表该帧通过尺寸、清晰度、曝光度和检测分门控。
+
+人脸与人体轨迹按以下顺序关联，避免把拥挤画面中的脸分配给错误旅客：
+
+1. 主规则检查人脸中心是否位于人体框的横向范围和上方 `60%` 区域；多个人体框同时满足时选择面积最小的包含框，事件中的 `association` 为 `person_strict`。
+2. 坐姿、遮挡或人体框截断导致主规则失败时，只有在人脸中心被唯一一个完整人体框包含的情况下才放宽关联，记为 `person_relaxed`；若同时落入多个人体框则拒绝猜测。
+3. 仍无法关联人体时，可用人脸框 IoU 建立短时兜底轨迹，轨迹 ID 为负数，记为 `face_fallback`。放宽关联和人脸兜底都使用更严格的 `0.60 / 4 帧 / 2 s` 策略，并抑制 `candidate` 事件。
+
+CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。当全帧没有合格人脸或只有小人脸时，系统最多选择 `8` 个高置信人体框，在人体上方 `75%` 区域做额外的人脸检测；T4 上该 ROI 通道默认 `4 Hz`，CPU 默认关闭。机场部署建议使用真实 `1920x1080` 输入并保留原始画质，低分辨率转码会直接缩小人脸短边，使远处或坐姿旅客更容易落到 `64 px` 以下。
+
 ## 使用 uv 安装
 
 项目固定使用 Python 3.11，并由 `uv.lock` 锁定依赖。
@@ -45,7 +61,7 @@ InsightFace 自身会传递依赖 CPU 版 `onnxruntime`，而 `onnxruntime-gpu` 
 
 #### 在 NVIDIA T4 上快速测试
 
-T4 具备 16 GB 显存，运行当前的 YOLOX-Tiny + `buffalo_l` 模型没有显存压力。服务器需要已安装 NVIDIA 驱动、CUDA/cuDNN 和 Python 3.11；先确认驱动可以看到 GPU：
+T4 具备 16 GB 显存，运行当前的 YOLOX-Tiny + `buffalo_l` 模型没有显存压力。机场场景建议输入 `1920x1080`，保持 CUDA 全帧人脸检测 `10 Hz`，并启用默认的 `4 Hz` 人体 ROI 补充检测（每轮最多 `8` 个人体框）；不要在未回归误报率和 P95 延迟前继续下调最小人脸尺寸。服务器需要已安装 NVIDIA 驱动、CUDA/cuDNN 和 Python 3.11；先确认驱动可以看到 GPU：
 
 ```bash
 nvidia-smi
@@ -243,6 +259,10 @@ uv run person-search-api
 
 可视化监控页位于 `http://127.0.0.1:8000/monitor`（根路径也会打开该页面）。页面可以完成目标照片登记、启动/停止搜索，并显示带人物框和人脸框的实时视频：普通轨迹为蓝框，候选目标为黄框，连续多帧确认后为绿框。状态、FPS、延迟、相似度和识别事件会同步更新。视频预览使用只保留最新帧的 MJPEG 流，不会因浏览器读取慢而阻塞推理。
 
+当前摄像头已按正方向输出，服务直接使用原始视频帧推理，不额外做旋转处理。若后续更换摄像头或转码链路，先在 RTSP 客户端确认画面方向和分辨率一致，再接入识别服务。
+
+勾选监控页的调试标注，或在接口中设置 `source.debug_preview=true`，预览会在人脸框旁显示短边像素、质量拒绝原因或 `ok`、关联方式以及相似度。白色人脸框表示通过质量门控，红色框表示被拒绝。`GET /v1/searches/{search_id}` 还返回累计诊断字段 `face_observations`、`accepted_faces`、`small_faces`、`unassociated_faces`、`rejection_counts` 和 `association_counts`，用于区分“未检测到脸”“脸太小或质量不足”“无法关联人体”和“相似度不足”。
+
 RTSP 默认通过 FFmpeg 的 TCP transport 拉流，避免局域网丢包导致 H.264 花屏。只在网络可靠且更看重最低延迟时，才设置 `PERSON_SEARCH_RTSP_TRANSPORT=udp` 改回 UDP。
 
 ### 发布 Mac 摄像头 RTSP
@@ -271,7 +291,7 @@ brew install mediamtx ffmpeg
 ./scripts/local_rtsp.sh logs -f
 ```
 
-首次运行需要在 macOS“系统设置 → 隐私与安全性 → 摄像头”中允许 FFmpeg。默认发布地址为 `rtsp://127.0.0.1:8554/camera`；同一局域网内的 T4 使用 Mac 的局域网 IP，例如：
+首次运行需要在 macOS“系统设置 → 隐私与安全性 → 摄像头”中允许 FFmpeg。脚本默认采集 `1920x1080` 并发布到 `rtsp://127.0.0.1:8554/camera`；同一局域网内的 T4 使用 Mac 的局域网 IP，例如：
 
 服务器中的 RTSP source：
 
@@ -283,10 +303,11 @@ brew install mediamtx ffmpeg
 
 ```bash
 LOCAL_RTSP_CAMERA_DEVICE=1 \
-LOCAL_RTSP_VIDEO_SIZE=1920x1080 \
 LOCAL_RTSP_FRAME_RATE=25 \
 ./scripts/local_rtsp.sh restart
 ```
+
+`LOCAL_RTSP_VIDEO_SIZE` 默认已经是 `1920x1080`；摄像头不支持该模式时可以显式覆盖，但应重新评估实际人脸短边是否仍能达到 `64 px`。
 
 完整参数列表使用 `./scripts/local_rtsp.sh help` 查看。无论哪种方式，都应先从 T4 服务器测试 RTSP 能否读取到一帧。
 
@@ -314,7 +335,7 @@ FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时�
 - `POST /v1/targets`：multipart 字段 `name` 和 `image`；姓名必填，照片必须恰好包含一张质量合格的人脸。姓名会出现在监控页的找到横幅和事件列表中。
 - `POST /v1/searches`：启动 RTSP 或 USB 搜索。
 - `POST /v1/batch-searches`：一次上传最多 20 组姓名与照片并启动异步搜索。
-- `GET /v1/searches/{search_id}`：查询状态、provider、FPS 和 P95 延迟。
+- `GET /v1/searches/{search_id}`：查询状态、provider、FPS、P95 延迟和累计人脸诊断计数。
 - `GET /v1/searches/{search_id}/preview.mjpg`：获取后端画框后的实时 MJPEG 预览。
 - `WS /v1/searches/{search_id}/events?after_seq=0`：订阅 `candidate`、`confirmed`、`lost` 和 `search_status`。
 - `DELETE /v1/searches/{search_id}`：停止任务并清除登记数据。
@@ -324,9 +345,15 @@ FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时�
 ```json
 {
   "target_id": "returned-target-uuid",
-  "source": {"type": "rtsp", "uri": "rtsp://user:password@camera/stream"}
+  "source": {
+    "type": "rtsp",
+    "uri": "rtsp://user:password@camera/stream",
+    "debug_preview": true
+  }
 }
 ```
+
+`debug_preview` 只增加预览标注和诊断可见性，不改变匹配阈值。
 
 目标登记示例：
 
@@ -407,7 +434,7 @@ uv run person-search-eval \
 
 ## 当前边界
 
-- ArcFace 无法识别背身或不可见的人脸；ByteTrack 只在短时间内延续已经确认的轨迹。
+- ArcFace 无法识别背身或不可见的人脸；当前要求上游提供方向正确的视频帧。ByteTrack 只在短时间内延续人体轨迹，人脸 IoU 兜底也只用于短时连续画面，不能替代 Person ReID。
 - 未实现 Person ReID 和活体检测，照片或屏幕重放可能命中。
 - `buffalo_l` 预训练模型仅限非商业研究用途。代码可以用于内部 PoC，但产品化或客户交付前必须取得模型授权或替换成权利清晰的模型。
 - 当前为单进程内存状态，只能使用一个 Uvicorn worker；多机器人扩展需要外部任务队列和状态存储。

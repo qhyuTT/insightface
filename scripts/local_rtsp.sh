@@ -11,7 +11,7 @@ CAMERA_JOB="${DOMAIN}/${CAMERA_LABEL}"
 RTSP_PORT="${LOCAL_RTSP_PORT:-8554}"
 RTSP_PATH="${LOCAL_RTSP_PATH:-camera}"
 CAMERA_DEVICE="${LOCAL_RTSP_CAMERA_DEVICE:-0}"
-VIDEO_SIZE="${LOCAL_RTSP_VIDEO_SIZE:-1280x720}"
+VIDEO_SIZE="${LOCAL_RTSP_VIDEO_SIZE:-1920x1080}"
 FRAME_RATE="${LOCAL_RTSP_FRAME_RATE:-30}"
 VIDEO_BITRATE="${LOCAL_RTSP_VIDEO_BITRATE:-2500k}"
 START_TIMEOUT="${LOCAL_RTSP_START_TIMEOUT:-20}"
@@ -56,7 +56,7 @@ Commands:
 
 Environment overrides:
   LOCAL_RTSP_CAMERA_DEVICE      AVFoundation camera index/name (default: 0)
-  LOCAL_RTSP_VIDEO_SIZE         Capture size (default: 1280x720)
+  LOCAL_RTSP_VIDEO_SIZE         Capture size (default: 1920x1080)
   LOCAL_RTSP_FRAME_RATE         Capture FPS (default: 30)
   LOCAL_RTSP_VIDEO_BITRATE      H.264 bitrate (default: 2500k)
   LOCAL_RTSP_PORT               RTSP port (default: 8554)
@@ -81,7 +81,7 @@ validate_settings() {
   ((FRAME_RATE > 0)) || fail "LOCAL_RTSP_FRAME_RATE must be greater than zero"
   [[ "${START_TIMEOUT}" =~ ^[0-9]+$ ]] || fail "LOCAL_RTSP_START_TIMEOUT must be a positive integer"
   ((START_TIMEOUT > 0)) || fail "LOCAL_RTSP_START_TIMEOUT must be greater than zero"
-  [[ "${VIDEO_SIZE}" =~ ^[0-9]+x[0-9]+$ ]] || fail "LOCAL_RTSP_VIDEO_SIZE must look like 1280x720"
+  [[ "${VIDEO_SIZE}" =~ ^[0-9]+x[0-9]+$ ]] || fail "LOCAL_RTSP_VIDEO_SIZE must look like 1920x1080"
   [[ "${RTSP_PATH}" =~ ^[A-Za-z0-9._~-]+$ ]] || fail "LOCAL_RTSP_PATH contains unsupported characters"
 }
 

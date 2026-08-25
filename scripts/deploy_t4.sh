@@ -185,6 +185,8 @@ docker run --detach \
   --env "PERSON_SEARCH_HOST=${T4_BIND_HOST}" \
   --env "PERSON_SEARCH_PORT=8000" \
   --env "PERSON_SEARCH_PREFER_CUDA=true" \
+  --env "PERSON_SEARCH_TINY_FACE_ENABLED=true" \
+  --env "PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false" \
   "${T4_IMAGE_NAME}" >/dev/null
 
 log "Waiting for API health check"

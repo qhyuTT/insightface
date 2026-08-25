@@ -21,3 +21,7 @@
 - 给 ROI 选择加入 per-track 冷却这类副作用后，必须清查是否存在"看起来是纯谓词"的包装函数。`_needs_roi_face_pass()` 只是 `bool(_tracks_needing_roi_face_pass(...))`，加了退避计数后调用它会静默消耗冷却额度。这类函数应删除而不是保留。
 - 改 `FaceBackend` 协议时必须同步 `cli.py` 的离线评估链路——它直接复用了 `SearchSession._tracks_needing_roi_face_pass` / `_analyze_person_rois` 私有方法和一个 `SimpleNamespace` 上下文。漏改的后果不是报错而是更糟：校准出的阈值来自一条生产环境不存在的流水线。
 - 性能改动的验收标准是"确认数不变"，不是"帧率变高"。用 `git stash` + `person-search-eval` 跑同一素材对比 `face_observations` / `evidence_collected` / `confirmed_events`，三者必须逐项相等；再用真实模型对比新旧嵌入的 `cos` 是否为 1.0。只跑注入 fake 的单测无法发现真实后端 API 用错。
+- 限流/预算判据的**分母必须匹配被限流阶段的节奏，并且要在它实际被求值的那一帧上成立**。`_roi_fits_budget` 拿 `1/target_loop_hz`（100ms）的单帧余额去卡 ROI，而 ROI 只在「刚跑完全帧人脸检测」那一帧被求值，该帧必做成本 125ms 已超预算，余额结构性为负 → 可选阶段占空比恒为 0（实测 ROI 全程只跑 1 次、跳过 1498 次），远脸召回归零。这与第 18 条的「限流只有下限没有上限」是同一个错误的两个方向：一个恒真、一个恒假。可选阶段的成本要摊到它自己的间隔上——用按目标循环速率补充的信用桶，便宜帧攒、贵帧花，并对信用**和欠账**双向截断，否则一次灾难性慢帧会留下无界欠账、再次形成饿死。
+- 诊断面板漏掉一个已存在于 API 响应里的字段，等价于这个字段不存在。`rejection_counts` 一直在 `SearchMetrics.snapshot()` 里返回，但 8 个诊断格子没有它；面板能说「脸有多大」，说不出「为什么被拒」，定位零匹配时必须靠人读代码。新增统计字段时必须同步 `monitor.html`，否则它只是给未来的自己留了一个盲区。
+- 跳过/拒绝类计数器要按**原因**分桶，不能只按阶段。`budget_skips = {face_roi: 1498}` 说不出是撞了 `min_processed_fps` 地板还是没有预算余额——这两者的处置完全不同（前者要减负载，后者要改判据）。拆成 `face_roi_floor` / `face_roi_credit` 几乎零成本。
+- 开启一个 docstring 明写 "opt-in" 的档位时，改配置而不是翻库默认值。`tiny_face_enabled` 默认 False 被多处测试依赖：`tests/conftest.py` 的 `make_face` 默认 bbox 是 60×60，正落在 48-63 桶内，翻默认会静默改变一批用 `Settings()` 的测试的语义。部署差异用 `.env` / `deploy_t4.sh` 的 `--env` 表达，测试扰动为零。

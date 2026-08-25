@@ -1061,7 +1061,9 @@ def test_confirmed_tracks_are_excluded_from_the_roi_pass() -> None:
     assert [track.track_id for track in selected] == [2]
 
 
-def _budget_stub(settings: Settings, roi_p95_ms: float) -> SimpleNamespace:
+def _budget_stub(
+    settings: Settings, roi_p95_ms: float, credit_seconds: float = 0.0
+) -> SimpleNamespace:
     metrics = SearchMetrics()
     if roi_p95_ms:
         metrics.stage_latencies_ms["face_roi"] = [roi_p95_ms]
@@ -1069,40 +1071,60 @@ def _budget_stub(settings: Settings, roi_p95_ms: float) -> SimpleNamespace:
         settings=settings,
         metrics=metrics,
         _lock=threading.Lock(),
+        _budget_credit=credit_seconds,
     )
     stub._stage_p95_ms = lambda stage: SearchSession._stage_p95_ms(stub, stage)
     stub._record_budget_skip = lambda stage: SearchSession._record_budget_skip(stub, stage)
     return stub
 
 
-def test_roi_is_skipped_when_its_measured_cost_exceeds_the_frame_budget() -> None:
-    # target_loop_hz=10 -> a 100ms budget; a 90ms ROI pass does not fit after 50ms.
-    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=90.0)
-    started = time.monotonic() - 0.05
+def test_roi_runs_on_a_frame_that_already_exceeded_the_target_period() -> None:
+    """The regression: ROI is only ever considered on an over-budget frame.
 
-    assert SearchSession._roi_fits_budget(session, started, 0.1) is False
-    assert session.metrics.budget_skips["face_roi"] == 1
+    Full-frame face detection alone costs more than one target period, so the
+    old single-frame remainder was structurally negative and the stage was
+    skipped forever. Banked credit from cheap frames must still admit it.
+    """
+    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=82.0, credit_seconds=0.1)
+    started = time.monotonic() - 0.125  # person 13ms + face_full 112ms, over the 100ms period
 
-
-def test_roi_runs_when_it_still_fits_the_frame_budget() -> None:
-    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=10.0)
-    started = time.monotonic()
-
-    assert SearchSession._roi_fits_budget(session, started, 0.1) is True
+    assert SearchSession._roi_fits_budget(session, started) is True
     assert session.metrics.budget_skips == {}
 
 
-def test_roi_is_skipped_once_the_processed_fps_floor_is_already_breached() -> None:
-    """The floor holds even when no ROI cost history exists yet.
+def test_roi_backs_off_once_its_cost_has_drained_the_credit() -> None:
+    """A stage slower than its refill rate throttles itself down, as before."""
+    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=90.0, credit_seconds=0.02)
+    started = time.monotonic()
 
-    This is the case that used to collapse the loop: with no measurement, the old
-    interval check passed unconditionally on every slow frame.
-    """
-    session = _budget_stub(Settings(target_loop_hz=10.0, min_processed_fps=2.0), roi_p95_ms=0.0)
+    assert SearchSession._roi_fits_budget(session, started) is False
+    assert session.metrics.budget_skips["face_roi_credit"] == 1
+
+
+def test_roi_is_skipped_once_the_processed_fps_floor_is_already_breached() -> None:
+    """The floor outranks any amount of banked credit."""
+    session = _budget_stub(
+        Settings(target_loop_hz=10.0, min_processed_fps=2.0), roi_p95_ms=0.0, credit_seconds=10.0
+    )
     started = time.monotonic() - 0.6  # already past the 500ms floor
 
-    assert SearchSession._roi_fits_budget(session, started, 0.1) is False
-    assert session.metrics.budget_skips["face_roi"] == 1
+    assert SearchSession._roi_fits_budget(session, started) is False
+    assert session.metrics.budget_skips["face_roi_floor"] == 1
+
+
+def test_budget_credit_is_capped_in_both_directions() -> None:
+    """Idle time cannot bank an unbounded burst, and one slow pass cannot starve."""
+    settings = Settings(target_loop_hz=10.0, budget_credit_max_frames=2.0)
+    cap = 2.0 / 10.0
+    session = _budget_stub(settings, roi_p95_ms=0.0)
+    session._settle_budget_credit = lambda cost: SearchSession._settle_budget_credit(session, cost)
+
+    for _ in range(20):
+        session._settle_budget_credit(0.001)  # a long stretch of near-free frames
+    assert session._budget_credit == pytest.approx(cap)
+
+    session._settle_budget_credit(5.0)  # one catastrophic pass
+    assert session._budget_credit == pytest.approx(-cap)
 
 
 def test_quality_rejected_faces_never_reach_arcface() -> None:

@@ -167,6 +167,7 @@
           <h2>远距离诊断</h2>
           <div class="diagnostic-grid">
             <div class="diagnostic-cell"><small>FACE SIZE</small><output id="faceSizeDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>REJECTION REASONS</small><output id="rejectionDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>DETECTION SOURCE</small><output id="faceSourceDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>MATCH COUNTS</small><output id="matchStageDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>STAGE P95 / HZ</small><output id="stageTimingDiag">尚无样本</output></div>
@@ -211,6 +212,7 @@
     }
     function renderDiagnostics(diagnostics = {}) {
       $('faceSizeDiag').textContent = countText(diagnostics.face_size_counts);
+      $('rejectionDiag').textContent = countText(diagnostics.rejection_counts);
       $('faceSourceDiag').textContent = countText(diagnostics.face_source_counts);
       $('matchStageDiag').textContent = countText(diagnostics.match_stage_counts);
       const latency = Object.fromEntries(Object.entries(diagnostics.stage_p95_latency_ms || {}).map(([key, value]) => [key, `${Number(value).toFixed(0)}ms`]));
@@ -259,7 +261,7 @@
       $('configGatesDiag').textContent = [
         `相似度 ${num(config.similarity_threshold, 2)}`,
         `小脸 ${num(config.small_face_similarity_threshold, 2)}`,
-        config.tiny_face_enabled ? `远脸 ${num(config.tiny_face_similarity_threshold, 2)}` : '远脸 关闭',
+        config.tiny_face_enabled ? `远脸 ${num(config.tiny_face_similarity_threshold, 2)} ${config.tiny_face_shadow_mode ? '影子' : '正式'}` : '远脸 关闭',
         `最小 ${config.effective_search_min_face_px ?? '?'}px`,
         `理想 ${config.preferred_search_face_px ?? '?'}px`,
         `模糊 ${num(config.min_search_blur_variance, 0)}`,

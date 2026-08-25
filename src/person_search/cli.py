@@ -210,7 +210,11 @@ def run_offline(
         buffer_seconds=settings.face_track_buffer_seconds,
     )
     # Mirrors the ROI bookkeeping SearchSession owns, so the offline harness
-    # exercises the same backoff and budget-free ROI selection the service does.
+    # exercises the same per-track backoff and ROI selection the service does.
+    # The one deliberate difference is the credit gate: offline calibration has no
+    # realtime constraint, so it runs ROI at every roi_interval unconditionally.
+    # The service now reaches roughly the same cadence, so this no longer
+    # calibrates a pipeline production does not run.
     roi_context = SimpleNamespace(
         settings=settings,
         face_backend=face_backend,

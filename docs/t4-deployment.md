@@ -183,9 +183,14 @@ curl http://127.0.0.1:8000/v1/searches/SEARCH_ID
 
 响应中的 `provider` 应同时表明 face 和 person detector 使用 `CUDAExecutionProvider`。
 
-### 6. 超小脸 shadow 验证
+### 6. 超小脸验证
 
-`48-63px` 超小脸策略默认关闭。先在 T4 上开启策略但保持 shadow 模式；该模式只发布 `tiny_shadow_confirmed`，不会将目标标记为已找到：
+`48-63px` 超小脸策略在库默认值里仍为关闭，由部署侧开启：`scripts/deploy_t4.sh` 现在下发
+`PERSON_SEARCH_TINY_FACE_ENABLED=true` 与 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false`。
+这是一个**已知先于标定的运营决定**——实拍显示该距离下全部人脸短边 <64px，不开该档则零召回。
+关掉 shadow 意味着一次 48-63px 确认会直接把目标标记为已找到并触发 `target_found`。
+
+需要先只观察、不置 `found` 时，用 shadow 模式单独起容器：
 
 ```bash
 docker run --rm --gpus all \
@@ -197,4 +202,6 @@ docker run --rm --gpus all \
   person-search:t4
 ```
 
-开启后，`GET /v1/searches/{search_id}` 的 `face_size_counts`、`face_source_counts`、`match_stage_counts`、`stage_p95_latency_ms` 和 `effective_hz` 必须持续采集。其中 `evidence_eligible` 是送入确认器的观测数，`evidence_collected` 才是去重和时间间隔后实际入窗数。离线 schema v2 报告将生产 `aggregate` 与 `shadow_aggregate` 分开，Shadow 通过不能生成生产阈值推荐。只有离线生产回归与 Shadow 报告都满足按尺寸分桶召回率、至少 100 小时负样本且误确认率不高于 `0.01/h` 后，才能设置 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false`。低于 `48px` 的人脸仍会被硬拒绝，`PERSON_SEARCH_TINY_FACE_MIN_PX` 不能下调突破该底线。
+`GET /v1/searches/{search_id}` 的 `face_size_counts`、`rejection_counts`、`face_source_counts`、`match_stage_counts`、`stage_p95_latency_ms`、`effective_hz` 和 `budget_skips` 必须持续采集（监控页 `远距离诊断` 已全部呈现）。其中 `evidence_eligible` 是送入确认器的观测数，`evidence_collected` 才是去重和时间间隔后实际入窗数；`budget_skips` 按 `face_roi_floor` / `face_roi_credit` 区分 ROI 被跳过的原因。离线 schema v2 报告将生产 `aggregate` 与 `shadow_aggregate` 分开，Shadow 通过不能生成生产阈值推荐。
+
+**仍然欠着的验收**：按尺寸分桶召回率、至少 100 小时负样本、误确认率不高于 `0.01/h`。在补齐之前，不要让机器人基于一次 48-63px 确认采取物理动作；`tiny_face_similarity_threshold` / `tiny_face_aggregate_similarity_threshold` 也应先用 `person-search-eval` 对实拍素材标定，而不是留用默认的 `0.64` / `0.68`。低于 `48px` 的人脸仍会被硬拒绝，`PERSON_SEARCH_TINY_FACE_MIN_PX` 不能下调突破该底线。

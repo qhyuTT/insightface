@@ -177,6 +177,9 @@ class SearchSession:
         # currently backed off for.
         self._roi_misses: dict[int, int] = {}
         self._roi_skips: dict[int, int] = {}
+        # Loop credit for opportunistic stages. Cheap frames bank headroom, an
+        # expensive optional pass spends it. See _roi_fits_budget.
+        self._budget_credit = 0.0
         self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
         self._stop_requested = False
@@ -273,6 +276,7 @@ class SearchSession:
             "similarity_threshold": settings.similarity_threshold,
             "small_face_similarity_threshold": settings.small_face_similarity_threshold,
             "tiny_face_enabled": settings.tiny_face_enabled,
+            "tiny_face_shadow_mode": settings.tiny_face_shadow_mode,
             "tiny_face_similarity_threshold": settings.tiny_face_similarity_threshold,
             "effective_search_min_face_px": settings.effective_search_min_face_px,
             "min_search_face_px": settings.min_search_face_px,
@@ -346,10 +350,6 @@ class SearchSession:
                 now = packet.captured_at
                 with self._lock:
                     self.metrics.frame_height, self.metrics.frame_width = packet.frame.shape[:2]
-                # The per-frame budget. Optional stages consult what is left of it,
-                # so a slow stage can no longer drag the loop below the sampling
-                # density the confirmation window needs.
-                budget_seconds = 1.0 / self.settings.target_loop_hz
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
                     stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
@@ -369,7 +369,7 @@ class SearchSession:
                         roi_face_hz > 0
                         and roi_clock - last_roi_face_at >= 1.0 / roi_face_hz
                         and roi_tracks
-                        and self._roi_fits_budget(started, budget_seconds)
+                        and self._roi_fits_budget(started)
                     ):
                         stage_started = time.monotonic()
                         roi_faces = self._analyze_person_rois(packet.frame, roi_tracks)
@@ -590,9 +590,11 @@ class SearchSession:
                     and self._publish_preview(packet.frame, all_tracks, faces)
                 ):
                     last_preview_at = preview_clock
+                frame_cost = time.monotonic() - started
+                self._settle_budget_credit(frame_cost)
                 with self._lock:
                     self.metrics.frame_count += 1
-                    self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
+                    self.metrics.latencies_ms.append(frame_cost * 1000.0)
                     self.metrics.end_to_end_latencies_ms.append(
                         (time.monotonic() - packet.captured_at) * 1000.0
                     )
@@ -852,26 +854,42 @@ class SearchSession:
         with self._lock:
             self.metrics.budget_skips[stage] = self.metrics.budget_skips.get(stage, 0) + 1
 
-    def _roi_fits_budget(self, started: float, budget_seconds: float) -> bool:
-        """Run the ROI pass only when its measured cost still fits this frame.
+    def _roi_fits_budget(self, started: float) -> bool:
+        """Admit the ROI pass only when banked loop credit covers its measured cost.
 
-        The old Hz throttle was an interval *floor*, so once a single iteration
-        exceeded 1/hz it passed unconditionally and ROI ran on every frame at 100%
-        duty. This is the missing ceiling: past the budget, ROI is skipped rather
-        than allowed to starve the confirmation window of samples.
+        The previous check compared the stage p95 against what was left of a
+        *single* ``target_loop_hz`` frame budget.  But ROI is only ever considered
+        on the frame that just paid for full-frame face detection, whose mandatory
+        cost already exceeds that budget, so the remainder was structurally
+        negative: once the first pass recorded a p95 the stage was skipped forever
+        and small faces lost the only stage that can recover them.
+
+        A credit bucket refilled at ``target_loop_hz`` fixes the denominator.  A
+        stage that grows slower than its refill rate drains the bucket and
+        throttles itself down — that is the duty-cycle ceiling — instead of being
+        starved to zero by one frame's arithmetic.
         """
-        elapsed = time.monotonic() - started
-        remaining = budget_seconds - elapsed
-        # Never let the floor be violated even if the budget is already blown.
-        hard_ceiling = 1.0 / self.settings.min_processed_fps
-        if elapsed >= hard_ceiling:
-            self._record_budget_skip("face_roi")
-            return False
         estimated = self._stage_p95_ms("face_roi") / 1000.0
-        if estimated and estimated > max(remaining, 0.0):
-            self._record_budget_skip("face_roi")
+        # The processed-fps floor is inviolable, whatever the credit says.
+        if (time.monotonic() - started) + estimated >= 1.0 / self.settings.min_processed_fps:
+            self._record_budget_skip("face_roi_floor")
+            return False
+        if estimated > self._budget_credit:
+            self._record_budget_skip("face_roi_credit")
             return False
         return True
+
+    def _settle_budget_credit(self, frame_cost_seconds: float) -> None:
+        """Refill the loop credit for this frame and charge what the frame cost.
+
+        Debt is capped as well as credit: one catastrophic pass must not starve
+        the optional stage for an unbounded stretch afterwards.
+        """
+        refill = 1.0 / self.settings.target_loop_hz
+        cap = refill * self.settings.budget_credit_max_frames
+        self._budget_credit = float(
+            np.clip(self._budget_credit + refill - frame_cost_seconds, -cap, cap)
+        )
 
     def _tracks_needing_roi_face_pass(
         self, faces: list[FaceObservation], tracks: list[Track]

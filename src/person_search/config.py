@@ -81,11 +81,15 @@ class Settings(BaseSettings):
     # waste here. Only the full-frame default (face_detection_size) must stay Auto.
     roi_face_detection_size: int = Field(default=320, ge=0)
 
-    # The per-frame time budget. ROI and preview are opportunistic: they only run
-    # when the measured cost fits in what is left, so a slow stage can never again
-    # collapse the loop below the sampling density the confirmation window needs.
+    # The loop rate the budget tries to hold. It refills a credit bucket that the
+    # opportunistic ROI pass spends, so a slow stage throttles itself down instead
+    # of collapsing the loop below the sampling density the confirmation window
+    # needs — and instead of being starved to zero by one frame's remainder.
     target_loop_hz: float = Field(default=10.0, gt=0)
     min_processed_fps: float = Field(default=2.0, gt=0)
+    # How many target periods' worth of credit an idle stretch may bank, and
+    # symmetrically how much debt one slow pass may leave behind.
+    budget_credit_max_frames: float = Field(default=2.0, ge=1.0)
     preview_hz: float = Field(default=5.0, ge=0.0)
     preview_max_width: int = Field(default=960, ge=64)
     rtsp_transport: Literal["tcp", "udp"] = "tcp"

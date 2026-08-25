@@ -207,11 +207,19 @@ class Settings(BaseSettings):
         return tuple(sorted(set(base) | {extra}))
 
     def roi_detection_scale(self, crop_width: int, crop_height: int) -> int:
-        """Return an ROI detector scale that never downsamples the crop."""
+        """Return an ROI detector scale that never downsamples a small crop.
+
+        Quantized onto a two-rung ladder rather than rounded per crop. Distinct
+        ONNX input shapes are what cost money here: on a T4, switching the SCRFD
+        input shape between two calls costs ~30ms of re-planning, against ~5ms for
+        a 320px crop's own inference. Rounding each crop to its own multiple of 32
+        measured 233ms per pass against 136ms for the same crops quantized -- the
+        adaptive scale would have spent its entire budget on shape changes.
+        """
         longest = max(int(crop_width), int(crop_height), 1)
-        rounded = ((longest + 31) // 32) * 32
-        ceiling = max(self.roi_face_detection_size, self.roi_face_detection_max_size)
-        return int(min(max(rounded, self.roi_face_detection_size), ceiling))
+        floor = self.roi_face_detection_size
+        ceiling = max(floor, self.roi_face_detection_max_size)
+        return int(floor if longest <= floor else ceiling)
 
 
 @lru_cache

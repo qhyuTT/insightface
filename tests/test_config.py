@@ -76,7 +76,14 @@ def test_roi_detection_scale_upsamples_small_crops_and_never_shrinks_large_ones(
 
     # A far person's head crop is tiny: it still gets upsampled to the floor.
     assert settings.roi_detection_scale(90, 130) == 320
+    assert settings.roi_detection_scale(320, 200) == 320
     # A close person's crop is larger than the floor; shrinking it back to 320 would
     # throw away the very pixels the crop existed to keep.
-    assert settings.roi_detection_scale(400, 520) == 544
+    assert settings.roi_detection_scale(400, 520) == 640
     assert settings.roi_detection_scale(700, 900) == 640
+    # Two rungs, not one per crop: every distinct ONNX input shape costs ~30ms of
+    # re-planning on CUDA, which dwarfs a 320px crop's own inference.
+    scales = {
+        settings.roi_detection_scale(size, size) for size in range(64, 900, 7)
+    }
+    assert scales == {320, 640}

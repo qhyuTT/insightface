@@ -1324,9 +1324,10 @@ def test_roi_pass_never_downsamples_a_crop_it_exists_to_preserve() -> None:
 
     SearchSession._analyze_person_rois(session, frame, [near, far])
 
-    # 500x500 rounds up to 512 rather than being squeezed back to 320; the far
-    # crop is still upsampled to the floor.
-    assert backend.detection_sizes == [512, 320]
+    # 500x500 goes to the upper rung instead of being squeezed back to 320; the far
+    # crop still gets upsampled to the floor. Two rungs keep the number of distinct
+    # ONNX input shapes -- the real cost on CUDA -- down to two.
+    assert backend.detection_sizes == [640, 320]
 
 
 def test_rejection_reason_is_reported_with_the_size_of_the_face_it_belongs_to() -> None:

@@ -17,6 +17,12 @@ T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
 # conservative keeps the calibrated far-face bar; responsive trades false-accept
 # headroom for a faster verdict and should wait for a calibrated threshold.
 T4_MATCH_PROFILE="${T4_MATCH_PROFILE:-conservative}"
+# One 1280 pass rather than Auto's 128+640: measured on a T4 it is both cheaper
+# (57ms against 108ms) and better at every face size, because each extra ONNX input
+# shape costs ~30ms of re-planning -- far more than the scale's own inference. The
+# extra-scale mechanism stays available but has nothing to add on top of 1280.
+T4_FACE_DETECTION_SIZE="${T4_FACE_DETECTION_SIZE:-1280}"
+T4_FACE_DETECTION_EXTRA_SCALE="${T4_FACE_DETECTION_EXTRA_SCALE:-0}"
 T4_YOLOX_MODEL_URL="${T4_YOLOX_MODEL_URL:-}"
 T4_PREFETCH_YOLOX="${T4_PREFETCH_YOLOX:-1}"
 # Prefix-style GitHub proxies, tried in order before the upstream URL itself.
@@ -190,7 +196,8 @@ docker run --detach \
   --env "PERSON_SEARCH_PREFER_CUDA=true" \
   --env "PERSON_SEARCH_TINY_FACE_ENABLED=true" \
   --env "PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false" \
-  --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=1280" \
+  --env "PERSON_SEARCH_FACE_DETECTION_SIZE=${T4_FACE_DETECTION_SIZE}" \
+  --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}" \
   --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}" \
   "${T4_IMAGE_NAME}" >/dev/null
 

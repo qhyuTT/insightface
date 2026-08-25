@@ -70,11 +70,23 @@ class TargetSearchView(BaseModel):
     evidence_count: int = 0
     required_evidence: int = 0
     qualifying_evidence: int = 0
-    median_similarity: float | None = None
+    # The number the verdict actually reads, plus the name of the reduction that
+    # produced it. Reporting a value without its statistic invites reading a
+    # top-K mean as a median.
+    window_similarity: float | None = None
+    window_statistic: str | None = None
     required_similarity: float | None = None
     aggregate_similarity: float | None = None
     required_aggregate_similarity: float | None = None
+    # Which size tier is judging this track. A moving robot crosses tiers, and the
+    # thresholds above are meaningless without knowing which one is in force.
+    tier: str | None = None
     last_rejection_reason: str | None = None
+    # The size of the face the rejection reason belongs to. It is not always
+    # last_face_px: the largest face seen and the largest rejected face are
+    # different observations, and pairing one's size with the other's reason
+    # produced "49px / face_too_small" against a 48px floor.
+    last_rejection_face_px: int | None = None
 
 
 class SearchView(BaseModel):
@@ -104,6 +116,9 @@ class SearchView(BaseModel):
     roi_calls_per_frame: float = 0.0
     drop_rate: float = 0.0
     end_to_end_p95_latency_ms: float = 0.0
+    camera_motion_px_p95: float = 0.0
+    blur_variance_p50: float = 0.0
+    blur_variance_p95: float = 0.0
     budget_skips: dict[str, int] = Field(default_factory=dict)
     effective_config: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
@@ -165,6 +180,9 @@ class FaceObservation:
     landmarks: np.ndarray | None = None
     accepted: bool = True
     rejection_reasons: tuple[str, ...] = ()
+    # Carried so the sharpness gate's own number can reach the panel. A gate whose
+    # value is never reported cannot be calibrated against real footage.
+    blur_variance: float = 0.0
 
     @property
     def short_side(self) -> int:
@@ -201,6 +219,8 @@ class SearchMetrics:
     roi_calls: int = 0
     budget_skips: dict[str, int] = field(default_factory=dict)
     end_to_end_latencies_ms: list[float] = field(default_factory=list)
+    camera_motion_px: list[float] = field(default_factory=list)
+    blur_variances: list[float] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = 0.0
@@ -251,4 +271,11 @@ class SearchMetrics:
             "drop_rate": drop_rate,
             "end_to_end_p95_latency_ms": end_to_end_p95,
             "budget_skips": dict(sorted(self.budget_skips.items())),
+            "camera_motion_px_p95": _percentile(self.camera_motion_px, 95),
+            "blur_variance_p50": _percentile(self.blur_variances, 50),
+            "blur_variance_p95": _percentile(self.blur_variances, 95),
         }
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    return float(np.percentile(values[-1000:], percentile)) if values else 0.0

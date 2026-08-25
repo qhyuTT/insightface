@@ -19,6 +19,7 @@ from .confirmation import (
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
     fallback_face_match_policy,
+    is_stricter_policy,
     normalize_bbox,
 )
 from .detector import YoloXOnnxDetector
@@ -221,13 +222,23 @@ def run_offline(
         _roi_misses={},
         _roi_skips={},
         _track_states={},
+        _motion_hanning=None,
         _lock=threading.Lock(),
         metrics=SearchMetrics(),
     )
     roi_context._note_roi_outcome = lambda track_id, *, hit: SearchSession._note_roi_outcome(
         roi_context, track_id, hit=hit
     )
+    roi_context._record_stage = lambda stage, started: SearchSession._record_stage(
+        roi_context, stage, started
+    )
+    roi_context._motion_window = lambda shape: SearchSession._motion_window(roi_context, shape)
     tracks = []
+    # Tier bookkeeping, owned here for the same reason the session owns it: the tier
+    # follows the observation, so every threshold under evaluation has to resolve
+    # the hysteresis margin against one answer.
+    track_tiers: dict[int, str] = {}
+    previous_motion_gray = None
     frame_id = 0
     started = time.monotonic()
     person_hz = (
@@ -240,6 +251,14 @@ def run_offline(
         if "CUDA" in getattr(face_backend, "detection_provider_name", face_backend.provider_name)
         else settings.face_detection_hz_cpu
     )
+    face_is_cuda = "CUDA" in getattr(
+        face_backend, "detection_provider_name", face_backend.provider_name
+    )
+    # Same scales, same cadence as the live loop. Calibrating against a detector
+    # configuration production does not run is worse than not calibrating.
+    shallow_scales = settings.full_frame_detection_scales(is_cuda=face_is_cuda, deep=False)
+    deep_scales = settings.full_frame_detection_scales(is_cuda=face_is_cuda)
+    face_pass_index = 0
     roi_face_hz = (
         settings.roi_face_detection_hz_cuda
         if "CUDA" in getattr(face_backend, "detection_provider_name", face_backend.provider_name)
@@ -256,10 +275,19 @@ def run_offline(
                 break
             timestamp = frame_id / max(fps, 1.0)
             if frame_id % person_interval == 0:
-                tracks = tracker.update(detector.detect(frame))
+                motion, previous_motion_gray = SearchSession._estimate_camera_motion(
+                    roi_context, frame, previous_motion_gray
+                )
+                tracks = tracker.update(detector.detect(frame), motion=motion)
             faces = []
             if frame_id % face_interval == 0:
-                faces = face_backend.detect_faces(frame, enrollment=False)
+                deep = face_pass_index % settings.face_deep_scan_every_n == 0
+                face_pass_index += 1
+                faces = face_backend.detect_faces(
+                    frame,
+                    enrollment=False,
+                    detection_size=deep_scales if deep else shallow_scales,
+                )
                 roi_tracks = SearchSession._tracks_needing_roi_face_pass(roi_context, faces, tracks)
                 if (
                     roi_interval is not None
@@ -290,15 +318,29 @@ def run_offline(
                 settings=settings,
                 face_tracker=face_tracker,
                 timestamp=timestamp,
+                track_tiers=track_tiers,
             )
             association_counts.update(association_modes.values())
             unassociated_faces += sum(
                 face_index not in associations for face_index in range(len(accepted))
             )
+            # The tier is threshold-independent, so it is resolved once against the
+            # base settings and then shared by every threshold being evaluated.
+            canonical_policies = _face_policies(
+                accepted, association_modes, settings, track_tiers
+            )
+            for face_index, track_id in associations.items():
+                track_tiers[track_id] = canonical_policies[face_index].tier
+            live_track_ids = {track.track_id for track in all_tracks}
+            track_tiers = {
+                key: value for key, value in track_tiers.items() if key in live_track_ids
+            }
 
             decisions_by_threshold = {}
             for key, confirmation in confirmations.items():
-                policies = _face_policies(accepted, association_modes, threshold_settings[key])
+                policies = _face_policies(
+                    accepted, association_modes, threshold_settings[key], track_tiers
+                )
                 counts = stage_counts_by_threshold[key]
                 counts.update(
                     _confirmation_input_counts(
@@ -460,18 +502,16 @@ def _associate_search_faces(
     settings: Settings,
     face_tracker: FaceTracker,
     timestamp: float,
+    track_tiers: dict[int, str] | None = None,
 ) -> tuple[list[Track], dict[int, int], dict[int, str]]:
     """Build the same detailed person/fallback associations as the live search."""
     detailed = associate_faces_to_tracks_detailed(faces, tracks)
     associations = {face_index: track_id for face_index, (track_id, _) in detailed.items()}
     modes = {face_index: mode for face_index, (_, mode) in detailed.items()}
     all_tracks = list(tracks)
-    policies = {
-        face_index: default_face_match_policy(face, settings)
-        for face_index, face in enumerate(faces)
-    }
+    policies = _policies_for_faces(faces, settings, associations, track_tiers)
     for face_index, mode in list(modes.items()):
-        if policies[face_index].requires_strict_association and mode != "person_strict":
+        if mode == "person_relaxed" and not policies[face_index].allows_relaxed_association:
             associations.pop(face_index, None)
             modes.pop(face_index, None)
     unassociated_indices = [
@@ -494,20 +534,38 @@ def _associate_search_faces(
     return all_tracks, associations, modes
 
 
+def _policies_for_faces(
+    faces: list[FaceObservation],
+    settings: Settings,
+    associations: dict[int, int] | None = None,
+    track_tiers: dict[int, str] | None = None,
+) -> dict[int, FaceMatchPolicy]:
+    """Resolve one policy per face, honouring the tier a track is already held to."""
+    associations = associations or {}
+    track_tiers = track_tiers or {}
+    policies: dict[int, FaceMatchPolicy] = {}
+    for face_index, face in enumerate(faces):
+        track_id = associations.get(face_index)
+        current_tier = None if track_id is None else track_tiers.get(track_id)
+        policies[face_index] = default_face_match_policy(face, settings, current_tier)
+    return policies
+
+
 def _face_policies(
     faces: list[FaceObservation],
     association_modes: dict[int, str],
     settings: Settings,
+    track_tiers: dict[int, str] | None = None,
+    associations: dict[int, int] | None = None,
 ) -> dict[int, FaceMatchPolicy]:
     fallback_policy = fallback_face_match_policy(settings)
-    policies = {
-        face_index: default_face_match_policy(face, settings)
-        for face_index, face in enumerate(faces)
-    }
+    policies = _policies_for_faces(faces, settings, associations, track_tiers)
     for face_index, mode in association_modes.items():
-        if (
-            mode in {"person_relaxed", "face_fallback"}
-            and not policies[face_index].requires_strict_association
+        # Weaker body evidence pulls a face up to the small-face bar, but only when
+        # that bar is actually higher: applying it unconditionally relaxed the far
+        # tier instead of tightening it.
+        if mode in {"person_relaxed", "face_fallback"} and is_stricter_policy(
+            fallback_policy, policies[face_index]
         ):
             policies[face_index] = fallback_policy
     return policies

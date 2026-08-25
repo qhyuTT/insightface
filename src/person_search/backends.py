@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Protocol
 
+import cv2
 import numpy as np
 
 from .config import Settings
@@ -19,7 +21,11 @@ class FaceBackend(Protocol):
     recognition_provider_name: str
 
     def detect_faces(
-        self, frame: np.ndarray, *, enrollment: bool = False, detection_size: int | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        enrollment: bool = False,
+        detection_size: int | Sequence[int] | None = None,
     ) -> list[FaceObservation]: ...
 
     def embed_faces(
@@ -86,16 +92,17 @@ class InsightFaceBackend:
                 )
 
     def detect_faces(
-        self, frame: np.ndarray, *, enrollment: bool = False, detection_size: int | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        enrollment: bool = False,
+        detection_size: int | Sequence[int] | None = None,
     ) -> list[FaceObservation]:
         """Run detection and quality only. The embedding is deferred to embed_faces()."""
         self.ensure_ready()
         app = self._app
         assert app is not None
-        input_size = (
-            None if detection_size is None or detection_size <= 0
-            else (detection_size, detection_size)
-        )
+        input_size = _resolve_input_size(detection_size)
         with self._lock:
             bboxes, kpss = app.det_model.detect(frame, input_size=input_size, max_num=0)
         observations: list[FaceObservation] = []
@@ -113,6 +120,7 @@ class InsightFaceBackend:
                     landmarks=None if kps is None else np.asarray(kps, dtype=np.float32),
                     accepted=quality.accepted,
                     rejection_reasons=quality.reasons,
+                    blur_variance=quality.blur_variance,
                 )
             )
         return observations
@@ -123,7 +131,10 @@ class InsightFaceBackend:
         """Fill in ArcFace embeddings, dropping faces the recogniser cannot use.
 
         Crops are aligned first and pushed through a single batched session run,
-        so N faces cost one inference rather than N.
+        so N faces cost one inference rather than N. With ``embedding_flip_tta``
+        each crop's mirror rides along in the same batch and the two features are
+        summed before normalising -- the standard ArcFace flip average, applied
+        identically on the enrollment side so both halves of the cosine match.
         """
         if not faces:
             return []
@@ -147,11 +158,15 @@ class InsightFaceBackend:
         if not crops:
             return []
 
+        flip_tta = self.settings.embedding_flip_tta
+        batch = (crops + [cv2.flip(crop, 1) for crop in crops]) if flip_tta else crops
         with self._lock:
-            features = recogniser.get_feat(crops)
+            features = np.asarray(recogniser.get_feat(batch))
+        if flip_tta:
+            features = features[: len(crops)] + features[len(crops) :]
 
         embedded: list[FaceObservation] = []
-        for face, feature in zip(pending, np.asarray(features), strict=True):
+        for face, feature in zip(pending, features, strict=True):
             try:
                 embedding = normalize_embedding(feature.flatten())
             except (TypeError, ValueError):
@@ -161,6 +176,23 @@ class InsightFaceBackend:
 
     def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]:
         return self.embed_faces(frame, self.detect_faces(frame, enrollment=enrollment))
+
+
+def _resolve_input_size(
+    detection_size: int | Sequence[int] | None,
+) -> tuple[int, int] | list[tuple[int, int]] | None:
+    """Map one scale, or a list of scales, onto SCRFD's ``input_size`` argument.
+
+    SCRFD runs every scale it is given and merges the candidates through NMS, so a
+    list is a genuine multi-scale pass rather than N separate calls. ``None`` falls
+    back to whatever ``prepare()`` configured.
+    """
+    if detection_size is None:
+        return None
+    if isinstance(detection_size, int):
+        return None if detection_size <= 0 else (detection_size, detection_size)
+    sizes = [(int(value), int(value)) for value in detection_size if int(value) > 0]
+    return sizes or None
 
 
 def _model_provider_name(app: object, task_name: str) -> str:

@@ -8,6 +8,12 @@ import numpy as np
 from .config import HARD_MIN_SEARCH_FACE_PX, Settings
 from .domain import FaceObservation, MatchState, Target, Track
 
+# Size tiers, loosest first. The name travels with the policy so progress reporting
+# and the panel can say which bar a track is being held to.
+TIER_NORMAL = "normal"
+TIER_SMALL = "small"
+TIER_TINY = "tiny"
+
 
 @dataclass(frozen=True, slots=True)
 class MatchDecision:
@@ -33,23 +39,28 @@ class TrackProgress:
 
     ``observed`` counts every banked sample; under ``collect_all_observations``
     that includes sub-threshold ones, so it saturates at ``required`` and says
-    nothing about progress. ``qualifying`` and ``median_similarity`` are what
+    nothing about progress. ``qualifying`` and ``window_similarity`` are what
     the confirmation gate actually reads.
+
+    ``window_similarity`` is reduced by ``window_statistic``; the name travels
+    with the value because a top-K mean read as a median is a wrong number.
 
     ``aggregate_similarity`` is the far-face tier's second gate: a
     quality-weighted mean embedding compared against the target. Without it a
-    track can show a passing median and still never confirm, with nothing on the
-    panel explaining why. It is ``None`` for tiers that do not use the gate.
+    track can show a passing window value and still never confirm, with nothing
+    on the panel explaining why. It is ``None`` for tiers that do not use the gate.
     """
 
     observed: int
     required: int
     qualifying: int
     threshold: float
-    median_similarity: float | None
+    window_similarity: float | None
     best_similarity: float | None
+    window_statistic: str = "median"
     aggregate_similarity: float | None = None
     aggregate_threshold: float | None = None
+    tier: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +77,19 @@ class FaceMatchPolicy:
     # reaches process(); it deliberately takes no part in the window verdict.
     min_top1_margin: float = 0.0
     collect_all_observations: bool = False
+    # Must sit on a person track: a face-only fallback track is never enough.
     requires_strict_association: bool = False
+    # Whether the relaxed person path (exactly one body box contains the face
+    # center) counts as that association. The two are separate questions: the
+    # seated and truncated cases are relaxed but perfectly unambiguous, while a
+    # face-only track carries no body evidence at all.
+    allows_relaxed_association: bool = True
     shadow_eligible: bool = False
+    # Which size tier produced this policy, and how its window is reduced to the
+    # one number _is_confirmed compares against the threshold.
+    tier: str = TIER_NORMAL
+    statistic: str = "median"
+    top_k: int = 3
 
     def accepts_observation(self, detection_score: float, similarity: float) -> bool:
         return detection_score >= self.min_detection_score and (
@@ -97,6 +119,7 @@ class _TrackState:
     last_quality: float = 0.0
     last_association: str = "person_strict"
     policy: FaceMatchPolicy | None = None
+    tier: str | None = None
 
 
 class TrackConfirmation:
@@ -144,22 +167,42 @@ class TrackConfirmation:
                 if target is not None and aggregate_threshold is not None
                 else None
             )
+            statistic, top_k = self._policy_statistic(state)
             progress[track_id] = TrackProgress(
                 observed=len(state.evidence),
                 required=self._policy_required(state),
                 qualifying=sum(value >= threshold for value in similarities),
                 threshold=threshold,
-                median_similarity=float(np.median(similarities)) if similarities else None,
+                window_similarity=(
+                    _window_statistic(similarities, statistic, top_k) if similarities else None
+                ),
                 best_similarity=max(similarities) if similarities else None,
+                window_statistic=statistic,
                 aggregate_similarity=aggregate_similarity,
                 aggregate_threshold=aggregate_threshold,
+                tier=state.tier,
             )
         return progress
+
+    def tier_of(self, track_id: int) -> str | None:
+        """Return the size tier a track is currently judged by, if it has one.
+
+        The caller resolves the next observation's tier against this so a face
+        drifting across a boundary does not flip tiers, and therefore does not
+        clear the evidence window, on every frame.
+        """
+        state = self._states.get(track_id)
+        return None if state is None else state.tier
 
     def _policy_threshold(self, state: _TrackState) -> float:
         if state.policy is not None:
             return state.policy.threshold
         return self.settings.similarity_threshold
+
+    def _policy_statistic(self, state: _TrackState) -> tuple[str, int]:
+        if state.policy is not None:
+            return state.policy.statistic, state.policy.top_k
+        return self.settings.evidence_statistic, self.settings.evidence_top_k
 
     def _policy_required(self, state: _TrackState) -> int:
         if state.policy is not None:
@@ -247,7 +290,7 @@ class TrackConfirmation:
                 state.shadow_confirmed = False
                 state.last_candidate_emit = -1e9
                 state.policy = policy
-            elif _is_stricter_policy(policy, state.policy):
+            elif is_stricter_policy(policy, state.policy):
                 if not state.confirmed:
                     state.evidence.clear()
                     state.last_candidate_emit = -1e9
@@ -265,6 +308,7 @@ class TrackConfirmation:
                 state.policy = policy
             else:
                 policy = state.policy
+            state.tier = policy.tier
             similarity = float(np.dot(target.embedding, face.embedding))
             if not policy.accepts_observation(face.detection_score, similarity):
                 continue
@@ -345,7 +389,8 @@ class TrackConfirmation:
             return False
         similarities = [item.similarity for item in state.evidence]
         threshold = self._policy_threshold(state)
-        if float(np.median(similarities)) < threshold:
+        statistic, top_k = self._policy_statistic(state)
+        if _window_statistic(similarities, statistic, top_k) < threshold:
             return False
         policy = state.policy
         votes_required = policy.consistent_votes_required if policy is not None else 0
@@ -443,20 +488,56 @@ def associate_faces_to_tracks_detailed(
     return associations
 
 
-def default_face_match_policy(face: FaceObservation, settings: Settings) -> FaceMatchPolicy:
-    """Return the normal or small-face evidence policy for one observation."""
+def resolve_face_tier(short_side: int, settings: Settings, current_tier: str | None = None) -> str:
+    """Return the size tier for one observation, sticky by ``face_tier_hysteresis_px``.
+
+    Leaving a tier costs a margin. Without one, a robot in motion sweeps a single
+    face back and forth across 64 or 80 px, and because changing tier clears the
+    evidence window, the window never fills — which reads on the panel as
+    "evidence is stuck at zero" rather than as tier thrash. A track with no tier
+    yet gets no margin: the first observation must land on its honest tier.
+    """
+    margin = settings.face_tier_hysteresis_px if current_tier else 0
+    small_floor = settings.min_search_face_px
+    normal_floor = settings.preferred_search_face_px
+    if current_tier == TIER_TINY:
+        small_floor += margin
+    elif current_tier == TIER_SMALL:
+        small_floor -= margin
+        normal_floor += margin
+    elif current_tier == TIER_NORMAL:
+        small_floor -= margin
+        normal_floor -= margin
+    if short_side >= normal_floor:
+        return TIER_NORMAL
+    if short_side >= small_floor:
+        return TIER_SMALL
+    return TIER_TINY
+
+
+def default_face_match_policy(
+    face: FaceObservation, settings: Settings, current_tier: str | None = None
+) -> FaceMatchPolicy:
+    """Return the evidence policy for one observation, given the track's current tier."""
     if face.short_side < HARD_MIN_SEARCH_FACE_PX:
         raise ValueError("face is below the effective search size floor")
-    is_tiny = settings.tiny_face_min_px <= face.short_side < settings.min_search_face_px
-    if settings.tiny_face_enabled and is_tiny:
+    tier = resolve_face_tier(face.short_side, settings, current_tier)
+    if tier == TIER_TINY and not settings.tiny_face_enabled:
+        # The far tier is opt-in. With it off, a sub-tier face cannot legally reach
+        # here at all -- _is_face_matchable rejects anything below
+        # effective_search_min_face_px -- so nothing tier-specific applies.
+        tier = TIER_NORMAL
+    if tier == TIER_TINY:
         return tiny_face_match_policy(settings)
-    is_small = settings.min_search_face_px <= face.short_side < settings.preferred_search_face_px
-    if is_small:
+    if tier == TIER_SMALL:
         return fallback_face_match_policy(settings)
     return FaceMatchPolicy(
         threshold=settings.similarity_threshold,
         evidence_required=settings.evidence_required,
         evidence_window_seconds=settings.evidence_window_seconds,
+        tier=TIER_NORMAL,
+        statistic=settings.evidence_statistic,
+        top_k=settings.evidence_top_k,
     )
 
 
@@ -466,6 +547,9 @@ def fallback_face_match_policy(settings: Settings) -> FaceMatchPolicy:
         evidence_required=settings.small_face_evidence_required,
         evidence_window_seconds=settings.small_face_evidence_window_seconds,
         suppress_candidate=True,
+        tier=TIER_SMALL,
+        statistic=settings.evidence_statistic,
+        top_k=settings.evidence_top_k,
     )
 
 
@@ -483,11 +567,42 @@ def tiny_face_match_policy(settings: Settings) -> FaceMatchPolicy:
         suppress_candidate=True,
         collect_all_observations=True,
         requires_strict_association=True,
+        # A far face that reached only the relaxed path is the seated or truncated
+        # case, not an ambiguous one -- relaxed already refuses to choose between
+        # overlapping people. Dropping it made "sitting at a distance"
+        # unconfirmable by construction.
+        allows_relaxed_association=settings.tiny_face_allow_relaxed_association,
         shadow_eligible=True,
+        tier=TIER_TINY,
+        statistic=settings.evidence_statistic,
+        top_k=settings.evidence_top_k,
     )
 
 
-def _is_stricter_policy(candidate: FaceMatchPolicy, current: FaceMatchPolicy) -> bool:
+def _window_statistic(similarities: list[float], statistic: str, top_k: int) -> float:
+    """Reduce an evidence window to the one number the verdict compares.
+
+    ``median`` demands that most of the window be good, which is right for a fixed
+    camera and wrong for a robot that samples plenty of unusable poses on the way
+    past. ``top_k_mean`` asks instead for K genuinely good looks. Both
+    ``_is_confirmed`` and ``track_progress`` read this, so the panel can never
+    disagree with the verdict.
+    """
+    if not similarities:
+        return float("-inf")
+    if statistic == "top_k_mean":
+        count = max(1, min(int(top_k), len(similarities)))
+        return float(np.mean(sorted(similarities, reverse=True)[:count]))
+    return float(np.median(similarities))
+
+
+def is_stricter_policy(candidate: FaceMatchPolicy, current: FaceMatchPolicy) -> bool:
+    """Whether ``candidate`` holds a track to a higher bar than ``current``.
+
+    Also used by the caller to decide whether a relaxed association should pull a
+    face down to the small-face policy: it should when that policy is stricter than
+    the one the face already has, and must not when it is looser.
+    """
     candidate_aggregate = (
         candidate.aggregate_threshold if candidate.aggregate_threshold is not None else -1.0
     )
@@ -502,6 +617,7 @@ def _is_stricter_policy(candidate: FaceMatchPolicy, current: FaceMatchPolicy) ->
         or candidate.min_detection_score > current.min_detection_score
         or candidate.min_top1_margin > current.min_top1_margin
         or (candidate.requires_strict_association and not current.requires_strict_association)
+        or (current.allows_relaxed_association and not candidate.allows_relaxed_association)
         or (candidate.suppress_candidate and not current.suppress_candidate)
     )
 

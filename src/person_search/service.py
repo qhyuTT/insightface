@@ -20,6 +20,7 @@ from .confirmation import (
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
     fallback_face_match_policy,
+    is_stricter_policy,
     normalize_bbox,
 )
 from .detector import PersonDetector, YoloXOnnxDetector
@@ -49,6 +50,13 @@ from .video import LatestFrameReader
 
 MAX_TARGET_NAME_LENGTH = 80
 STOP_WAIT_SECONDS = 15.0
+# Global motion is estimated on a downscaled grayscale frame: a couple of
+# milliseconds, and translation of a whole scene survives the downsample intact.
+MOTION_ESTIMATE_WIDTH = 320
+# phaseCorrelate reports its peak strength. A weak peak means the two frames were
+# not a translation of each other (a cut, a reconnect, a fast rotation), and a
+# fabricated shift is worse for association than no shift at all.
+MOTION_MIN_RESPONSE = 0.05
 
 
 class EventHub:
@@ -164,11 +172,14 @@ class SearchSession:
                 "evidence_count": 0,
                 "required_evidence": 0,
                 "qualifying_evidence": 0,
-                "median_similarity": None,
+                "window_similarity": None,
+                "window_statistic": None,
                 "required_similarity": None,
                 "aggregate_similarity": None,
                 "required_aggregate_similarity": None,
+                "tier": None,
                 "last_rejection_reason": None,
+                "last_rejection_face_px": None,
             }
             for target in self.targets
         }
@@ -182,9 +193,14 @@ class SearchSession:
         # currently backed off for.
         self._roi_misses: dict[int, int] = {}
         self._roi_skips: dict[int, int] = {}
+        # The size tier each live track is judged by. Held here rather than per
+        # target because the tier follows the observation, and every target has to
+        # resolve the hysteresis margin against the same answer.
+        self._track_tiers: dict[int, str] = {}
         # Loop credit for opportunistic stages. Cheap frames bank headroom, an
         # expensive optional pass spends it. See _roi_fits_budget.
         self._budget_credit = 0.0
+        self._motion_hanning: np.ndarray | None = None
         self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
         self._stop_requested = False
@@ -276,13 +292,32 @@ class SearchSession:
             "min_processed_fps": settings.min_processed_fps,
             "preview_hz": settings.preview_hz,
             "face_detection_size": settings.face_detection_size or "auto(128+640)",
+            "full_frame_detection_scales": list(
+                settings.full_frame_detection_scales(is_cuda=face_is_cuda)
+            ),
+            "face_deep_scan_every_n": settings.face_deep_scan_every_n,
             "roi_face_detection_size": settings.roi_face_detection_size,
+            "roi_face_detection_max_size": settings.roi_face_detection_max_size,
             "roi_max_tracks_per_pass": settings.roi_max_tracks_per_pass,
+            "match_profile": settings.match_profile,
+            "evidence_statistic": settings.evidence_statistic,
+            "evidence_top_k": settings.evidence_top_k,
+            "face_tier_hysteresis_px": settings.face_tier_hysteresis_px,
+            "camera_motion_compensation": settings.camera_motion_compensation,
+            "embedding_flip_tta": settings.embedding_flip_tta,
             "similarity_threshold": settings.similarity_threshold,
             "small_face_similarity_threshold": settings.small_face_similarity_threshold,
             "tiny_face_enabled": settings.tiny_face_enabled,
             "tiny_face_shadow_mode": settings.tiny_face_shadow_mode,
             "tiny_face_similarity_threshold": settings.tiny_face_similarity_threshold,
+            "tiny_face_aggregate_similarity_threshold": (
+                settings.tiny_face_aggregate_similarity_threshold
+            ),
+            "tiny_face_detection_threshold": settings.tiny_face_detection_threshold,
+            "tiny_face_evidence_required": settings.tiny_face_evidence_required,
+            "tiny_face_evidence_window_seconds": settings.tiny_face_evidence_window_seconds,
+            "tiny_face_consistent_votes_required": settings.tiny_face_consistent_votes_required,
+            "tiny_face_allow_relaxed_association": settings.tiny_face_allow_relaxed_association,
             "effective_search_min_face_px": settings.effective_search_min_face_px,
             "min_search_face_px": settings.min_search_face_px,
             "preferred_search_face_px": settings.preferred_search_face_px,
@@ -300,6 +335,10 @@ class SearchSession:
             "small_face_required_sampling_hz": (
                 settings.small_face_evidence_required
                 / settings.small_face_evidence_window_seconds
+            ),
+            "tiny_face_required_sampling_hz": (
+                settings.tiny_face_evidence_required
+                / settings.tiny_face_evidence_window_seconds
             ),
         }
 
@@ -337,6 +376,13 @@ class SearchSession:
             if face_is_cuda
             else self.settings.roi_face_detection_hz_cpu
         )
+        shallow_scales = self.settings.full_frame_detection_scales(
+            is_cuda=face_is_cuda, deep=False
+        )
+        deep_scales = self.settings.full_frame_detection_scales(is_cuda=face_is_cuda)
+        deep_scan_every_n = self.settings.face_deep_scan_every_n
+        face_pass_index = 0
+        previous_motion_gray: np.ndarray | None = None
         try:
             reader.start()
             while not self._stop.is_set():
@@ -358,14 +404,28 @@ class SearchSession:
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
                     stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
-                    tracks = self._tracker.update(detections)
+                    motion, previous_motion_gray = self._estimate_camera_motion(
+                        packet.frame, previous_motion_gray
+                    )
+                    tracks = self._tracker.update(detections, motion=motion)
                     self._record_stage("person", stage_started)
                     last_person_at = now
                 faces = []
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
+                    deep = face_pass_index % deep_scan_every_n == 0
+                    face_pass_index += 1
                     stage_started = time.monotonic()
-                    faces = self.face_backend.detect_faces(packet.frame, enrollment=False)
+                    faces = self.face_backend.detect_faces(
+                        packet.frame,
+                        enrollment=False,
+                        detection_size=deep_scales if deep else shallow_scales,
+                    )
+                    # face_full always covers every pass, which is the cost the
+                    # budget must reason about; face_full_deep isolates the large
+                    # scale so its price is visible when tuning deep_scan_every_n.
                     self._record_stage("face_full", stage_started)
+                    if deep:
+                        self._record_stage("face_full_deep", stage_started)
                     self._record_face_source("full_frame", len(faces))
                     last_face_at = now
                     roi_clock = time.monotonic()
@@ -407,17 +467,28 @@ class SearchSession:
                 modes_by_face = {face_index: mode for face_index, (_, mode) in detailed.items()}
                 all_tracks = list(tracks)
                 fallback_policy = fallback_face_match_policy(self.settings)
+                # The tier is a property of the observation, not of one target, so
+                # the session owns it: every target must judge a given track by the
+                # same size tier, and the hysteresis margin has to be resolved once.
                 policies_by_face: dict[int, FaceMatchPolicy] = {
-                    face_index: default_face_match_policy(face, self.settings)
+                    face_index: default_face_match_policy(
+                        face,
+                        self.settings,
+                        self._tier_of_associated_track(face_index, association_by_face),
+                    )
                     for face_index, face in enumerate(accepted_faces)
                 }
                 for face_index, mode in list(modes_by_face.items()):
-                    if policies_by_face[face_index].requires_strict_association:
-                        if mode != "person_strict":
-                            association_by_face.pop(face_index, None)
-                            modes_by_face.pop(face_index, None)
+                    policy = policies_by_face[face_index]
+                    if mode == "person_relaxed" and not policy.allows_relaxed_association:
+                        association_by_face.pop(face_index, None)
+                        modes_by_face.pop(face_index, None)
                         continue
-                    if mode == "person_relaxed":
+                    if mode == "person_relaxed" and is_stricter_policy(fallback_policy, policy):
+                        # A relaxed association is weaker body evidence, so it pulls
+                        # the face up to the small-face bar -- but only when that bar
+                        # is actually higher. Applying it unconditionally would have
+                        # relaxed the far tier instead of tightening it.
                         policies_by_face[face_index] = fallback_policy
                 unassociated_indices = [
                     face_index
@@ -450,6 +521,14 @@ class SearchSession:
                         self.metrics.match_stage_counts.get("associated", 0)
                         + len(association_by_face)
                     )
+                for face_index, track_id in association_by_face.items():
+                    self._track_tiers[track_id] = policies_by_face[face_index].tier
+                live_track_ids = {track.track_id for track in all_tracks}
+                self._track_tiers = {
+                    key: value
+                    for key, value in self._track_tiers.items()
+                    if key in live_track_ids
+                }
 
                 self._debug_faces = []
                 faces_by_target: dict[str, list[tuple[int, FaceObservation]]] = {
@@ -565,23 +644,25 @@ class SearchSession:
                         # observed == required while contributing nothing.
                         best = max(
                             progress.values(),
-                            key=lambda item: (item.qualifying, item.median_similarity or -1.0),
+                            key=lambda item: (item.qualifying, item.window_similarity or -1.0),
                         )
                         with self._lock:
                             current = self._target_status[target_id]
                             current["evidence_count"] = best.observed
                             current["required_evidence"] = best.required
                             current["qualifying_evidence"] = best.qualifying
-                            current["median_similarity"] = best.median_similarity
+                            current["window_similarity"] = best.window_similarity
+                            current["window_statistic"] = best.window_statistic
                             current["required_similarity"] = best.threshold
                             current["aggregate_similarity"] = best.aggregate_similarity
                             current["required_aggregate_similarity"] = best.aggregate_threshold
+                            current["tier"] = best.tier
                     else:
                         with self._lock:
                             current = self._target_status[target_id]
                             current["evidence_count"] = 0
                             current["qualifying_evidence"] = 0
-                            current["median_similarity"] = None
+                            current["window_similarity"] = None
                             current["aggregate_similarity"] = None
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
                         state_value = (
@@ -781,6 +862,7 @@ class SearchSession:
                 self.metrics.face_size_counts[bucket] = (
                     self.metrics.face_size_counts.get(bucket, 0) + 1
                 )
+                self.metrics.blur_variances.append(face.blur_variance)
                 for reason in face.rejection_reasons:
                     self.metrics.rejection_counts[reason] = (
                         self.metrics.rejection_counts.get(reason, 0) + 1
@@ -826,6 +908,7 @@ class SearchSession:
                 current["last_face_px"] = face.short_side
                 if not face.accepted:
                     current["last_rejection_reason"] = ",".join(face.rejection_reasons)
+                    current["last_rejection_face_px"] = face.short_side
 
     def _record_rejected_observations(self, faces: list[FaceObservation]) -> None:
         """Record why rejected faces were dropped, without paying for an embedding.
@@ -833,6 +916,12 @@ class SearchSession:
         Similarity is unknowable for these faces by design — they never reach
         ArcFace — but "a face this big was rejected for this reason" is the more
         actionable half of the diagnostic anyway.
+
+        The reason and the size it belongs to are written together. They used to
+        come from different observations: ``last_face_px`` tracked the largest face
+        seen while the reason came from the largest *rejected* one, so the panel
+        could read "49px / face_too_small" against a 48px floor and send the
+        operator hunting for a bug in the size gate.
         """
         if not faces or not self._active_targets:
             return
@@ -844,6 +933,7 @@ class SearchSession:
                     current["last_face_px"] = largest.short_side
                 if largest.rejection_reasons:
                     current["last_rejection_reason"] = ",".join(largest.rejection_reasons)
+                    current["last_rejection_face_px"] = largest.short_side
 
     def _rank_identity_matches(self, face: FaceObservation) -> list[tuple[str, float]]:
         """Rank against the immutable batch gallery, including found targets."""
@@ -860,6 +950,13 @@ class SearchSession:
 
     def _is_face_matchable(self, face: FaceObservation) -> bool:
         return bool(face.accepted and face.short_side >= self.settings.effective_search_min_face_px)
+
+    def _tier_of_associated_track(
+        self, face_index: int, association_by_face: dict[int, int]
+    ) -> str | None:
+        """Return the tier the face's track is currently judged by, if any."""
+        track_id = association_by_face.get(face_index)
+        return None if track_id is None else self._track_tiers.get(track_id)
 
     def _stage_p95_ms(self, stage: str) -> float:
         with self._lock:
@@ -908,6 +1005,59 @@ class SearchSession:
         self._budget_credit = float(
             np.clip(self._budget_credit + refill - frame_cost_seconds, -cap, cap)
         )
+
+    def _estimate_camera_motion(
+        self, frame: np.ndarray, previous_gray: np.ndarray | None
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return the global pixel shift since the last person pass, and the new state.
+
+        A robot that pans moves every box in the frame at once, which pure-IoU
+        association reads as "every track lost" -- and a fresh track id restarts the
+        evidence window from zero, so a moving camera silently caps how much
+        evidence a person can ever accumulate. Handing the shift to the tracker
+        keeps one person on one id.
+
+        Only translation is estimated. A fast on-the-spot rotation needs an affine
+        fit; ``camera_motion_px_p95`` on the panel is what says whether that day
+        has come.
+        """
+        if not self.settings.camera_motion_compensation:
+            return None, None
+        stage_started = time.monotonic()
+        height, width = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        scale = MOTION_ESTIMATE_WIDTH / max(width, 1)
+        if scale < 1.0:
+            gray = cv2.resize(
+                gray,
+                (MOTION_ESTIMATE_WIDTH, max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            scale = 1.0
+        current = np.float32(gray)
+        if previous_gray is None or previous_gray.shape != current.shape:
+            return None, current
+        (shift_x, shift_y), response = cv2.phaseCorrelate(
+            previous_gray, current, self._motion_window(current.shape)
+        )
+        self._record_stage("cmc", stage_started)
+        if not np.isfinite(response) or response < MOTION_MIN_RESPONSE:
+            return None, current
+        # phaseCorrelate reports the shift that maps the previous frame onto the
+        # current one, which is exactly what a track box needs added to it.
+        motion = np.asarray([shift_x, shift_y], dtype=np.float32) / scale
+        with self._lock:
+            self.metrics.camera_motion_px.append(float(np.hypot(motion[0], motion[1])))
+        return motion, current
+
+    def _motion_window(self, shape: tuple[int, ...]) -> np.ndarray:
+        """Return a cached Hanning window; without one, frame edges bias the peak."""
+        if self._motion_hanning is None or self._motion_hanning.shape != shape:
+            self._motion_hanning = cv2.createHanningWindow(
+                (shape[1], shape[0]), cv2.CV_32F
+            )
+        return self._motion_hanning
 
     def _tracks_needing_roi_face_pass(
         self, faces: list[FaceObservation], tracks: list[Track]
@@ -967,11 +1117,13 @@ class SearchSession:
             roi = frame[y1:roi_bottom, x1:x2]
             # A crop is already tight, so the full-frame Auto dual-scale pass would
             # only double the cost here. Detection only — embedding happens once,
-            # later, after dedup against the full-frame results.
+            # later, after dedup against the full-frame results. The scale keeps a
+            # small crop upsampled while never shrinking a large one back below the
+            # pixels the crop existed to preserve.
             found = self.face_backend.detect_faces(
                 roi,
                 enrollment=False,
-                detection_size=self.settings.roi_face_detection_size,
+                detection_size=self.settings.roi_detection_scale(roi.shape[1], roi.shape[0]),
             )
             self._note_roi_outcome(track.track_id, hit=bool(found))
             for face in found:

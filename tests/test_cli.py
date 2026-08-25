@@ -16,6 +16,7 @@ from person_search.cli import (
     _offline_decision_state,
 )
 from person_search.config import Settings
+from person_search.confirmation import tiny_face_match_policy
 from person_search.domain import Track
 from person_search.face_tracking import FaceTracker
 
@@ -77,8 +78,39 @@ def test_offline_association_uses_relaxed_person_then_face_fallback() -> None:
     assert {track.track_id for track in all_tracks} == {7, associations[1]}
 
 
-def test_offline_tiny_face_requires_strict_person_association_without_fallback() -> None:
+def test_offline_tiny_face_keeps_a_relaxed_association_but_never_a_face_only_track() -> None:
+    """Seated and truncated far faces are unambiguous; face-only tracks are not."""
     settings = Settings(tiny_face_enabled=True)
+    relaxed = make_face(bbox=(20, 65, 68, 113))
+    unassociated = make_face(bbox=(140, 10, 188, 58))
+    tracks = [
+        Track(
+            track_id=7,
+            bbox=np.asarray([0, 0, 100, 120], dtype=np.float32),
+            score=0.9,
+        )
+    ]
+
+    all_tracks, associations, modes = _associate_search_faces(
+        [relaxed, unassociated],
+        tracks,
+        settings=settings,
+        face_tracker=FaceTracker(),
+        timestamp=1.0,
+    )
+
+    assert associations == {0: 7}
+    assert modes == {0: "person_relaxed"}
+    # No fallback face track was created for the unassociated far face.
+    assert [track.track_id for track in all_tracks] == [7]
+    # The relaxed path must not swap the far tier's policy for the looser
+    # small-face one: it is weaker body evidence, not a bigger face.
+    policies = _face_policies([relaxed, unassociated], modes, settings)
+    assert policies[0] == tiny_face_match_policy(settings)
+
+
+def test_offline_tiny_face_can_still_be_held_to_strict_person_association() -> None:
+    settings = Settings(tiny_face_enabled=True, tiny_face_allow_relaxed_association=False)
     relaxed = make_face(bbox=(20, 65, 68, 113))
     unassociated = make_face(bbox=(140, 10, 188, 58))
     tracks = [

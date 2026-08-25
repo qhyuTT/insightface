@@ -175,6 +175,8 @@
             <div class="diagnostic-cell"><small>SAMPLING HEADROOM</small><output id="samplingDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>EFFECTIVE RATES</small><output id="configRatesDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>EFFECTIVE GATES</small><output id="configGatesDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>MOTION / SHARPNESS</small><output id="motionDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>MATCH PROFILE</small><output id="profileDiag">尚无样本</output></div>
           </div>
         </div>
       </section>
@@ -215,6 +217,8 @@
       if (!reason) return '';
       return reason.split(',').map(part => REJECTION_TEXT[part.trim()] || part.trim()).join(' / ');
     }
+    const TIER_TEXT = { normal: '近档', small: '小脸档', tiny: '远脸档' };
+    const STATISTIC_TEXT = { median: '中位', top_k_mean: '最佳K均' };
     function renderTargets(targets = []) {
       $('batchInfo').textContent = targets.map(item => {
         // "证据" counts banked samples, which saturates for far faces because every
@@ -222,27 +226,33 @@
         // number that actually decides confirmation.
         const progress = item.required_evidence ? ` · 证据 ${item.evidence_count}/${item.required_evidence}` : '';
         const pixels = item.last_face_px ? ` · ${item.last_face_px}px` : '';
-        const head = `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}${pixels}${progress}`;
+        const tier = item.tier ? ` · ${TIER_TEXT[item.tier] || item.tier}` : '';
+        const head = `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}${pixels}${tier}${progress}`;
         if (item.status === 'found') return head;
         const detail = [];
         if (item.best_observed_similarity != null && item.required_similarity != null) {
           detail.push(`最佳 ${item.best_observed_similarity.toFixed(2)} / 需 ${item.required_similarity.toFixed(2)}`);
         }
-        if (item.median_similarity != null) {
-          detail.push(`中位 ${item.median_similarity.toFixed(2)}`);
+        // The statistic travels with its value: a top-K mean read as a median is a
+        // wrong number, and which one is in force depends on match_profile.
+        if (item.window_similarity != null) {
+          const label = STATISTIC_TEXT[item.window_statistic] || item.window_statistic || '窗口';
+          detail.push(`${label} ${item.window_similarity.toFixed(2)}`);
         }
         if (item.required_evidence) {
           detail.push(`达标 ${item.qualifying_evidence}/${item.required_evidence}`);
         }
         // The far-face tier has a second gate: a quality-weighted mean embedding.
-        // A track can show a passing median and still never confirm on this one,
-        // so it has to be visible or the panel cannot explain the verdict.
+        // A track can show a passing window value and still never confirm on this
+        // one, so it has to be visible or the panel cannot explain the verdict.
         if (item.aggregate_similarity != null && item.required_aggregate_similarity != null) {
           const pass = item.aggregate_similarity >= item.required_aggregate_similarity ? '✓' : '✗';
           detail.push(`聚合 ${item.aggregate_similarity.toFixed(2)} / 需 ${item.required_aggregate_similarity.toFixed(2)} ${pass}`);
         }
         const reason = rejectionText(item.last_rejection_reason);
-        if (reason) detail.push(reason);
+        // The rejected face's own size, because it is often not last_face_px: the
+        // largest face seen and the largest rejected face are different faces.
+        if (reason) detail.push(item.last_rejection_face_px != null ? `${item.last_rejection_face_px}px ${reason}` : reason);
         return detail.length ? `${head}\n    ${detail.join(' · ')}` : head;
       }).join('\n');
     }
@@ -307,6 +317,32 @@
         `模糊 ${num(config.min_search_blur_variance, 0)}`,
         `检测阈 ${num(config.face_detection_threshold, 2)}`,
         `证据 ${config.evidence_required ?? '?'}/${num(config.evidence_window_seconds, 1)}s`,
+      ].join('  /  ');
+
+      // A panning robot is the reason tracks churn, and sharpness is a gate whose
+      // own value was never reported. Both belong on the panel rather than in a
+      // guess about why evidence is not accumulating.
+      $('motionDiag').textContent = [
+        `相机位移 p95 ${num(body.camera_motion_px_p95, 1)}px`,
+        config.camera_motion_compensation ? '运动补偿 开' : '运动补偿 关',
+        `清晰度 中位 ${num(body.blur_variance_p50, 0)} / p95 ${num(body.blur_variance_p95, 0)}`,
+        `门槛 ${num(config.min_search_blur_variance, 0)}`,
+      ].join('  /  ');
+
+      // Which bar the operator switched on, and the numbers it resolved to. The
+      // profile only fills in fields the environment left alone, so the resolved
+      // values -- not the profile name -- are what explains a verdict.
+      const tinyNeeded = Number(config.tiny_face_required_sampling_hz || 0);
+      $('profileDiag').textContent = [
+        `档位 ${config.match_profile ?? '?'}`,
+        `统计量 ${config.evidence_statistic ?? '?'}${config.evidence_statistic === 'top_k_mean' ? `(K=${config.evidence_top_k ?? '?'})` : ''}`,
+        `远脸证据 ${config.tiny_face_evidence_required ?? '?'}/${num(config.tiny_face_evidence_window_seconds, 1)}s 需 ${num(tinyNeeded, 2)}Hz → ${verdict(tinyNeeded)}`,
+        `远脸检测阈 ${num(config.tiny_face_detection_threshold, 2)}`,
+        `远脸聚合 ${num(config.tiny_face_aggregate_similarity_threshold, 2)}`,
+        `坐姿关联 ${config.tiny_face_allow_relaxed_association ? '允许' : '禁止'}`,
+        `档位迟滞 ${config.face_tier_hysteresis_px ?? '?'}px`,
+        `多尺度 ${(config.full_frame_detection_scales || []).join('+') || '?'}${config.face_deep_scan_every_n > 1 ? ` 每${config.face_deep_scan_every_n}轮` : ''}`,
+        `翻转TTA ${config.embedding_flip_tta ? '开' : '关'}`,
       ].join('  /  ');
     }
 

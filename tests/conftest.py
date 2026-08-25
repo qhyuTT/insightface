@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 
 import numpy as np
@@ -19,10 +20,14 @@ class FakeFaceBackend:
         self.detect_calls = 0
         self.embed_calls = 0
         self.embedded_faces = 0
-        self.detection_sizes: list[int | None] = []
+        self.detection_sizes: list[int | Sequence[int] | None] = []
 
     def detect_faces(
-        self, frame: np.ndarray, *, enrollment: bool = False, detection_size: int | None = None
+        self,
+        frame: np.ndarray,
+        *,
+        enrollment: bool = False,
+        detection_size: int | Sequence[int] | None = None,
     ) -> list[FaceObservation]:
         self.detect_calls += 1
         self.detection_sizes.append(detection_size)
@@ -68,6 +73,7 @@ def make_face(
     *,
     accepted: bool = True,
     quality: float = 0.9,
+    blur_variance: float = 0.0,
 ) -> FaceObservation:
     vector = np.asarray(embedding, dtype=np.float32)
     vector /= np.linalg.norm(vector)
@@ -78,4 +84,5 @@ def make_face(
         quality=quality,
         accepted=accepted,
         rejection_reasons=() if accepted else ("face_blurry",),
+        blur_variance=blur_variance,
     )

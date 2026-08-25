@@ -7,9 +7,11 @@ from conftest import make_face
 from person_search.config import Settings
 from person_search.confirmation import (
     TrackConfirmation,
+    _window_statistic,
     associate_faces_to_tracks,
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
+    resolve_face_tier,
     tiny_face_match_policy,
 )
 from person_search.domain import MatchState, Target, TargetView, Track
@@ -648,7 +650,7 @@ def test_saturated_tiny_evidence_reports_qualifying_shortfall() -> None:
     assert progress.observed == progress.required == 6
     assert progress.qualifying == 1
     assert progress.threshold == pytest.approx(settings.tiny_face_similarity_threshold)
-    assert progress.median_similarity == pytest.approx(0.41, abs=1e-2)
+    assert progress.window_similarity == pytest.approx(0.41, abs=1e-2)
     assert progress.best_similarity == pytest.approx(0.70, abs=1e-2)
 
 
@@ -737,7 +739,7 @@ def test_relaxing_the_tier_clears_the_evidence_window() -> None:
     _feed(matcher, settings, ((0.4, 120, 0.70),), start_frame=2)
     progress = matcher.track_progress()[7]
     assert progress.observed == 1
-    assert progress.median_similarity == pytest.approx(0.70, abs=1e-2)
+    assert progress.window_similarity == pytest.approx(0.70, abs=1e-2)
 
 
 def test_track_progress_reports_the_far_face_aggregate_gate() -> None:
@@ -765,3 +767,109 @@ def test_track_progress_reports_the_far_face_aggregate_gate() -> None:
     # Without a target the rest of the report still works; only the gate is unknown.
     assert matcher.track_progress()[7].aggregate_similarity is None
 
+
+
+def _feed_with_hysteresis(
+    matcher: TrackConfirmation,
+    settings: Settings,
+    samples: tuple[tuple[float, int, float], ...],
+) -> list:
+    """Drive the matcher the way service._run does: tier resolved against the track.
+
+    The live loop looks up the tier the track is already held to before choosing a
+    policy, which is what makes the hysteresis margin apply at all.
+    """
+    decisions = []
+    for frame_id, (timestamp, short_side, similarity) in enumerate(samples):
+        face = _face_with_similarity(short_side, similarity)
+        policy = default_face_match_policy(face, settings, matcher.tier_of(7))
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[face],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+    return decisions
+
+
+def test_tier_hysteresis_keeps_a_face_drifting_across_a_boundary_in_one_window() -> None:
+    """A moving robot sweeps one face across 64px; that must not reset the evidence."""
+    samples = ((0.0, 66, 0.66), (0.3, 62, 0.66), (0.6, 66, 0.66), (0.9, 62, 0.66))
+    sticky = TrackConfirmation(Settings(tiny_face_enabled=True))
+    flapping = TrackConfirmation(Settings(tiny_face_enabled=True, face_tier_hysteresis_px=0))
+
+    sticky_decisions = _feed_with_hysteresis(
+        sticky, Settings(tiny_face_enabled=True), samples
+    )
+    flapping_decisions = _feed_with_hysteresis(
+        flapping, Settings(tiny_face_enabled=True, face_tier_hysteresis_px=0), samples
+    )
+
+    # Sticky: every sample lands in the small tier, so the window fills and confirms.
+    assert sticky.track_progress()[7].observed == 4
+    assert sticky.track_progress()[7].tier == "small"
+    assert any(item.state == MatchState.CONFIRMED for item in sticky_decisions)
+    # Flapping: each frame swaps tier, each swap clears the window, and a window
+    # that never exceeds one sample can never reach a quorum.
+    assert flapping.track_progress()[7].observed == 1
+    assert not any(item.state == MatchState.CONFIRMED for item in flapping_decisions)
+
+
+def test_resolve_face_tier_requires_a_margin_to_leave_the_current_tier() -> None:
+    settings = Settings(min_search_face_px=64, preferred_search_face_px=80)
+
+    # With no tier yet, the first observation lands on its honest tier.
+    assert resolve_face_tier(63, settings) == "tiny"
+    assert resolve_face_tier(64, settings) == "small"
+    assert resolve_face_tier(80, settings) == "normal"
+    # Leaving a tier costs face_tier_hysteresis_px in the direction of travel.
+    assert resolve_face_tier(68, settings, "tiny") == "tiny"
+    assert resolve_face_tier(70, settings, "tiny") == "small"
+    assert resolve_face_tier(59, settings, "small") == "small"
+    assert resolve_face_tier(57, settings, "small") == "tiny"
+    assert resolve_face_tier(85, settings, "small") == "small"
+    assert resolve_face_tier(86, settings, "normal") == "normal"
+    assert resolve_face_tier(75, settings, "normal") == "normal"
+    assert resolve_face_tier(73, settings, "normal") == "small"
+
+
+def test_window_statistic_top_k_mean_survives_poses_a_median_cannot() -> None:
+    similarities = [0.72, 0.70, 0.40, 0.40]
+
+    assert _window_statistic(similarities, "median", 3) == pytest.approx(0.55)
+    assert _window_statistic(similarities, "top_k_mean", 3) == pytest.approx(0.606666, abs=1e-4)
+    # K larger than the window is clamped, so the two agree on a single sample.
+    assert _window_statistic([0.5], "top_k_mean", 3) == pytest.approx(0.5)
+
+
+def test_responsive_statistic_confirms_a_far_window_the_median_would_reject() -> None:
+    """Same samples, same threshold: only the reduction differs.
+
+    The statistic only ever matters on the far tier. Every other tier refuses
+    sub-threshold observations outright, so its window contains nothing but
+    qualifying samples and its median is above the threshold by construction.
+    """
+    samples = ((0.0, 55, 0.80), (0.3, 55, 0.78), (0.6, 55, 0.40), (0.9, 55, 0.30))
+    common = {
+        "tiny_face_enabled": True,
+        "tiny_face_evidence_required": 4,
+        "tiny_face_consistent_votes_required": 2,
+        "tiny_face_evidence_window_seconds": 2.0,
+        # Held low on purpose so this test measures the window statistic and not
+        # the aggregate-embedding gate sitting behind it.
+        "tiny_face_aggregate_similarity_threshold": 0.50,
+        "tiny_face_shadow_mode": False,
+    }
+    strict_settings = Settings(**common)
+    loose_settings = Settings(**common, evidence_statistic="top_k_mean", evidence_top_k=3)
+
+    strict = _feed(TrackConfirmation(strict_settings), strict_settings, samples)
+    loose = _feed(TrackConfirmation(loose_settings), loose_settings, samples)
+
+    assert not any(item.state == MatchState.CONFIRMED for item in strict)
+    assert any(item.state == MatchState.CONFIRMED for item in loose)

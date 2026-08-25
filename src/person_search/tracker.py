@@ -14,6 +14,11 @@ class _TrackMemory:
     score: float
     velocity: np.ndarray
     missed: int = 0
+    # The last box that came from a detection, as opposed to bbox which may have
+    # been advanced by the motion model. Velocity must be measured between two
+    # observations; measuring it against the prediction yields the residual, which
+    # decays to zero and makes the tracker systematically under-predict motion.
+    observed_bbox: np.ndarray | None = None
 
 
 class ByteTracker:
@@ -39,10 +44,27 @@ class ByteTracker:
         self._tracks.clear()
         self._next_id = 1
 
-    def update(self, detections: list[Detection]) -> list[Track]:
+    def update(self, detections: list[Detection], motion: np.ndarray | None = None) -> list[Track]:
+        """Associate detections with tracks, optionally after cancelling camera motion.
+
+        ``motion`` is the global ``(dx, dy)`` shift of the frame since the previous
+        update. Every box moves by it at once when the camera pans, so applying it
+        before IoU is what stops a moving robot from being read as "all tracks lost"
+        and handing every person a brand new id.
+        """
+        shift = None
+        if motion is not None:
+            dx, dy = float(motion[0]), float(motion[1])
+            shift = np.asarray([dx, dy, dx, dy], dtype=np.float32)
         memories = list(self._tracks.values())
         for memory in memories:
             memory.bbox = memory.bbox + memory.velocity
+            if shift is not None:
+                memory.bbox = memory.bbox + shift
+                # Carry the reference box along too, so velocity keeps measuring the
+                # person's own motion rather than re-absorbing the camera's.
+                if memory.observed_bbox is not None:
+                    memory.observed_bbox = memory.observed_bbox + shift
             memory.missed += 1
 
         high = [item for item in detections if item.score >= self.high_threshold]
@@ -73,6 +95,7 @@ class ByteTracker:
                 bbox=detection.bbox.copy(),
                 score=detection.score,
                 velocity=np.zeros(4, dtype=np.float32),
+                observed_bbox=detection.bbox.copy(),
             )
             self._tracks[memory.track_id] = memory
             matched_track_ids.add(memory.track_id)
@@ -90,8 +113,16 @@ class ByteTracker:
 
     @staticmethod
     def _apply_match(memory: _TrackMemory, detection: Detection) -> None:
-        memory.velocity = detection.bbox.astype(np.float32) - memory.bbox.astype(np.float32)
+        reference = memory.observed_bbox if memory.observed_bbox is not None else memory.bbox
+        # missed counts the update() calls since the last observation, so dividing
+        # by it keeps a track that coasted for several frames from coming back with
+        # a velocity several times too large.
+        intervals = max(1, memory.missed)
+        memory.velocity = (
+            detection.bbox.astype(np.float32) - reference.astype(np.float32)
+        ) / intervals
         memory.bbox = detection.bbox.copy()
+        memory.observed_bbox = detection.bbox.copy()
         memory.score = detection.score
         memory.missed = 0
 

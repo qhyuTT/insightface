@@ -233,17 +233,13 @@ def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_opti
     session = SimpleNamespace(
         _lock=threading.RLock(),
         settings=Settings(preferred_search_face_px=80),
-        metrics=SimpleNamespace(
-            face_observations=0,
-            accepted_faces=0,
-            small_faces=0,
-            rejection_counts={},
-            face_size_counts={},
-            match_stage_counts={},
-        ),
+        # A real SearchMetrics rather than a hand-rolled namespace: the stub version
+        # broke every time the pipeline started recording one more field, which says
+        # nothing about the behaviour under test.
+        metrics=SearchMetrics(),
     )
-    small = make_face(bbox=(0, 0, 64, 70))
-    rejected = make_face(accepted=False)
+    small = make_face(bbox=(0, 0, 64, 70), blur_variance=120.0)
+    rejected = make_face(accepted=False, blur_variance=20.0)
 
     SearchSession._record_face_metrics(session, [small, rejected])
 
@@ -256,6 +252,10 @@ def test_face_metrics_and_rtsp_sanitization_keep_new_diagnostics_and_source_opti
         "detected": 2,
         "quality_accepted": 1,
     }
+    # The sharpness gate's own numbers reach the panel, rejected faces included:
+    # a gate nobody can read cannot be calibrated against real footage.
+    assert session.metrics.blur_variances == [120.0, 20.0]
+    assert session.metrics.snapshot()["blur_variance_p50"] == pytest.approx(70.0)
 
     sanitized = _sanitize_source(
         SourceConfig(
@@ -1246,8 +1246,142 @@ def test_saturated_tiny_evidence_surfaces_similarity_shortfall(monkeypatch) -> N
     assert view_target.status.value == "searching"
     assert view_target.evidence_count == view_target.required_evidence == 6
     assert view_target.qualifying_evidence == 0
-    assert view_target.median_similarity == pytest.approx(similarity)
+    assert view_target.window_similarity == pytest.approx(similarity)
     assert view_target.required_similarity == pytest.approx(
         settings.tiny_face_similarity_threshold
     )
     assert view_target.last_rejection_reason == "similarity_low"
+
+
+def _fake_reader(packets: list) -> type:
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    return FakeReader
+
+
+def _single_target() -> Target:
+    view = TargetView(
+        target_id="target-scale",
+        name="目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    return Target("target-scale", np.asarray([1.0, 0.0], dtype=np.float32), view, "目标")
+
+
+def test_full_frame_pass_uses_the_resolved_scales_on_the_deep_scan_cadence(monkeypatch) -> None:
+    """On 1080p the 640 pass leaves a 49px face at ~16px, below what SCRFD can score."""
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=float(index), frame=frame)
+        for index in range(4)
+    ]
+    monkeypatch.setattr("person_search.service.LatestFrameReader", _fake_reader(packets))
+    backend = FakeFaceBackend([])
+    session = SearchSession(
+        search_id="search-scales",
+        target=_single_target(),
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(face_detection_extra_scale_cpu=1280, face_deep_scan_every_n=2),
+        face_backend=backend,
+        # No person tracks, so nothing can trigger an ROI pass and every recorded
+        # detection size belongs to the full-frame pass.
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    assert backend.detection_sizes == [(128, 640, 1280), (128, 640), (128, 640, 1280), (128, 640)]
+
+
+def test_roi_pass_never_downsamples_a_crop_it_exists_to_preserve() -> None:
+    backend = FakeFaceBackend([])
+    settings = Settings(roi_face_detection_size=320, roi_face_detection_max_size=640)
+    session = _roi_stub(settings, backend)
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    # A close person: the upper half of the body box is far larger than 320, and
+    # shrinking it back to 320 would throw away the pixels the crop was taken for.
+    near = Track(1, np.asarray([0, 0, 500, 1000], dtype=np.float32), 0.9)
+    far = Track(2, np.asarray([600, 0, 690, 260], dtype=np.float32), 0.9)
+
+    SearchSession._analyze_person_rois(session, frame, [near, far])
+
+    # 500x500 rounds up to 512 rather than being squeezed back to 320; the far
+    # crop is still upsampled to the floor.
+    assert backend.detection_sizes == [512, 320]
+
+
+def test_rejection_reason_is_reported_with_the_size_of_the_face_it_belongs_to() -> None:
+    """The reason and the pixel count must describe one observation, not two."""
+    session = SimpleNamespace(
+        _lock=threading.RLock(),
+        settings=Settings(),
+        _active_targets={"target-1": None},
+        _target_status={
+            "target-1": {"last_face_px": 49, "last_rejection_reason": None,
+                         "last_rejection_face_px": None}
+        },
+    )
+    rejected = make_face(bbox=(0, 0, 40, 40), accepted=False)
+
+    SearchSession._record_rejected_observations(session, [rejected])
+
+    status = session._target_status["target-1"]
+    # The largest face seen stays at 49px, but the reason now carries its own 40px
+    # rather than borrowing the other face's size.
+    assert status["last_face_px"] == 49
+    assert status["last_rejection_reason"] == "face_blurry"
+    assert status["last_rejection_face_px"] == 40
+
+
+def test_camera_motion_estimate_recovers_a_known_shift() -> None:
+    session = SimpleNamespace(
+        settings=Settings(),
+        _lock=threading.RLock(),
+        metrics=SearchMetrics(),
+        _motion_hanning=None,
+    )
+    session._record_stage = lambda stage, started: SearchSession._record_stage(
+        session, stage, started
+    )
+    session._motion_window = lambda shape: SearchSession._motion_window(session, shape)
+    rng = np.random.default_rng(7)
+    first = rng.integers(0, 255, size=(540, 960, 3), dtype=np.uint8)
+    shift = 60
+    second = np.roll(first, shift, axis=1)
+
+    motion, state = SearchSession._estimate_camera_motion(session, first, None)
+    assert motion is None and state is not None
+
+    motion, _ = SearchSession._estimate_camera_motion(session, second, state)
+
+    assert motion is not None
+    # Reported in full-frame pixels even though the estimate runs downscaled.
+    assert motion[0] == pytest.approx(shift, abs=2.0)
+    assert motion[1] == pytest.approx(0.0, abs=2.0)
+    assert session.metrics.snapshot()["camera_motion_px_p95"] == pytest.approx(shift, abs=2.0)
+
+
+def test_camera_motion_estimate_is_skipped_when_disabled() -> None:
+    session = SimpleNamespace(settings=Settings(camera_motion_compensation=False))
+    frame = np.zeros((540, 960, 3), dtype=np.uint8)
+
+    assert SearchSession._estimate_camera_motion(session, frame, None) == (None, None)

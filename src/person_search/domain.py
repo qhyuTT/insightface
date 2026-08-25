@@ -93,6 +93,14 @@ class SearchView(BaseModel):
     match_stage_counts: dict[str, int] = Field(default_factory=dict)
     stage_p95_latency_ms: dict[str, float] = Field(default_factory=dict)
     effective_hz: dict[str, float] = Field(default_factory=dict)
+    source_fps: float = 0.0
+    frame_width: int = 0
+    frame_height: int = 0
+    roi_calls_per_frame: float = 0.0
+    drop_rate: float = 0.0
+    end_to_end_p95_latency_ms: float = 0.0
+    budget_skips: dict[str, int] = Field(default_factory=dict)
+    effective_config: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
     targets: list[TargetSearchView] = Field(default_factory=list)
     found_count: int = 0
@@ -144,7 +152,10 @@ class Track:
 class FaceObservation:
     bbox: np.ndarray
     detection_score: float
-    embedding: np.ndarray
+    # None until embed_faces() runs. Detection is cheap and most detections are
+    # discarded (dedup, quality, association), so ArcFace is deferred until a face
+    # has actually earned it.
+    embedding: np.ndarray | None
     quality: float
     landmarks: np.ndarray | None = None
     accepted: bool = True
@@ -180,6 +191,11 @@ class SearchMetrics:
     match_stage_counts: dict[str, int] = field(default_factory=dict)
     stage_latencies_ms: dict[str, list[float]] = field(default_factory=dict)
     stage_call_counts: dict[str, int] = field(default_factory=dict)
+    frame_width: int = 0
+    frame_height: int = 0
+    roi_calls: int = 0
+    budget_skips: dict[str, int] = field(default_factory=dict)
+    end_to_end_latencies_ms: list[float] = field(default_factory=list)
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = 0.0
@@ -196,6 +212,13 @@ class SearchMetrics:
             for stage, latencies in sorted(self.stage_latencies_ms.items())
             if latencies
         }
+        end_to_end_p95 = (
+            float(np.percentile(self.end_to_end_latencies_ms[-1000:], 95))
+            if self.end_to_end_latencies_ms
+            else 0.0
+        )
+        arrived = self.dropped_frames + self.frame_count
+        drop_rate = self.dropped_frames / arrived if arrived else 0.0
         return {
             "processed_fps": fps,
             "p95_latency_ms": p95,
@@ -214,4 +237,13 @@ class SearchMetrics:
                 stage: count / elapsed if elapsed else 0.0
                 for stage, count in sorted(self.stage_call_counts.items())
             },
+            "source_fps": arrived / elapsed if elapsed else 0.0,
+            "frame_width": self.frame_width,
+            "frame_height": self.frame_height,
+            "roi_calls_per_frame": (
+                self.roi_calls / self.frame_count if self.frame_count else 0.0
+            ),
+            "drop_rate": drop_rate,
+            "end_to_end_p95_latency_ms": end_to_end_p95,
+            "budget_skips": dict(sorted(self.budget_skips.items())),
         }

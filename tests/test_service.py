@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 
 import cv2
@@ -13,6 +15,7 @@ from person_search.confirmation import MatchDecision
 from person_search.domain import (
     Detection,
     MatchState,
+    SearchMetrics,
     SearchStatus,
     SourceConfig,
     Target,
@@ -27,6 +30,32 @@ from person_search.service import (
     _merge_faces,
     _sanitize_source,
 )
+
+
+def _preview_stub(track_states: dict, *, settings: Settings | None = None) -> SimpleNamespace:
+    """A minimal stand-in for SearchSession with a subscribed preview hub."""
+    hub = PreviewHub()
+    hub.subscribe()
+    return SimpleNamespace(
+        _track_states=track_states,
+        preview=hub,
+        settings=settings or Settings(),
+        source=SourceConfig(type="camera", device_index=0),
+    )
+
+
+def _roi_stub(settings: Settings, backend) -> SimpleNamespace:
+    """A minimal stand-in for SearchSession's ROI bookkeeping."""
+    return SimpleNamespace(
+        settings=settings,
+        face_backend=backend,
+        _roi_misses={},
+        _roi_skips={},
+        _track_states={},
+        _lock=threading.Lock(),
+        metrics=SearchMetrics(),
+        _note_roi_outcome=lambda track_id, *, hit: None,
+    )
 
 
 def test_enroll_requires_exactly_one_face() -> None:
@@ -76,14 +105,14 @@ def test_preview_only_draws_active_match_tracks(state: str) -> None:
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
     track = Track(7, np.asarray([20, 20, 80, 90], dtype=np.float32), 0.9)
 
-    hidden = SimpleNamespace(_track_states={}, preview=PreviewHub())
+    hidden = _preview_stub({})
     SearchSession._publish_preview(hidden, frame, [track], [])
     _, hidden_jpeg = hidden.preview.after(0, timeout=0)
     assert hidden_jpeg is not None
     hidden_frame = cv2.imdecode(np.frombuffer(hidden_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert np.max(hidden_frame) == 0
 
-    visible = SimpleNamespace(_track_states={7: (state, 0.9)}, preview=PreviewHub())
+    visible = _preview_stub({7: (state, 0.9)})
     SearchSession._publish_preview(visible, frame, [track], [])
     _, visible_jpeg = visible.preview.after(0, timeout=0)
     assert visible_jpeg is not None
@@ -91,20 +120,51 @@ def test_preview_only_draws_active_match_tracks(state: str) -> None:
     assert np.max(visible_frame) > 0
 
 
+def test_preview_is_skipped_when_nobody_is_watching() -> None:
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    track = Track(7, np.asarray([20, 20, 80, 90], dtype=np.float32), 0.9)
+    stub = SimpleNamespace(
+        _track_states={7: ("confirmed", 0.9)},
+        preview=PreviewHub(),
+        settings=Settings(),
+        source=SourceConfig(type="camera", device_index=0),
+    )
+
+    assert SearchSession._publish_preview(stub, frame, [track], []) is False
+    _, jpeg = stub.preview.after(0, timeout=0)
+    assert jpeg is None
+
+    stub.preview.subscribe()
+    assert SearchSession._publish_preview(stub, frame, [track], []) is True
+
+
+def test_preview_downscales_to_the_configured_width() -> None:
+    frame = np.zeros((1440, 2560, 3), dtype=np.uint8)
+    stub = _preview_stub({}, settings=Settings(preview_max_width=960))
+
+    SearchSession._publish_preview(stub, frame, [], [])
+
+    _, jpeg = stub.preview.after(0, timeout=0)
+    decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded.shape[1] == 960
+    assert decoded.shape[0] == 540
+
+
 def test_person_roi_faces_translate_bbox_and_landmarks_to_frame_coordinates() -> None:
     face = make_face(bbox=(5, 7, 45, 47))
     face.landmarks = np.asarray([[10, 12], [30, 12], [20, 22]], dtype=np.float32)
     backend = FakeFaceBackend([face])
-    session = SimpleNamespace(
-        settings=Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120),
-        face_backend=backend,
+    session = _roi_stub(
+        Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120), backend
     )
     frame = np.zeros((400, 500, 3), dtype=np.uint8)
     track = Track(7, np.asarray([100, 80, 300, 320], dtype=np.float32), 0.9)
 
     observations = SearchSession._analyze_person_rois(session, frame, [track])
 
-    assert backend.calls == 1
+    # Detection only: the ROI pass must never pay for an embedding.
+    assert backend.detect_calls == 1
+    assert backend.embed_calls == 0
     np.testing.assert_array_equal(observations[0].bbox, [105, 87, 145, 127])
     np.testing.assert_array_equal(
         observations[0].landmarks,
@@ -113,11 +173,10 @@ def test_person_roi_faces_translate_bbox_and_landmarks_to_frame_coordinates() ->
     np.testing.assert_array_equal(face.bbox, [5, 7, 45, 47])
 
 
-def test_person_roi_pass_uses_top_eight_valid_tracks_by_score() -> None:
+def test_person_roi_pass_uses_top_n_valid_tracks_by_score() -> None:
     backend = FakeFaceBackend([])
-    session = SimpleNamespace(
-        settings=Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120),
-        face_backend=backend,
+    session = _roi_stub(
+        Settings(roi_max_tracks_per_pass=8, roi_min_person_height_px=120), backend
     )
     frame = np.zeros((500, 500, 3), dtype=np.uint8)
     tracks = [
@@ -131,11 +190,11 @@ def test_person_roi_pass_uses_top_eight_valid_tracks_by_score() -> None:
 
     SearchSession._analyze_person_rois(session, frame, tracks)
 
-    assert backend.calls == 8
+    assert backend.detect_calls == 8
 
 
 def test_roi_selection_is_per_track_and_not_suppressed_by_an_unrelated_near_face() -> None:
-    session = SimpleNamespace(settings=Settings(preferred_search_face_px=80))
+    session = _roi_stub(Settings(preferred_search_face_px=80), FakeFaceBackend([]))
     tracks = [
         Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.9),
         Track(2, np.asarray([200, 0, 320, 240], dtype=np.float32), 0.8),
@@ -376,10 +435,20 @@ def test_found_target_remains_an_identity_competitor_until_real_runner_up_appear
             self.observations = list(observations)
             self.calls = 0
 
-        def analyze(self, frame, *, enrollment=False):
+        def detect_faces(self, frame, *, enrollment=False, detection_size=None):
             observation = self.observations[self.calls]
             self.calls += 1
-            return [observation]
+            return [replace(observation, embedding=None)]
+
+        def embed_faces(self, frame, faces):
+            # This backend hands out one scripted observation per call, so the
+            # embedding is recovered from the same script position.
+            index = max(0, self.calls - 1)
+            source = self.observations[index]
+            return [replace(face, embedding=source.embedding) for face in faces]
+
+        def analyze(self, frame, *, enrollment=False):
+            return self.embed_faces(frame, self.detect_faces(frame, enrollment=enrollment))
 
     monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
     target_view_a = TargetView(
@@ -923,3 +992,163 @@ def test_terminal_target_found_event_can_immediately_start_next_search(monkeypat
 
     manager.stop_search(replacement.search_id)
     assert manager.active_search() is None
+
+
+def test_roi_pass_uses_a_single_fixed_detection_size() -> None:
+    """A tight crop must not pay for the full-frame Auto dual-scale pass."""
+    backend = FakeFaceBackend([])
+    settings = Settings(roi_face_detection_size=320, roi_min_person_height_px=120)
+    session = _roi_stub(settings, backend)
+    frame = np.zeros((500, 500, 3), dtype=np.uint8)
+    track = Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.9)
+
+    SearchSession._analyze_person_rois(session, frame, [track])
+
+    assert backend.detection_sizes == [320]
+
+
+def test_roi_backoff_skips_a_track_that_keeps_yielding_nothing() -> None:
+    settings = Settings(roi_backoff_max_skips=16)
+    session = _roi_stub(settings, FakeFaceBackend([]))
+    tracks = [Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.9)]
+
+    # First pass: no cooldown yet, the track is a candidate.
+    assert SearchSession._tracks_needing_roi_face_pass(session, [], tracks) == tracks
+
+    SearchSession._note_roi_outcome(session, 1, hit=False)
+    assert session._roi_skips[1] == 2
+
+    # The next two passes are skipped, then the track is eligible again.
+    assert SearchSession._tracks_needing_roi_face_pass(session, [], tracks) == []
+    assert SearchSession._tracks_needing_roi_face_pass(session, [], tracks) == []
+    assert SearchSession._tracks_needing_roi_face_pass(session, [], tracks) == tracks
+
+    # Backoff grows with each consecutive miss.
+    SearchSession._note_roi_outcome(session, 1, hit=False)
+    assert session._roi_skips[1] == 4
+
+    # A hit clears it immediately.
+    SearchSession._note_roi_outcome(session, 1, hit=True)
+    assert 1 not in session._roi_skips
+    assert 1 not in session._roi_misses
+
+
+def test_roi_backoff_is_capped_and_forgets_dead_tracks() -> None:
+    session = _roi_stub(Settings(roi_backoff_max_skips=4), FakeFaceBackend([]))
+    for _ in range(6):
+        SearchSession._note_roi_outcome(session, 7, hit=False)
+    assert session._roi_skips[7] == 4
+
+    # A track that no longer exists must not leak its bookkeeping forever.
+    SearchSession._tracks_needing_roi_face_pass(session, [], [])
+    SearchSession._tracks_needing_roi_face_pass(
+        session, [], [Track(9, np.asarray([0, 0, 10, 10], dtype=np.float32), 0.5)]
+    )
+    assert 7 not in session._roi_skips
+    assert 7 not in session._roi_misses
+
+
+def test_confirmed_tracks_are_excluded_from_the_roi_pass() -> None:
+    session = _roi_stub(Settings(), FakeFaceBackend([]))
+    tracks = [
+        Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.9),
+        Track(2, np.asarray([200, 0, 320, 240], dtype=np.float32), 0.8),
+    ]
+    session._track_states = {1: ("confirmed", 0.9)}
+
+    selected = SearchSession._tracks_needing_roi_face_pass(session, [], tracks)
+
+    assert [track.track_id for track in selected] == [2]
+
+
+def _budget_stub(settings: Settings, roi_p95_ms: float) -> SimpleNamespace:
+    metrics = SearchMetrics()
+    if roi_p95_ms:
+        metrics.stage_latencies_ms["face_roi"] = [roi_p95_ms]
+    stub = SimpleNamespace(
+        settings=settings,
+        metrics=metrics,
+        _lock=threading.Lock(),
+    )
+    stub._stage_p95_ms = lambda stage: SearchSession._stage_p95_ms(stub, stage)
+    stub._record_budget_skip = lambda stage: SearchSession._record_budget_skip(stub, stage)
+    return stub
+
+
+def test_roi_is_skipped_when_its_measured_cost_exceeds_the_frame_budget() -> None:
+    # target_loop_hz=10 -> a 100ms budget; a 90ms ROI pass does not fit after 50ms.
+    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=90.0)
+    started = time.monotonic() - 0.05
+
+    assert SearchSession._roi_fits_budget(session, started, 0.1) is False
+    assert session.metrics.budget_skips["face_roi"] == 1
+
+
+def test_roi_runs_when_it_still_fits_the_frame_budget() -> None:
+    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=10.0)
+    started = time.monotonic()
+
+    assert SearchSession._roi_fits_budget(session, started, 0.1) is True
+    assert session.metrics.budget_skips == {}
+
+
+def test_roi_is_skipped_once_the_processed_fps_floor_is_already_breached() -> None:
+    """The floor holds even when no ROI cost history exists yet.
+
+    This is the case that used to collapse the loop: with no measurement, the old
+    interval check passed unconditionally on every slow frame.
+    """
+    session = _budget_stub(Settings(target_loop_hz=10.0, min_processed_fps=2.0), roi_p95_ms=0.0)
+    started = time.monotonic() - 0.6  # already past the 500ms floor
+
+    assert SearchSession._roi_fits_budget(session, started, 0.1) is False
+    assert session.metrics.budget_skips["face_roi"] == 1
+
+
+def test_quality_rejected_faces_never_reach_arcface() -> None:
+    """Detection is cheap; ArcFace is not. Rejected faces must cost zero embeddings."""
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    blurry = make_face(bbox=(20, 20, 120, 120), accepted=False)
+    backend = FakeFaceBackend([blurry])
+
+    detected = backend.detect_faces(frame)
+    settings = Settings()
+    session = SimpleNamespace(settings=settings)
+    matchable = [face for face in detected if SearchSession._is_face_matchable(session, face)]
+
+    assert matchable == []
+    assert backend.embed_calls == 0
+
+
+def test_detect_then_embed_matches_analyze() -> None:
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    face = make_face(bbox=(20, 20, 120, 120))
+    backend = FakeFaceBackend([face])
+
+    combined = backend.embed_faces(frame, backend.detect_faces(frame))
+    direct = backend.analyze(frame)
+
+    assert len(combined) == len(direct) == 1
+    np.testing.assert_array_equal(combined[0].bbox, direct[0].bbox)
+    np.testing.assert_array_equal(combined[0].embedding, direct[0].embedding)
+
+
+def test_effective_config_reports_the_resolved_rates_and_gates() -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "Alice")
+    search = manager.start_search(
+        target.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    session = manager.get_session(search.search_id)
+
+    config = session.view().effective_config
+
+    # The fakes report CPU providers, so the CPU branch must be the one reported.
+    assert config["face_detection_hz"] == Settings().face_detection_hz_cpu
+    assert config["person_detection_hz"] == Settings().person_detection_hz_cpu
+    assert config["face_detection_size"] == "auto(128+640)"
+    assert config["required_sampling_hz"] == pytest.approx(3 / 1.5)
+    assert config["small_face_required_sampling_hz"] == pytest.approx(4 / 2.0)
+    assert config["effective_search_min_face_px"] == Settings().effective_search_min_face_px
+
+    manager.stop_search(search.search_id)

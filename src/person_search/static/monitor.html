@@ -170,6 +170,10 @@
             <div class="diagnostic-cell"><small>DETECTION SOURCE</small><output id="faceSourceDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>MATCH COUNTS</small><output id="matchStageDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>STAGE P95 / HZ</small><output id="stageTimingDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>PIPELINE THROUGHPUT</small><output id="throughputDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>SAMPLING HEADROOM</small><output id="samplingDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>EFFECTIVE RATES</small><output id="configRatesDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>EFFECTIVE GATES</small><output id="configGatesDiag">尚无样本</output></div>
           </div>
         </div>
       </section>
@@ -212,6 +216,56 @@
       const latency = Object.fromEntries(Object.entries(diagnostics.stage_p95_latency_ms || {}).map(([key, value]) => [key, `${Number(value).toFixed(0)}ms`]));
       const rates = Object.fromEntries(Object.entries(diagnostics.effective_hz || {}).map(([key, value]) => [key, `${Number(value).toFixed(1)}Hz`]));
       $('stageTimingDiag').textContent = [countText(latency), countText(rates)].join('  |  ');
+      renderRuntimeConditions(diagnostics);
+    }
+    function renderRuntimeConditions(body = {}) {
+      const config = body.effective_config || {};
+      const num = (value, digits = 1) => Number(value ?? 0).toFixed(digits);
+      $('throughputDiag').textContent = [
+        `源流 ${num(body.source_fps)}fps`,
+        `处理 ${num(body.processed_fps)}fps`,
+        `丢帧 ${num((body.drop_rate || 0) * 100, 0)}%`,
+        `端到端 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
+        `分辨率 ${body.frame_width || 0}×${body.frame_height || 0}`,
+        `ROI ${num(body.roi_calls_per_frame, 2)}次/帧`,
+      ].join('  /  ');
+
+      // The confirmation window needs a minimum sampling rate; below it the
+      // evidence quorum cannot be met and confirmation becomes incidental.
+      const processed = Number(body.processed_fps || 0);
+      const needed = Number(config.required_sampling_hz || 0);
+      const neededSmall = Number(config.small_face_required_sampling_hz || 0);
+      const verdict = (required) => {
+        if (!required) return 'n/a';
+        const ratio = processed / required;
+        return `${num(ratio, 1)}×${ratio < 1 ? ' 不足' : ''}`;
+      };
+      $('samplingDiag').textContent = [
+        `≥${config.preferred_search_face_px ?? '?'}px 需 ${num(needed, 2)}Hz → ${verdict(needed)}`,
+        `小脸需 ${num(neededSmall, 2)}Hz → ${verdict(neededSmall)}`,
+        `预算跳过 ${countText(body.budget_skips)}`,
+      ].join('  /  ');
+
+      $('configRatesDiag').textContent = [
+        `person ${num(config.person_detection_hz)}Hz`,
+        `face ${num(config.face_detection_hz)}Hz`,
+        `roi ${num(config.roi_face_detection_hz)}Hz`,
+        `目标循环 ${num(config.target_loop_hz)}Hz`,
+        `下限 ${num(config.min_processed_fps)}fps`,
+        `预览 ${num(config.preview_hz)}Hz`,
+        `det ${config.face_detection_size ?? '?'} / roi ${config.roi_face_detection_size ?? '?'}`,
+      ].join('  /  ');
+
+      $('configGatesDiag').textContent = [
+        `相似度 ${num(config.similarity_threshold, 2)}`,
+        `小脸 ${num(config.small_face_similarity_threshold, 2)}`,
+        config.tiny_face_enabled ? `远脸 ${num(config.tiny_face_similarity_threshold, 2)}` : '远脸 关闭',
+        `最小 ${config.effective_search_min_face_px ?? '?'}px`,
+        `理想 ${config.preferred_search_face_px ?? '?'}px`,
+        `模糊 ${num(config.min_search_blur_variance, 0)}`,
+        `检测阈 ${num(config.face_detection_threshold, 2)}`,
+        `证据 ${config.evidence_required ?? '?'}/${num(config.evidence_window_seconds, 1)}s`,
+      ].join('  /  ');
     }
 
     function updateEnrollAvailability() {

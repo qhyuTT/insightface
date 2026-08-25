@@ -1,57 +1,88 @@
-# 实时寻人 PoC 实施清单
+# 提升 SearchSession 处理帧率
 
-- [x] 使用 uv 建立 Python 工程、锁文件、配置、领域模型和依赖边界
-- [x] 实现 InsightFace 登记/识别、YOLOX 行人检测和 ByteTrack 适配
-- [x] 实现视频采集、轨迹级多帧确认和搜索任务生命周期
-- [x] 实现 FastAPI REST/WebSocket 接口与离线评测 CLI
-- [x] 添加单元/集成测试、示例配置和使用文档
-- [x] 运行测试与静态检查，记录实际模型验证限制
-- [x] 增加 uv 管理的 VLC 摄像头 RTSP 启动命令并完成本机拉流验证
+计划：`~/.claude/plans/rtsp-admin-kaiya-4012-192-168-30-26-8554-reflective-snail.md`
 
-## 可视化监控页
+## 背景
 
-- [x] 为搜索会话增加带人物框/匹配状态的实时预览帧
-- [x] 增加 MJPEG 预览接口和监控页 REST/WS 集成
-- [x] 补充接口测试、运行完整测试并在本机启动验证
+现网 RTSP 源稳定 25 FPS，处理循环却被压到 ~1.05 FPS，低于确认窗口所需的最低采样密度
+（≥80px 需 ≈1.33Hz，64–79px 需 ≈1.5Hz），远脸确认退化成偶发事件。
 
-## T4 Docker 部署
+## 任务
 
-- [x] 添加基于 CUDA/cuDNN runtime 的 GPU Dockerfile
-- [x] 配置国内 CUDA、APT 和 PyPI 镜像源及构建参数
-- [x] 添加镜像构建、GPU 启动、provider 验证和模型缓存文档
-- [x] 添加可重复执行的 T4 构建、启动和 CUDA provider 验证脚本
+- [x] 1. `config.py`：新增预算/ROI/预览调优项，`roi_max_tracks_per_pass` 8→3
+- [x] 2. `domain.py`：`FaceObservation.embedding` 可空；`SearchMetrics` 新增指标字段
+- [x] 3. `backends.py`：`FaceBackend` 拆成 `detect_faces` / `embed_faces` / `analyze`
+- [x] 4. `tests/conftest.py`：`FakeFaceBackend` 补齐新协议 + 调用计数
+- [x] 5. `service.py`：主循环重排为「检测 → 去重 → 筛选 → 统一嵌入」
+- [x] 6. `service.py`：帧预算调度，ROI 与预览降级为机会性阶段
+- [x] 7. `service.py`：per-track ROI 冷却退避；已确认 track 跳过 ROI
+- [x] 8. `service.py`：预览按订阅者 + 降采样 + 独立节流
+- [x] 9. `video.py`：`grab`/`retrieve` 分离，跳帧不付解码成本
+- [x] 10. `api.py` + `domain.py`：`effective_config` 直出当前生效判定条件
+- [x] 11. `static/monitor.html`：运行条件面板
+- [x] 12. 新增单测：等价性、嵌入次数、ROI 冷却、预算跳过
+- [x] 13. `uv run pytest` + `uv run ruff check .` 全绿
 
-## 目标姓名
+## 复盘
 
-- [x] 登记接口同时接收姓名和照片，并在目标/事件数据中保留姓名
-- [x] 监控页显示姓名并补充姓名字段校验测试
+### 改了什么
 
-## 1080p 远距离人脸优化
+1. **`FaceBackend` 拆成 detect / embed 两段**（`backends.py`）。原先 `analyze()` 走 `app.get()`，
+   检测和 ArcFace 绑死。现在 `detect_faces()` 只跑 SCRFD，`embed_faces()` 单独跑 ArcFace 且
+   **一次批量推理**（`get_feat` 接受图片列表）。`analyze()` 保留为两者组合，enrollment 路径不变。
+2. **主循环改为「检测 → 去重 → 质量筛选 → 统一嵌入一次」**（`service.py:_run`）。被
+   `_merge_faces` 去重掉的、被质量门拒掉的脸，都不再产生 ArcFace 调用。
+3. **帧预算调度**（`_roi_fits_budget`）。旧的 Hz 判据是间隔*下限*，单轮 ≥100ms 后恒为真，
+   限流自我失效。新增基于 `face_roi` 历史 p95 的成本预估 + `min_processed_fps` 硬地板。
+4. **per-track ROI 指数退避**（`_note_roi_outcome`），已确认 track 跳过 ROI，
+   `roi_max_tracks_per_pass` 8→3，ROI 用固定 320 单尺度（全帧仍是 Auto 双尺度）。
+5. **预览按订阅者门控 + 降采样到 960 宽 + 独立 5Hz 节流**。`PreviewHub` 新增显式
+   `subscribe()`/`unsubscribe()`，由 MJPEG 端点包住自己的生命周期。
+6. **`video.py` grab/retrieve 分离**：队列满时只 `grab()` 跳过解码，同时驱逐最旧帧，
+   保持"最新帧优先"语义不变。
+7. **可观测性**：新增 `source_fps` / `drop_rate` / `roi_calls_per_frame` /
+   `end_to_end_p95_latency_ms` / `frame_width×height` / `budget_skips`，以及
+   `effective_config`（直出 CPU/CUDA 分支解析后的真实速率与门槛，含确认窗口
+   所要求的最低采样率）。`/monitor` 加了 4 个诊断格。
 
-- [x] 实现 48–63px 超小脸安全分层和轨迹级多帧聚合
-- [x] 将 ROI 补检改为逐人体轨迹触发，并修正真实 provider/推理频率诊断
-- [x] 在查询接口和监控页暴露尺寸分桶、阶段漏斗和证据进度
-- [x] 让离线评测复用线上小脸/ROI/关联策略，支持按人脸像素分桶
-- [x] 补充边界、多帧、ROI、provider 和评测回归测试
-- [x] 更新配置/部署文档，运行完整测试与 Ruff
+### 验证结果（真实模型，非 fake）
 
-验证记录：两张现场图在 CPU Provider 下回归，近图主脸为 145px；远图主脸为 62px、检测分 0.8393、与近图登记脸相似度 0.7628，并严格关联到人体轨迹。26–31px 背景脸保持硬拒绝。尚未具备 T4 和 100 小时真实负样本，因此生产开关保持默认关闭，启用后仍默认 shadow。
+- **等价性**：同一张 6 人图，新 `analyze()` 与旧 `app._app.get()` 逐脸比对，
+  `cos(new, old) = 1.000000`，`max|1-cos| = 5.96e-08`。bbox 完全一致。
+- **成本实测**（CPU，1280×886，6 张脸）：
+  | | 耗时 |
+  |---|---|
+  | `detect_faces` Auto(128+640) | 96 ms |
+  | `detect_faces` 320 单尺度 | 26 ms（3.7× 更省） |
+  | `analyze`（检测+6张嵌入） | 497 ms |
+  | **旧 ROI 通道**（8× analyze） | **1487 ms** |
+  | **新 ROI 通道**（3× detect-only@320） | **88 ms → 16.9× 更省** |
+- **确认能力不退化**（最关键）：`person-search-eval` 同一素材、同一阈值，
+  改动前后 stash 对比：
 
-## 超小脸改动的 review 修复
+  | | main | 改动后 |
+  |---|---|---|
+  | face_observations | 240 | 240 |
+  | accepted_faces | 240 | 240 |
+  | evidence_collected | 40 | 40 |
+  | **confirmed_events** | **1** | **1** |
+  | elapsed | 27.28s | 25.02s |
 
-- [x] 只有达标观测才刷新 `last_similarity` / `last_face_seen`，修复预览显示低分相似度与 shadow 轨迹永不发出 `lost`
-- [x] 用 `requires_strict_association` / `shadow_eligible` 替代 `collect_all_observations` 的身份代理语义（service 与 cli 同步）
-- [x] Top1/Top2 差值不足时把 `identity_margin_low` 同时写回次优目标
-- [x] 补充 3 项回归测试并验证回滚修复后必定失败
+  检测数、证据数、确认数**完全一致**，说明纯性能改动没有动到判定语义。
+- `uv run pytest` 130 passed（原 120 + 新增 10）；`uv run ruff check .` 全绿。
 
-复盘：前两项同源——`service.py` 的 `similarity >= threshold` 入口门移进 `TrackConfirmation.process` 时，赋值语句留在了 `continue` 之前。低于阈值的观测仍按设计计入超小脸证据窗口，但不再被当作一次“看见”，因此普通档与小脸档行为与改动前完全等价，只有超小脸档的上报和 grace 计时被修正。验收标准 `MAX_FALSE_CONFIRMATIONS_PER_HOUR=0.01` 与 `MIN_NEGATIVE_EXPOSURE_HOURS=100` 经确认全局保留，它只影响“是否给出生产阈值推荐”，不影响评测跑数。测试 98 项全过、Ruff 通过；三项新测试均已确认在回滚对应修复后失败。
+### 教训
 
-## 第二轮远距安全 review 修复
+- 本次根因里最隐蔽的一条：**基于「距上次多久」的限流，在循环变慢后会自动失效**。
+  它只能约束下限，不能约束占空比。已记入 `tasks/lessons.md`。
+- 顺手删掉了 `_needs_roi_face_pass()`：ROI 选择加入冷却副作用后，一个「看起来是纯谓词」
+  的包装函数会静默消耗退避计数。无人调用，直接移除而不是留着当陷阱。
+- `cli.py` 的离线评估复用了 `SearchSession` 的 ROI 私有方法，改协议时必须同步，
+  否则校准跑的是一条生产里不存在的流水线。
 
-- [x] 将全批次身份竞争集与仍待确认目标集分离，阻止已找到目标的人脸误确认剩余目标
-- [x] 固化不可下调的 48px 搜索安全底线，并在配置、质量门和消费端防御
-- [x] 按目标分别维护最佳观测，并校准 `evidence_eligible` / `evidence_collected` 语义
-- [x] 处理 `tiny_shadow_lost` 前端状态，离线报告隔离生产与 Shadow 指标
-- [x] 补充回归测试、更新文档并完成全量验证
+### 仍未做（留作下一轮）
 
-验证记录：118 项测试、Ruff、差异完整性和监控页脚本语法检查全部通过。现场两图 CPU 回归保持 145px/62px 主脸、相似度 0.7628、严格人体关联；26/30/31px 背景脸继续硬拒绝。T4 与 100 小时负样本验收仍需在部署环境完成，生产 tiny 开关保持默认关闭。
+- ROI 多裁剪**批量** ONNX 推理（需绕开 `app.get`，自己接 SCRFD 前后处理）。
+  CPU 上批量对 ArcFace 只带来 1.1× 收益，但 T4 上应显著更高。
+- 真机 RTSP 复测：需要在 192.168.17.60 上跑，确认 `processed_fps` ≥ 8 且
+  `source_fps` 仍为 25。本地只有 CPU，无法代表 T4 的绝对帧率。

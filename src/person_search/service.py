@@ -86,6 +86,7 @@ class PreviewHub:
         self._condition = threading.Condition()
         self._seq = 0
         self._jpeg: bytes | None = None
+        self._subscribers = 0
 
     def publish(self, jpeg: bytes) -> None:
         with self._condition:
@@ -98,6 +99,21 @@ class PreviewHub:
             if self._seq <= seq:
                 self._condition.wait(timeout=timeout)
             return self._seq, self._jpeg if self._seq > seq else None
+
+    def subscribe(self) -> None:
+        """Register a viewer. A subscriber is a stream lifetime, not a single poll."""
+        with self._condition:
+            self._subscribers += 1
+
+    def unsubscribe(self) -> None:
+        with self._condition:
+            self._subscribers = max(0, self._subscribers - 1)
+
+    @property
+    def has_subscribers(self) -> bool:
+        """Whether anyone is watching. Nobody watching means no encode cost."""
+        with self._condition:
+            return self._subscribers > 0
 
 
 @dataclass
@@ -157,6 +173,10 @@ class SearchSession:
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
         self._shadow_tracks: set[int] = set()
+        # Consecutive empty ROI passes per track, and how many passes that track is
+        # currently backed off for.
+        self._roi_misses: dict[int, int] = {}
+        self._roi_skips: dict[int, int] = {}
         self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
         self._stop_requested = False
@@ -213,8 +233,66 @@ class SearchSession:
                 ],
                 timeout_seconds=self.timeout_seconds,
                 request_id=self.request_id,
+                effective_config=self._effective_config(),
                 **metrics,
             )
+
+    def _effective_config(self) -> dict[str, object]:
+        """Report the gates that are *actually* in force, not the raw settings.
+
+        The CPU/CUDA rate split is resolved at runtime, so reading `Settings` alone
+        cannot tell you what the pipeline is doing. This surfaces the resolved
+        values so "what are my recognition conditions?" has a direct answer.
+        """
+        settings = self.settings
+        face_provider = getattr(
+            self.face_backend, "detection_provider_name", self.face_backend.provider_name
+        )
+        face_is_cuda = "CUDA" in face_provider
+        person_is_cuda = "CUDA" in self.person_detector.provider_name
+        return {
+            "person_detection_hz": (
+                settings.person_detection_hz_cuda
+                if person_is_cuda
+                else settings.person_detection_hz_cpu
+            ),
+            "face_detection_hz": (
+                settings.face_detection_hz_cuda if face_is_cuda else settings.face_detection_hz_cpu
+            ),
+            "roi_face_detection_hz": (
+                settings.roi_face_detection_hz_cuda
+                if face_is_cuda
+                else settings.roi_face_detection_hz_cpu
+            ),
+            "target_loop_hz": settings.target_loop_hz,
+            "min_processed_fps": settings.min_processed_fps,
+            "preview_hz": settings.preview_hz,
+            "face_detection_size": settings.face_detection_size or "auto(128+640)",
+            "roi_face_detection_size": settings.roi_face_detection_size,
+            "roi_max_tracks_per_pass": settings.roi_max_tracks_per_pass,
+            "similarity_threshold": settings.similarity_threshold,
+            "small_face_similarity_threshold": settings.small_face_similarity_threshold,
+            "tiny_face_enabled": settings.tiny_face_enabled,
+            "tiny_face_similarity_threshold": settings.tiny_face_similarity_threshold,
+            "effective_search_min_face_px": settings.effective_search_min_face_px,
+            "min_search_face_px": settings.min_search_face_px,
+            "preferred_search_face_px": settings.preferred_search_face_px,
+            "min_search_blur_variance": settings.min_search_blur_variance,
+            "face_detection_threshold": settings.face_detection_threshold,
+            "evidence_required": settings.evidence_required,
+            "evidence_window_seconds": settings.evidence_window_seconds,
+            "small_face_evidence_required": settings.small_face_evidence_required,
+            "small_face_evidence_window_seconds": settings.small_face_evidence_window_seconds,
+            # The sampling rate the confirmation window implies. Below this, the
+            # evidence quorum cannot be met inside the window.
+            "required_sampling_hz": (
+                settings.evidence_required / settings.evidence_window_seconds
+            ),
+            "small_face_required_sampling_hz": (
+                settings.small_face_evidence_required
+                / settings.small_face_evidence_window_seconds
+            ),
+        }
 
     def _run(self) -> None:
         self.metrics.started_at = time.monotonic()
@@ -229,6 +307,7 @@ class SearchSession:
         last_person_at = -1e9
         last_face_at = -1e9
         last_roi_face_at = -1e9
+        last_preview_at = -1e9
         face_detection_provider = getattr(
             self.face_backend, "detection_provider_name", self.face_backend.provider_name
         )
@@ -265,6 +344,12 @@ class SearchSession:
                     continue
                 started = time.monotonic()
                 now = packet.captured_at
+                with self._lock:
+                    self.metrics.frame_height, self.metrics.frame_width = packet.frame.shape[:2]
+                # The per-frame budget. Optional stages consult what is left of it,
+                # so a slow stage can no longer drag the loop below the sampling
+                # density the confirmation window needs.
+                budget_seconds = 1.0 / self.settings.target_loop_hz
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
                     stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
@@ -274,28 +359,42 @@ class SearchSession:
                 faces = []
                 if now - last_face_at >= 1.0 / max(face_hz, 0.1):
                     stage_started = time.monotonic()
-                    faces = self.face_backend.analyze(packet.frame, enrollment=False)
+                    faces = self.face_backend.detect_faces(packet.frame, enrollment=False)
                     self._record_stage("face_full", stage_started)
                     self._record_face_source("full_frame", len(faces))
                     last_face_at = now
+                    roi_clock = time.monotonic()
                     roi_tracks = self._tracks_needing_roi_face_pass(faces, tracks)
                     if (
                         roi_face_hz > 0
-                        and now - last_roi_face_at >= 1.0 / roi_face_hz
+                        and roi_clock - last_roi_face_at >= 1.0 / roi_face_hz
                         and roi_tracks
+                        and self._roi_fits_budget(started, budget_seconds)
                     ):
                         stage_started = time.monotonic()
                         roi_faces = self._analyze_person_rois(packet.frame, roi_tracks)
                         self._record_stage("face_roi", stage_started)
                         self._record_face_source("roi", len(roi_faces))
                         faces = _merge_faces(faces, roi_faces)
-                        last_roi_face_at = now
+                        last_roi_face_at = roi_clock
                     self._record_face_metrics(faces)
-                    self._record_target_observations(faces)
 
-                accepted_faces = [
+                # ArcFace runs once, here, and only on faces that survived dedup and
+                # the quality gate. Detections thrown away by _merge_faces or
+                # _is_face_matchable never cost an embedding.
+                matchable = [
                     face for face in faces if SearchSession._is_face_matchable(self, face)
                 ]
+                if matchable:
+                    stage_started = time.monotonic()
+                    accepted_faces = self.face_backend.embed_faces(packet.frame, matchable)
+                    self._record_stage("face_embed", stage_started)
+                else:
+                    accepted_faces = []
+                self._record_target_observations(accepted_faces)
+                self._record_rejected_observations(
+                    [face for face in faces if not SearchSession._is_face_matchable(self, face)]
+                )
                 detailed = associate_faces_to_tracks_detailed(accepted_faces, tracks)
                 association_by_face = {
                     face_index: track_id for face_index, (track_id, _) in detailed.items()
@@ -355,6 +454,8 @@ class SearchSession:
                     if not self._active_targets:
                         break
                     ranked_matches = self._rank_identity_matches(face)
+                    if not ranked_matches:
+                        continue
                     target_id, similarity = ranked_matches[0]
                     top1_margin = (
                         similarity - ranked_matches[1][1]
@@ -481,10 +582,20 @@ class SearchSession:
                 if not self._active_targets:
                     self._transition(SearchStatus.COMPLETED, None, publish=False)
                     break
-                self._publish_preview(packet.frame, all_tracks, faces)
+                preview_hz = self.settings.preview_hz
+                preview_clock = time.monotonic()
+                if (
+                    preview_hz > 0
+                    and preview_clock - last_preview_at >= 1.0 / preview_hz
+                    and self._publish_preview(packet.frame, all_tracks, faces)
+                ):
+                    last_preview_at = preview_clock
                 with self._lock:
                     self.metrics.frame_count += 1
                     self.metrics.latencies_ms.append((time.monotonic() - started) * 1000.0)
+                    self.metrics.end_to_end_latencies_ms.append(
+                        (time.monotonic() - packet.captured_at) * 1000.0
+                    )
         except Exception as exc:  # noqa: BLE001 - the worker must fail closed and release resources
             self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
         finally:
@@ -504,10 +615,28 @@ class SearchSession:
 
     def _publish_preview(
         self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
-    ) -> None:
-        canvas = frame.copy()
+    ) -> bool:
+        """Encode an annotated preview. Returns False when the work was skipped.
+
+        Nobody watching means no copy and no JPEG encode — this runs on the worker
+        thread, so an unwatched preview was pure inference tax.
+        """
+        if not self.preview.has_subscribers:
+            return False
+        # Downscale before annotating: a 1440p copy + q82 encode per frame costs
+        # more than some inference stages.
+        height, width = frame.shape[:2]
+        scale = min(1.0, self.settings.preview_max_width / max(width, 1))
+        if scale < 1.0:
+            canvas = cv2.resize(
+                frame,
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            canvas = frame.copy()
         for track in tracks:
-            x1, y1, x2, y2 = (int(value) for value in track.bbox)
+            x1, y1, x2, y2 = (int(value * scale) for value in track.bbox)
             state, similarity = self._track_states.get(track.track_id, ("tracking", 0.0))
             if state == "confirmed":
                 color, label = (60, 220, 95), f"FOUND  {similarity:.2f}"
@@ -532,7 +661,7 @@ class SearchSession:
                 cv2.LINE_AA,
             )
         for face in faces:
-            x1, y1, x2, y2 = (int(value) for value in face.bbox)
+            x1, y1, x2, y2 = (int(value * scale) for value in face.bbox)
             color = (232, 232, 232) if face.accepted else (70, 70, 230)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1)
             if self.source.debug_preview:
@@ -554,6 +683,7 @@ class SearchSession:
         ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if ok:
             self.preview.publish(encoded.tobytes())
+        return True
 
     def _handle_decisions(
         self,
@@ -677,8 +807,28 @@ class SearchSession:
                 if not face.accepted:
                     current["last_rejection_reason"] = ",".join(face.rejection_reasons)
 
+    def _record_rejected_observations(self, faces: list[FaceObservation]) -> None:
+        """Record why rejected faces were dropped, without paying for an embedding.
+
+        Similarity is unknowable for these faces by design — they never reach
+        ArcFace — but "a face this big was rejected for this reason" is the more
+        actionable half of the diagnostic anyway.
+        """
+        if not faces or not self._active_targets:
+            return
+        largest = max(faces, key=lambda face: face.short_side)
+        with self._lock:
+            for target_id in self._active_targets:
+                current = self._target_status[target_id]
+                if current["last_face_px"] is None or largest.short_side > current["last_face_px"]:
+                    current["last_face_px"] = largest.short_side
+                if largest.rejection_reasons:
+                    current["last_rejection_reason"] = ",".join(largest.rejection_reasons)
+
     def _rank_identity_matches(self, face: FaceObservation) -> list[tuple[str, float]]:
         """Rank against the immutable batch gallery, including found targets."""
+        if face.embedding is None:
+            return []
         return sorted(
             (
                 (target_id, float(np.dot(target.embedding, face.embedding)))
@@ -691,13 +841,46 @@ class SearchSession:
     def _is_face_matchable(self, face: FaceObservation) -> bool:
         return bool(face.accepted and face.short_side >= self.settings.effective_search_min_face_px)
 
-    def _needs_roi_face_pass(self, faces: list[FaceObservation], tracks: list[Track]) -> bool:
-        return bool(self._tracks_needing_roi_face_pass(faces, tracks))
+    def _stage_p95_ms(self, stage: str) -> float:
+        with self._lock:
+            latencies = self.metrics.stage_latencies_ms.get(stage)
+            if not latencies:
+                return 0.0
+            return float(np.percentile(latencies[-200:], 95))
+
+    def _record_budget_skip(self, stage: str) -> None:
+        with self._lock:
+            self.metrics.budget_skips[stage] = self.metrics.budget_skips.get(stage, 0) + 1
+
+    def _roi_fits_budget(self, started: float, budget_seconds: float) -> bool:
+        """Run the ROI pass only when its measured cost still fits this frame.
+
+        The old Hz throttle was an interval *floor*, so once a single iteration
+        exceeded 1/hz it passed unconditionally and ROI ran on every frame at 100%
+        duty. This is the missing ceiling: past the budget, ROI is skipped rather
+        than allowed to starve the confirmation window of samples.
+        """
+        elapsed = time.monotonic() - started
+        remaining = budget_seconds - elapsed
+        # Never let the floor be violated even if the budget is already blown.
+        hard_ceiling = 1.0 / self.settings.min_processed_fps
+        if elapsed >= hard_ceiling:
+            self._record_budget_skip("face_roi")
+            return False
+        estimated = self._stage_p95_ms("face_roi") / 1000.0
+        if estimated and estimated > max(remaining, 0.0):
+            self._record_budget_skip("face_roi")
+            return False
+        return True
 
     def _tracks_needing_roi_face_pass(
         self, faces: list[FaceObservation], tracks: list[Track]
     ) -> list[Track]:
-        """Return tracks that do not own a preferred-size full-frame face."""
+        """Return tracks that do not own a preferred-size full-frame face.
+
+        Tracks that keep yielding nothing, and tracks already confirmed, are
+        excluded — neither can turn more ROI passes into new evidence.
+        """
         if not tracks:
             return []
         accepted = [face for face in faces if SearchSession._is_face_matchable(self, face)]
@@ -707,7 +890,28 @@ class SearchSession:
             for face_index, (track_id, _) in associations.items()
             if accepted[face_index].short_side >= self.settings.preferred_search_face_px
         }
-        return [track for track in tracks if track.track_id not in satisfied_track_ids]
+        confirmed_track_ids = {
+            track_id
+            for track_id, (state, _) in self._track_states.items()
+            if state in ("confirmed", "shadow")
+        }
+        candidates: list[Track] = []
+        for track in tracks:
+            if track.track_id in satisfied_track_ids or track.track_id in confirmed_track_ids:
+                self._roi_misses.pop(track.track_id, None)
+                self._roi_skips.pop(track.track_id, None)
+                continue
+            remaining_skips = self._roi_skips.get(track.track_id, 0)
+            if remaining_skips > 0:
+                self._roi_skips[track.track_id] = remaining_skips - 1
+                continue
+            candidates.append(track)
+        live_ids = {track.track_id for track in tracks}
+        self._roi_misses = {
+            key: value for key, value in self._roi_misses.items() if key in live_ids
+        }
+        self._roi_skips = {key: value for key, value in self._roi_skips.items() if key in live_ids}
+        return candidates
 
     def _analyze_person_rois(self, frame: np.ndarray, tracks: list[Track]) -> list[FaceObservation]:
         height, width = frame.shape[:2]
@@ -725,7 +929,16 @@ class SearchSession:
             analyzed_tracks += 1
             roi_bottom = min(y2, y1 + max(1, int(self.settings.roi_person_fraction * (y2 - y1))))
             roi = frame[y1:roi_bottom, x1:x2]
-            for face in self.face_backend.analyze(roi, enrollment=False):
+            # A crop is already tight, so the full-frame Auto dual-scale pass would
+            # only double the cost here. Detection only — embedding happens once,
+            # later, after dedup against the full-frame results.
+            found = self.face_backend.detect_faces(
+                roi,
+                enrollment=False,
+                detection_size=self.settings.roi_face_detection_size,
+            )
+            self._note_roi_outcome(track.track_id, hit=bool(found))
+            for face in found:
                 observations.append(
                     replace(
                         face,
@@ -737,7 +950,19 @@ class SearchSession:
                         ),
                     )
                 )
+        with self._lock:
+            self.metrics.roi_calls += analyzed_tracks
         return observations
+
+    def _note_roi_outcome(self, track_id: int, *, hit: bool) -> None:
+        """Back a track off exponentially while its ROI crop keeps coming up empty."""
+        if hit:
+            self._roi_misses.pop(track_id, None)
+            self._roi_skips.pop(track_id, None)
+            return
+        misses = self._roi_misses.get(track_id, 0) + 1
+        self._roi_misses[track_id] = misses
+        self._roi_skips[track_id] = min(2**misses, self.settings.roi_backoff_max_skips)
 
     def _on_drop(self) -> None:
         with self._lock:

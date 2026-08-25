@@ -15,3 +15,9 @@
 - 文档声明的安全底线必须在配置校验和数据消费处双重成立。像 `<48px` 永不确认这样的不变量不能直接信任可调参数或上游 `accepted` 标志；即使配置未经校验，质量门、实时链路和离线链路也必须拒绝。
 - 诊断计数名称必须对应准确的数据阶段。`evidence_eligible` 只能表示已通过静态门控并送入确认器，真正通过去重和采样间隔写入窗口的数量要单列为 `evidence_collected`。
 - 新增成对状态事件时必须同步审查所有消费者和评估器。`tiny_shadow_confirmed` 与 `tiny_shadow_lost` 要在前端成对处理，离线报告也必须保留 Shadow 身份，不能将它降格序列化为生产 `confirmed`。
+- 基于"距上次执行多久"的 Hz 限流只能约束间隔下限，不能约束占空比；一旦单轮耗时超过该间隔，判据恒为真，限流自我失效。`service.py` 的 `roi_face_detection_hz=4` 在循环被压到 1 FPS 后实际每帧都跑 ROI，把画面卡顿归因到网络是错的。可选阶段必须有基于实测成本（stage p95）的预算上限和一条 `min_processed_fps` 硬地板，否则慢会自我放大。
+- 帧率不是独立指标，它决定确认能否成立。`evidence_required / evidence_window_seconds` 隐含了一个最低采样率（3/1.5s ≈ 1.33Hz，小脸 4/2s = 1.5Hz）；处理帧率低于它时确认退化成偶发事件。任何降帧率的优化都必须同时报告这个比值，`effective_config.required_sampling_hz` 就是为此存在的。
+- 检测和识别的成本差一个数量级，不能绑死在一个调用里。`app.get()` 是检测+ArcFace 全跑，实测 6 张脸 497ms 中约 400ms 是嵌入。ROI 补检只需要检测结果（随后还会被 `_merge_faces` 按 IoU 去重丢掉），对每个裁剪调用 `analyze()` 等于为将被丢弃的脸付全额识别成本——旧的 8 路 ROI 通道 1487ms，改为 detect-only 后 88ms。嵌入必须延后到去重、质量门、关联都筛完之后再批量做一次。
+- 给 ROI 选择加入 per-track 冷却这类副作用后，必须清查是否存在"看起来是纯谓词"的包装函数。`_needs_roi_face_pass()` 只是 `bool(_tracks_needing_roi_face_pass(...))`，加了退避计数后调用它会静默消耗冷却额度。这类函数应删除而不是保留。
+- 改 `FaceBackend` 协议时必须同步 `cli.py` 的离线评估链路——它直接复用了 `SearchSession._tracks_needing_roi_face_pass` / `_analyze_person_rois` 私有方法和一个 `SimpleNamespace` 上下文。漏改的后果不是报错而是更糟：校准出的阈值来自一条生产环境不存在的流水线。
+- 性能改动的验收标准是"确认数不变"，不是"帧率变高"。用 `git stash` + `person-search-eval` 跑同一素材对比 `face_observations` / `evidence_collected` / `confirmed_events`，三者必须逐项相等；再用真实模型对比新旧嵌入的 `cos` 是否为 1.0。只跑注入 fake 的单测无法发现真实后端 API 用错。

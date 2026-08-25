@@ -272,12 +272,18 @@ def create_app(
 
         async def frames():
             seq = 0
-            while True:
-                seq, jpeg = await asyncio.to_thread(session.preview.after, seq, 1.0)
-                if jpeg is not None:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-                if session.status.value in {"completed", "timed_out", "stopped", "failed"} and jpeg is None:
-                    return
+            # The worker only pays the annotate + encode cost while a viewer is
+            # registered, so the stream must bracket its own lifetime.
+            session.preview.subscribe()
+            try:
+                while True:
+                    seq, jpeg = await asyncio.to_thread(session.preview.after, seq, 1.0)
+                    if jpeg is not None:
+                        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
+                    if session.status.value in {"completed", "timed_out", "stopped", "failed"} and jpeg is None:
+                        return
+            finally:
+                session.preview.unsubscribe()
 
         return StreamingResponse(
             frames(),

@@ -75,8 +75,16 @@ class LatestFrameReader:
                         continue
                     reconnect_delay = 1.0
 
-                ok, frame = capture.read()
-                if not ok or frame is None:
+                # grab() parses the packet without decoding it to a BGR array.
+                # When the consumer is already behind, the frame is destined for
+                # eviction anyway, so decoding it is wasted work.
+                skip_decode = self.frames.full()
+                if skip_decode:
+                    ok = capture.grab()
+                    frame = None
+                else:
+                    ok, frame = capture.read()
+                if not ok or (frame is None and not skip_decode):
                     if self.source.type == SourceType.FILE:
                         self._stop.set()
                         break
@@ -87,17 +95,23 @@ class LatestFrameReader:
                         announced_lost = True
                     continue
 
+                if skip_decode:
+                    # Evict the stalest frame so the next iteration has room and
+                    # decodes a *fresh* one. Newest-wins is preserved; we simply
+                    # never pay to decode a frame that was destined for eviction.
+                    try:
+                        self.frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                    frame_id += 1
+                    self.on_drop()
+                    continue
+
                 if announced_lost or frame_id == 0:
                     self.on_status(SearchStatus.RUNNING, None)
                     announced_lost = False
                 packet = FramePacket(frame_id=frame_id, captured_at=time.monotonic(), frame=frame)
                 frame_id += 1
-                if self.frames.full():
-                    try:
-                        self.frames.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self.on_drop()
                 try:
                     self.frames.put_nowait(packet)
                 except queue.Full:

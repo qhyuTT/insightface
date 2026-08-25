@@ -71,9 +71,23 @@ class Settings(BaseSettings):
     face_fallback_enabled: bool = True
     roi_face_detection_hz_cuda: float = Field(default=4.0, ge=0.0)
     roi_face_detection_hz_cpu: float = Field(default=0.0, ge=0.0)
-    roi_max_tracks_per_pass: int = Field(default=8, ge=1)
+    roi_max_tracks_per_pass: int = Field(default=3, ge=1)
     roi_min_person_height_px: int = Field(default=120, ge=1)
     roi_person_fraction: float = Field(default=0.5, gt=0.0, le=1.0)
+    # A track whose ROI crop keeps yielding nothing backs off exponentially, so a
+    # permanently face-less person (turned away, occluded) stops burning the budget.
+    roi_backoff_max_skips: int = Field(default=16, ge=0)
+    # ROI crops are already tight, so the full-frame Auto dual-scale pass is pure
+    # waste here. Only the full-frame default (face_detection_size) must stay Auto.
+    roi_face_detection_size: int = Field(default=320, ge=0)
+
+    # The per-frame time budget. ROI and preview are opportunistic: they only run
+    # when the measured cost fits in what is left, so a slow stage can never again
+    # collapse the loop below the sampling density the confirmation window needs.
+    target_loop_hz: float = Field(default=10.0, gt=0)
+    min_processed_fps: float = Field(default=2.0, gt=0)
+    preview_hz: float = Field(default=5.0, ge=0.0)
+    preview_max_width: int = Field(default=960, ge=64)
     rtsp_transport: Literal["tcp", "udp"] = "tcp"
     rtsp_reconnect_max_seconds: float = 10.0
     rtsp_open_timeout_seconds: float = Field(default=5.0, gt=0)

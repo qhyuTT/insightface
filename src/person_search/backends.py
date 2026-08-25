@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from typing import Protocol
 
 import numpy as np
@@ -16,6 +17,14 @@ class FaceBackend(Protocol):
     provider_name: str
     detection_provider_name: str
     recognition_provider_name: str
+
+    def detect_faces(
+        self, frame: np.ndarray, *, enrollment: bool = False, detection_size: int | None = None
+    ) -> list[FaceObservation]: ...
+
+    def embed_faces(
+        self, frame: np.ndarray, faces: list[FaceObservation]
+    ) -> list[FaceObservation]: ...
 
     def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]: ...
 
@@ -76,36 +85,82 @@ class InsightFaceBackend:
                     f"recognition={self.recognition_provider_name}"
                 )
 
-    def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]:
+    def detect_faces(
+        self, frame: np.ndarray, *, enrollment: bool = False, detection_size: int | None = None
+    ) -> list[FaceObservation]:
+        """Run detection and quality only. The embedding is deferred to embed_faces()."""
         self.ensure_ready()
+        app = self._app
+        assert app is not None
+        input_size = (
+            None if detection_size is None or detection_size <= 0
+            else (detection_size, detection_size)
+        )
         with self._lock:
-            faces = self._app.get(frame)  # type: ignore[union-attr]
+            bboxes, kpss = app.det_model.detect(frame, input_size=input_size, max_num=0)
         observations: list[FaceObservation] = []
-        for face in faces:
-            quality = assess_face(
-                frame,
-                face.bbox,
-                face.kps,
-                float(face.det_score),
-                self.settings,
-                enrollment=enrollment,
-            )
-            try:
-                embedding = normalize_embedding(face.embedding)
-            except (TypeError, ValueError):
-                continue
+        for index in range(bboxes.shape[0]):
+            bbox = bboxes[index, 0:4]
+            det_score = float(bboxes[index, 4])
+            kps = None if kpss is None else kpss[index]
+            quality = assess_face(frame, bbox, kps, det_score, self.settings, enrollment=enrollment)
             observations.append(
                 FaceObservation(
-                    bbox=np.asarray(face.bbox, dtype=np.float32),
-                    detection_score=float(face.det_score),
-                    embedding=embedding,
+                    bbox=np.asarray(bbox, dtype=np.float32),
+                    detection_score=det_score,
+                    embedding=None,
                     quality=quality.score,
-                    landmarks=None if face.kps is None else np.asarray(face.kps, dtype=np.float32),
+                    landmarks=None if kps is None else np.asarray(kps, dtype=np.float32),
                     accepted=quality.accepted,
                     rejection_reasons=quality.reasons,
                 )
             )
         return observations
+
+    def embed_faces(
+        self, frame: np.ndarray, faces: list[FaceObservation]
+    ) -> list[FaceObservation]:
+        """Fill in ArcFace embeddings, dropping faces the recogniser cannot use.
+
+        Crops are aligned first and pushed through a single batched session run,
+        so N faces cost one inference rather than N.
+        """
+        if not faces:
+            return []
+        self.ensure_ready()
+        app = self._app
+        assert app is not None
+        recogniser = app.models.get("recognition")
+        if recogniser is None:
+            raise ModelUnavailableError("InsightFace recognition model is unavailable")
+
+        from insightface.utils import face_align
+
+        image_size = recogniser.input_size[0]
+        crops: list[np.ndarray] = []
+        pending: list[FaceObservation] = []
+        for face in faces:
+            if face.landmarks is None:
+                continue
+            crops.append(face_align.norm_crop(frame, landmark=face.landmarks, image_size=image_size))
+            pending.append(face)
+        if not crops:
+            return []
+
+        with self._lock:
+            features = recogniser.get_feat(crops)
+
+        embedded: list[FaceObservation] = []
+        for face, feature in zip(pending, np.asarray(features), strict=True):
+            try:
+                embedding = normalize_embedding(feature.flatten())
+            except (TypeError, ValueError):
+                continue
+            embedded.append(replace(face, embedding=embedding))
+        return embedded
+
+    def analyze(self, frame: np.ndarray, *, enrollment: bool = False) -> list[FaceObservation]:
+        return self.embed_faces(frame, self.detect_faces(frame, enrollment=enrollment))
 
 
 def _model_provider_name(app: object, task_name: str) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -21,7 +22,7 @@ from .confirmation import (
     normalize_bbox,
 )
 from .detector import YoloXOnnxDetector
-from .domain import FaceObservation, MatchState, Track
+from .domain import FaceObservation, MatchState, SearchMetrics, Track
 from .evaluation import (
     DEFAULT_EVAL_THRESHOLDS,
     MAX_FALSE_CONFIRMATIONS_PER_HOUR,
@@ -208,7 +209,20 @@ def run_offline(
         iou_threshold=settings.face_track_iou_threshold,
         buffer_seconds=settings.face_track_buffer_seconds,
     )
-    roi_context = SimpleNamespace(settings=settings, face_backend=face_backend)
+    # Mirrors the ROI bookkeeping SearchSession owns, so the offline harness
+    # exercises the same backoff and budget-free ROI selection the service does.
+    roi_context = SimpleNamespace(
+        settings=settings,
+        face_backend=face_backend,
+        _roi_misses={},
+        _roi_skips={},
+        _track_states={},
+        _lock=threading.Lock(),
+        metrics=SearchMetrics(),
+    )
+    roi_context._note_roi_outcome = lambda track_id, *, hit: SearchSession._note_roi_outcome(
+        roi_context, track_id, hit=hit
+    )
     tracks = []
     frame_id = 0
     started = time.monotonic()
@@ -241,7 +255,7 @@ def run_offline(
                 tracks = tracker.update(detector.detect(frame))
             faces = []
             if frame_id % face_interval == 0:
-                faces = face_backend.analyze(frame, enrollment=False)
+                faces = face_backend.detect_faces(frame, enrollment=False)
                 roi_tracks = SearchSession._tracks_needing_roi_face_pass(roi_context, faces, tracks)
                 if (
                     roi_interval is not None
@@ -256,6 +270,14 @@ def run_offline(
                 rejection_counts.update(
                     reason for face in faces for reason in face.rejection_reasons
                 )
+                # Embed once, after dedup and the quality gate, exactly as the
+                # service does — otherwise calibration would measure a pipeline
+                # that does not exist in production.
+                embedded = face_backend.embed_faces(
+                    frame, [face for face in faces if _is_matchable_face(face, settings)]
+                )
+                embedded_by_key = {tuple(face.bbox.tolist()): face for face in embedded}
+                faces = [embedded_by_key.get(tuple(face.bbox.tolist()), face) for face in faces]
 
             accepted = [face for face in faces if _is_matchable_face(face, settings)]
             all_tracks, associations, association_modes = _associate_search_faces(

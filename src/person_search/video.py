@@ -39,8 +39,11 @@ class LatestFrameReader:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._capture_loop, name="frame-reader", daemon=True)
-        self._thread.start()
+        thread = threading.Thread(target=self._capture_loop, name="frame-reader", daemon=True)
+        thread.start()
+        # Publish only once the thread is running: stop() runs on another thread and
+        # would otherwise be able to observe a thread it cannot join yet.
+        self._thread = thread
 
     def get(self, timeout: float = 0.5) -> FramePacket | None:
         try:

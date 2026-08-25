@@ -16,3 +16,6 @@ artifacts/
 /auto.crt
 /auto.key
 .claude/
+.env
+.env.*
+!.env.example

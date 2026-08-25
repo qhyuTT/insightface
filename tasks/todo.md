@@ -218,3 +218,60 @@ tiny 策略要求 `det_score ≥ 0.65`，而全帧 640 下 18px 的脸达不到�
       移动机器人在 3 秒内姿态差异很大，低分姿态会把中位数拉下来。可考察缩短到
       1.5-2.0s，或把中位数改为上四分位 / 最佳-K 均值（更贴合移动采样，但会提高
       误报，必须用上面的负样本分布验证）。按实测决定，不预先承诺。
+
+## 修复策略单向棘轮：由远走近的轨迹终身按远脸档苛判
+
+### 背景
+
+现场症状是"证据够了，但相似度总差点意思"。上一项（`6ceb350`）已经证明其中一半是
+**显示问题**：远脸档 `collect_all_observations=True` 让计数器恒显 `6/6`。这一项处理
+另一半，是**真正的判定 bug**。
+
+`confirmation.py` 的策略选择只有"收紧"一个方向：`_is_stricter_policy` 返回 False 时，
+`else` 分支把传入的宽策略丢掉、继续用锁定的严策略。`state.policy` 只在轨迹被删除时清空。
+后果是：旅客在远处被首次看到（55px → 48-63 档）后，即使走到 3 米、人脸已 120px，
+整条轨迹仍按 `0.64 / 6 帧 / 聚合 0.68 / 仅 person_strict / 不发 candidate` 判定，
+而该尺寸本应只需 `0.55 / 3 帧 / 1.5s`。监控视频下 ArcFace 相似度中位数常落在
+0.55-0.62——正好过得了 0.55、过不了 0.64，于是表现为"帧数攒满、就是不确认"。
+
+第二个问题：远脸档的**第二道门**（质量加权聚合 embedding `>=0.68`）此前是
+`_is_confirmed` 里的局部变量，算完即弃。面板可以显示"中位 0.66 ✓"却永远不确认，
+且没有任何字段解释原因。
+
+### 已做
+
+- [x] `confirmation.py`：在 `_is_stricter_policy` 分支后补 `elif policy != state.policy`
+      降档分支，按当前帧尺寸重新解析策略；升档与降档**都**清空证据窗口，
+      避免一个窗口混入不同阈值下采集的样本。已确认轨迹（`state.confirmed`）不清证据，
+      不会被打回重新取证。`state.shadow_confirmed` 那条过渡分支未动。
+- [x] `confirmation.py`：把聚合相似度抽成 `_aggregate_similarity(state, target)`，
+      `_is_confirmed` 与 `track_progress` 共用，进度与判定不会各自复算而漂移。
+- [x] `confirmation.py`：`TrackProgress` 增 `aggregate_similarity` / `aggregate_threshold`；
+      `track_progress(target=None)` 保持向后兼容，不传 target 时聚合值为 None。
+- [x] `domain.py` / `service.py`：`TargetSearchView` 增 `aggregate_similarity` /
+      `required_aggregate_similarity`，`_target_status` 同步加默认值。
+- [x] `monitor.html`：次行加 `聚合 0.66 / 需 0.68 ✗`，仍走 `textContent`。
+- [x] 回归测试三条：`test_track_confirms_on_the_normal_tier_after_its_face_grows_past_the_far_bar`、
+      `test_relaxing_the_tier_clears_the_evidence_window`、
+      `test_track_progress_reports_the_far_face_aggregate_gate`。
+      **已验证前两条在移除降档分支后确实失败**（`assert 0 == 1` 无确认事件；
+      `observed=3, required=6, threshold=0.64` 即 120px 脸仍被锁在远脸档），
+      不是恒真断言。
+- [x] `uv run pytest` 137 passed；`uv run ruff check .` 全绿。
+
+### 仍未做
+
+- [ ] **真机复测**：起流后走一遍"远处进入画面 → 走近到 2-3 米"，确认同一条轨迹
+      在脸变大后按 `0.55 / 3 帧` 确认，而不是继续卡在 `0.64 / 6 帧`；
+      并读新暴露的聚合值，判断"差点意思"里有多少是显示问题、多少是真实短板。
+- [ ] **误报回归**：本改动是**放宽**确认条件，方向上会增加误确认。而 `0.55` 按
+      README 自己的说法"只用于跑通流程"，从未标定过。必须用 `person-search-eval`
+      在同一素材上对比：`face_observations` 必须完全不变（未碰检测），
+      `confirmed_events` 只允许增加且每条新增都要人工确认是真阳性。
+- [ ] **`video.py:41-43` 的 join 竞态**（本次验证时偶发命中，与本改动无关）：
+      `self._thread = Thread(...)` 与 `self._thread.start()` 之间有窗口，
+      此时 `stop()` 从另一线程进来会 `RuntimeError: cannot join thread before it is
+      started`。全套测试里约 1/8 概率让
+      `test_effective_config_reports_the_resolved_rates_and_gates` 失败
+      （该测试用真实 `camera/device_index=0`）。改法是先赋局部变量、`start()` 之后
+      再发布 `self._thread`，或两者置于同一把锁下。

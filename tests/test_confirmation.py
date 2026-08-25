@@ -663,3 +663,105 @@ def test_track_progress_is_empty_before_any_evidence() -> None:
         target=_target(),
     )
     assert matcher.track_progress() == {}
+
+
+def _feed(
+    matcher: TrackConfirmation,
+    settings: Settings,
+    samples: tuple[tuple[float, int, float], ...],
+    *,
+    start_frame: int = 0,
+) -> list:
+    """Drive the matcher with (timestamp, short_side, similarity) samples.
+
+    The policy is resolved from each face's own size, exactly as service._run
+    does, so a track that grows across a tier boundary is exercised end to end.
+    """
+    decisions = []
+    for offset, (timestamp, short_side, similarity) in enumerate(samples):
+        face = _face_with_similarity(short_side, similarity)
+        decisions.extend(
+            matcher.process(
+                frame_id=start_frame + offset,
+                timestamp=timestamp,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[face],
+                target=_target(),
+                face_policies={0: default_face_match_policy(face, settings)},
+            )
+        )
+    return decisions
+
+
+def test_track_confirms_on_the_normal_tier_after_its_face_grows_past_the_far_bar() -> None:
+    """A passenger walking closer must be re-judged, not held to the far-face bar.
+
+    The policy used to latch the strictest tier a track ever saw, so someone first
+    seen at 55px kept 0.64/6-frames/aggregate-0.68 even at 120px, where the normal
+    tier only asks for 0.55 over 3 frames.
+    """
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+
+    decisions = _feed(
+        matcher,
+        settings,
+        (
+            (0.0, 55, 0.60),
+            (0.2, 55, 0.60),
+            (0.4, 120, 0.70),
+            (0.6, 120, 0.70),
+            (0.8, 120, 0.70),
+        ),
+    )
+
+    confirmed = [item for item in decisions if item.state == MatchState.CONFIRMED]
+    assert len(confirmed) == 1
+    assert confirmed[0].evidence_count == settings.evidence_required
+    progress = matcher.track_progress()[7]
+    assert progress.threshold == pytest.approx(settings.similarity_threshold)
+    assert progress.required == settings.evidence_required
+    # The far-face aggregate gate does not apply to the normal tier.
+    assert progress.aggregate_threshold is None
+
+
+def test_relaxing_the_tier_clears_the_evidence_window() -> None:
+    """Samples taken under different thresholds must never share one window."""
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+
+    _feed(matcher, settings, ((0.0, 55, 0.60), (0.2, 55, 0.60)))
+    assert matcher.track_progress()[7].observed == 2
+
+    _feed(matcher, settings, ((0.4, 120, 0.70),), start_frame=2)
+    progress = matcher.track_progress()[7]
+    assert progress.observed == 1
+    assert progress.median_similarity == pytest.approx(0.70, abs=1e-2)
+
+
+def test_track_progress_reports_the_far_face_aggregate_gate() -> None:
+    """The aggregate gate is invisible unless it is reported next to the median."""
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+
+    for frame_id, timestamp in enumerate((0.0, 0.2, 0.4)):
+        matcher.process(
+            frame_id=frame_id,
+            timestamp=timestamp,
+            frame_shape=(200, 100, 3),
+            tracks=[_track()],
+            faces=[_face_with_similarity(55, 0.66)],
+            target=_target(),
+            face_policies={0: policy},
+        )
+
+    reported = matcher.track_progress(_target())[7]
+    assert reported.aggregate_threshold == pytest.approx(
+        settings.tiny_face_aggregate_similarity_threshold
+    )
+    assert reported.aggregate_similarity == pytest.approx(0.66, abs=1e-2)
+    # Without a target the rest of the report still works; only the gate is unknown.
+    assert matcher.track_progress()[7].aggregate_similarity is None
+

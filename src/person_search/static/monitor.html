@@ -234,6 +234,13 @@
         if (item.required_evidence) {
           detail.push(`达标 ${item.qualifying_evidence}/${item.required_evidence}`);
         }
+        // The far-face tier has a second gate: a quality-weighted mean embedding.
+        // A track can show a passing median and still never confirm on this one,
+        // so it has to be visible or the panel cannot explain the verdict.
+        if (item.aggregate_similarity != null && item.required_aggregate_similarity != null) {
+          const pass = item.aggregate_similarity >= item.required_aggregate_similarity ? '✓' : '✗';
+          detail.push(`聚合 ${item.aggregate_similarity.toFixed(2)} / 需 ${item.required_aggregate_similarity.toFixed(2)} ${pass}`);
+        }
         const reason = rejectionText(item.last_rejection_reason);
         if (reason) detail.push(reason);
         return detail.length ? `${head}\n    ${detail.join(' · ')}` : head;

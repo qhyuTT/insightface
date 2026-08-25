@@ -35,6 +35,11 @@ class TrackProgress:
     that includes sub-threshold ones, so it saturates at ``required`` and says
     nothing about progress. ``qualifying`` and ``median_similarity`` are what
     the confirmation gate actually reads.
+
+    ``aggregate_similarity`` is the far-face tier's second gate: a
+    quality-weighted mean embedding compared against the target. Without it a
+    track can show a passing median and still never confirm, with nothing on the
+    panel explaining why. It is ``None`` for tiers that do not use the gate.
     """
 
     observed: int
@@ -43,6 +48,8 @@ class TrackProgress:
     threshold: float
     median_similarity: float | None
     best_similarity: float | None
+    aggregate_similarity: float | None = None
+    aggregate_threshold: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,14 +124,26 @@ class TrackConfirmation:
             )
         }
 
-    def track_progress(self) -> dict[int, TrackProgress]:
-        """Return per-track confirmation progress for active tracks."""
+    def track_progress(self, target: Target | None = None) -> dict[int, TrackProgress]:
+        """Return per-track confirmation progress for active tracks.
+
+        ``target`` is only needed to report the far-face aggregate gate; without
+        it ``aggregate_similarity`` stays ``None`` and the rest is unchanged.
+        """
         progress: dict[int, TrackProgress] = {}
         for track_id, state in self._states.items():
             if not (state.confirmed or state.shadow_confirmed or state.evidence):
                 continue
             threshold = self._policy_threshold(state)
             similarities = [item.similarity for item in state.evidence]
+            aggregate_threshold = (
+                state.policy.aggregate_threshold if state.policy is not None else None
+            )
+            aggregate_similarity = (
+                self._aggregate_similarity(state, target)
+                if target is not None and aggregate_threshold is not None
+                else None
+            )
             progress[track_id] = TrackProgress(
                 observed=len(state.evidence),
                 required=self._policy_required(state),
@@ -132,6 +151,8 @@ class TrackConfirmation:
                 threshold=threshold,
                 median_similarity=float(np.median(similarities)) if similarities else None,
                 best_similarity=max(similarities) if similarities else None,
+                aggregate_similarity=aggregate_similarity,
+                aggregate_threshold=aggregate_threshold,
             )
         return progress
 
@@ -231,6 +252,17 @@ class TrackConfirmation:
                     state.evidence.clear()
                     state.last_candidate_emit = -1e9
                 state.policy = policy
+            elif policy != state.policy:
+                # A face that grew back into a looser tier must be judged by that
+                # tier. Latching the strictest policy a track ever saw meant a
+                # passenger first seen at 55px kept the 0.64/6-frame far-face bar
+                # for the whole track, even at 120px where 0.55/3 frames applies.
+                # Evidence is cleared in both directions so one window never mixes
+                # samples taken under different thresholds.
+                if not state.confirmed:
+                    state.evidence.clear()
+                    state.last_candidate_emit = -1e9
+                state.policy = policy
             else:
                 policy = state.policy
             similarity = float(np.dot(target.embedding, face.embedding))
@@ -320,20 +352,32 @@ class TrackConfirmation:
         if votes_required and sum(value >= threshold for value in similarities) < votes_required:
             return False
         if policy is not None and policy.aggregate_threshold is not None:
-            embeddings = np.stack([item.embedding for item in state.evidence])
-            weights = np.asarray(
-                [max(item.quality, 0.0) for item in state.evidence], dtype=np.float32
-            )
-            if not np.any(weights):
-                weights = np.ones(len(state.evidence), dtype=np.float32)
-            aggregate = np.average(embeddings, axis=0, weights=weights)
-            magnitude = float(np.linalg.norm(aggregate))
-            if magnitude <= 1e-12:
+            aggregate_similarity = self._aggregate_similarity(state, target)
+            if aggregate_similarity is None:
                 return False
-            aggregate_similarity = float(np.dot(target.embedding, aggregate / magnitude))
             if aggregate_similarity < policy.aggregate_threshold:
                 return False
         return True
+
+    def _aggregate_similarity(self, state: _TrackState, target: Target) -> float | None:
+        """Cosine between the target and the window's quality-weighted mean embedding.
+
+        ``track_progress`` and ``_is_confirmed`` both read this so the panel can
+        never disagree with the verdict. ``None`` means the aggregate is unusable
+        (no evidence, or the weighted mean cancelled out), which the gate treats
+        as a failure.
+        """
+        if not state.evidence:
+            return None
+        embeddings = np.stack([item.embedding for item in state.evidence])
+        weights = np.asarray([max(item.quality, 0.0) for item in state.evidence], dtype=np.float32)
+        if not np.any(weights):
+            weights = np.ones(len(state.evidence), dtype=np.float32)
+        aggregate = np.average(embeddings, axis=0, weights=weights)
+        magnitude = float(np.linalg.norm(aggregate))
+        if magnitude <= 1e-12:
+            return None
+        return float(np.dot(target.embedding, aggregate / magnitude))
 
     def _decision(self, state_name: MatchState, track_id: int, state: _TrackState) -> MatchDecision:
         shadow = self._is_shadow_policy(state.policy)

@@ -166,6 +166,8 @@ class SearchSession:
                 "qualifying_evidence": 0,
                 "median_similarity": None,
                 "required_similarity": None,
+                "aggregate_similarity": None,
+                "required_aggregate_similarity": None,
                 "last_rejection_reason": None,
             }
             for target in self.targets
@@ -556,7 +558,7 @@ class SearchSession:
                             + confirmation_result.evidence_collected
                         )
                     self._handle_decisions(target_id, target, decisions, packet.frame.shape)
-                    progress = confirmation.track_progress()
+                    progress = confirmation.track_progress(target)
                     if progress:
                         # Rank by qualifying samples, not banked ones: under
                         # collect_all_observations a track sits permanently at
@@ -572,12 +574,15 @@ class SearchSession:
                             current["qualifying_evidence"] = best.qualifying
                             current["median_similarity"] = best.median_similarity
                             current["required_similarity"] = best.threshold
+                            current["aggregate_similarity"] = best.aggregate_similarity
+                            current["required_aggregate_similarity"] = best.aggregate_threshold
                     else:
                         with self._lock:
                             current = self._target_status[target_id]
                             current["evidence_count"] = 0
                             current["qualifying_evidence"] = 0
                             current["median_similarity"] = None
+                            current["aggregate_similarity"] = None
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
                         state_value = (
                             "shadow"

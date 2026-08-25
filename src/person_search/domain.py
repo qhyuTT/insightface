@@ -72,6 +72,8 @@ class TargetSearchView(BaseModel):
     qualifying_evidence: int = 0
     median_similarity: float | None = None
     required_similarity: float | None = None
+    aggregate_similarity: float | None = None
+    required_aggregate_similarity: float | None = None
     last_rejection_reason: str | None = None
 
 

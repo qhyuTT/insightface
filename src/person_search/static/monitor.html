@@ -199,11 +199,44 @@
         debug_preview: $('debugPreview').checked,
       };
     }
+    const REJECTION_TEXT = {
+      similarity_low: '相似度不足',
+      detection_score_low: '检测置信度不足',
+      face_too_small: '人脸过小',
+      face_blurry: '画面模糊',
+      face_exposure_bad: '曝光不当',
+      identity_margin_low: '与其他目标难以区分',
+      unassociated: '未关联到人体',
+      invalid_face_crop: '人脸裁切无效',
+      shadow_only: '仅影子确认',
+      shadow_lost: '影子目标丢失',
+    };
+    function rejectionText(reason) {
+      if (!reason) return '';
+      return reason.split(',').map(part => REJECTION_TEXT[part.trim()] || part.trim()).join(' / ');
+    }
     function renderTargets(targets = []) {
       $('batchInfo').textContent = targets.map(item => {
-        const progress = item.required_evidence ? ` · ${item.evidence_count}/${item.required_evidence}帧` : '';
+        // "证据" counts banked samples, which saturates for far faces because every
+        // sample is banked regardless of score. The similarity line below is the
+        // number that actually decides confirmation.
+        const progress = item.required_evidence ? ` · 证据 ${item.evidence_count}/${item.required_evidence}` : '';
         const pixels = item.last_face_px ? ` · ${item.last_face_px}px` : '';
-        return `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}${pixels}${progress}`;
+        const head = `${item.status === 'found' ? '✓' : '·'} ${item.name} · ${item.status === 'found' ? '已找到' : '寻找中'}${pixels}${progress}`;
+        if (item.status === 'found') return head;
+        const detail = [];
+        if (item.best_observed_similarity != null && item.required_similarity != null) {
+          detail.push(`最佳 ${item.best_observed_similarity.toFixed(2)} / 需 ${item.required_similarity.toFixed(2)}`);
+        }
+        if (item.median_similarity != null) {
+          detail.push(`中位 ${item.median_similarity.toFixed(2)}`);
+        }
+        if (item.required_evidence) {
+          detail.push(`达标 ${item.qualifying_evidence}/${item.required_evidence}`);
+        }
+        const reason = rejectionText(item.last_rejection_reason);
+        if (reason) detail.push(reason);
+        return detail.length ? `${head}\n    ${detail.join(' · ')}` : head;
       }).join('\n');
     }
     function countText(values = {}) {
@@ -375,6 +408,13 @@
         if (response.ok) {
           setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
           renderDiagnostics(body);
+          // Far-face policies suppress candidate events, so the confirmed-decision
+          // metric stays empty. Fall back to the best value actually observed.
+          const observed = body.targets?.map(item => item.best_observed_similarity).filter(value => value != null) ?? [];
+          if (observed.length) {
+            bestSimilarity = Math.max(bestSimilarity, ...observed);
+            $('similarityMetric').textContent = bestSimilarity.toFixed(3);
+          }
           if (body.total_count) {
             targetName = `${body.found_count}/${body.total_count} 人`; renderTargets(body.targets);
             const limited = body.targets.find(item => item.status !== 'found' && (item.last_rejection_reason || '').includes('face_too_small'));

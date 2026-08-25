@@ -163,6 +163,9 @@ class SearchSession:
                 "last_face_px": None,
                 "evidence_count": 0,
                 "required_evidence": 0,
+                "qualifying_evidence": 0,
+                "median_similarity": None,
+                "required_similarity": None,
                 "last_rejection_reason": None,
             }
             for target in self.targets
@@ -555,16 +558,26 @@ class SearchSession:
                     self._handle_decisions(target_id, target, decisions, packet.frame.shape)
                     progress = confirmation.track_progress()
                     if progress:
-                        _, (evidence_count, required_evidence) = max(
-                            progress.items(), key=lambda item: item[1][0]
+                        # Rank by qualifying samples, not banked ones: under
+                        # collect_all_observations a track sits permanently at
+                        # observed == required while contributing nothing.
+                        best = max(
+                            progress.values(),
+                            key=lambda item: (item.qualifying, item.median_similarity or -1.0),
                         )
                         with self._lock:
                             current = self._target_status[target_id]
-                            current["evidence_count"] = evidence_count
-                            current["required_evidence"] = required_evidence
+                            current["evidence_count"] = best.observed
+                            current["required_evidence"] = best.required
+                            current["qualifying_evidence"] = best.qualifying
+                            current["median_similarity"] = best.median_similarity
+                            current["required_similarity"] = best.threshold
                     else:
                         with self._lock:
-                            self._target_status[target_id]["evidence_count"] = 0
+                            current = self._target_status[target_id]
+                            current["evidence_count"] = 0
+                            current["qualifying_evidence"] = 0
+                            current["median_similarity"] = None
                     for track_id, (state, similarity) in confirmation.active_track_states().items():
                         state_value = (
                             "shadow"

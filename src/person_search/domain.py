@@ -69,6 +69,9 @@ class TargetSearchView(BaseModel):
     last_face_px: int | None = None
     evidence_count: int = 0
     required_evidence: int = 0
+    qualifying_evidence: int = 0
+    median_similarity: float | None = None
+    required_similarity: float | None = None
     last_rejection_reason: str | None = None
 
 

@@ -1174,3 +1174,80 @@ def test_effective_config_reports_the_resolved_rates_and_gates() -> None:
     assert config["effective_search_min_face_px"] == Settings().effective_search_min_face_px
 
     manager.stop_search(search.search_id)
+
+
+def test_saturated_tiny_evidence_surfaces_similarity_shortfall(monkeypatch) -> None:
+    """Reproduce the field failure and assert the view explains it.
+
+    A 50px face banks 6/6 samples yet never confirms because similarity sits
+    far below the tiny threshold. The view must report the qualifying count and
+    the required similarity, not just the saturated evidence counter.
+    """
+    frame = np.zeros((160, 160, 3), dtype=np.uint8)
+    packets = [
+        SimpleNamespace(frame_id=index, captured_at=index * 0.25, frame=frame) for index in range(8)
+    ]
+
+    class FakeReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+
+        def start(self) -> None:
+            pass
+
+        def get(self, timeout=0.5):
+            if packets:
+                return packets.pop(0)
+            self.ended.set()
+            return None
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", FakeReader)
+    target_view = TargetView(
+        target_id="target-far",
+        name="张三",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-far",
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        "张三",
+    )
+    similarity = 0.41
+    tiny_face = make_face(
+        embedding=(similarity, float(np.sqrt(1.0 - similarity**2))),
+        bbox=(20, 20, 70, 70),
+    )
+    settings = Settings(tiny_face_enabled=True)
+    session = SearchSession(
+        search_id="search-far",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings,
+        face_backend=FakeFaceBackend([tiny_face]),
+        person_detector=FakePersonDetector(
+            [Detection(np.asarray([0, 0, 140, 150], dtype=np.float32), 0.99)]
+        ),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    session._run()
+
+    events = session.events.after(0, timeout=0)
+    assert not any(event["type"] in {"confirmed", "tiny_shadow_confirmed"} for event in events)
+    view_target = session.view().targets[0]
+    assert view_target.status.value == "searching"
+    assert view_target.evidence_count == view_target.required_evidence == 6
+    assert view_target.qualifying_evidence == 0
+    assert view_target.median_similarity == pytest.approx(similarity)
+    assert view_target.required_similarity == pytest.approx(
+        settings.tiny_face_similarity_threshold
+    )
+    assert view_target.last_rejection_reason == "similarity_low"

@@ -164,7 +164,8 @@ def test_tiny_low_similarity_is_collected_as_negative_evidence() -> None:
     assert policy.accepts_observation(0.99, 0.50)
     assert result.decisions == []
     assert result.evidence_collected == 1
-    assert matcher.track_progress() == {7: (1, 6)}
+    progress = matcher.track_progress()[7]
+    assert (progress.observed, progress.required, progress.qualifying) == (1, 6, 0)
 
 
 def test_eligible_observation_inside_minimum_interval_is_not_collected() -> None:
@@ -195,7 +196,8 @@ def test_eligible_observation_inside_minimum_interval_is_not_collected() -> None
     assert policy.accepts_observation(0.99, 0.90)
     assert first.evidence_collected == 1
     assert too_close.evidence_collected == 0
-    assert matcher.track_progress() == {7: (1, 3)}
+    progress = matcher.track_progress()[7]
+    assert (progress.observed, progress.required, progress.qualifying) == (1, 3, 1)
 
 
 def test_face_associates_to_smallest_upper_body_box() -> None:
@@ -398,7 +400,8 @@ def test_tiny_face_collects_six_observations_and_requires_five_consistent_votes(
     confirmed = [item for item in decisions if item.state == MatchState.CONFIRMED]
     assert len(confirmed) == 1
     assert confirmed[0].evidence_count == 6
-    assert matcher.track_progress() == {7: (6, 6)}
+    progress = matcher.track_progress()[7]
+    assert (progress.observed, progress.required, progress.qualifying) == (6, 6, 5)
 
 
 def test_tiny_face_rejects_four_of_six_consistent_votes() -> None:
@@ -610,3 +613,53 @@ def test_candidate_state_disappears_when_evidence_expires() -> None:
         target=_target(),
     )
     assert matcher.active_track_states() == {}
+
+
+def test_saturated_tiny_evidence_reports_qualifying_shortfall() -> None:
+    """The field failure: 6/6 banked, one sample qualifying, never confirmed.
+
+    collect_all_observations banks sub-threshold samples too, so `observed`
+    pins at `required` forever. Only `qualifying` and `median_similarity`
+    reveal that the track is nowhere near the gate.
+    """
+    settings = Settings(tiny_face_enabled=True)
+    matcher = TrackConfirmation(settings)
+    policy = tiny_face_match_policy(settings)
+    decisions = []
+    # One lucky frame above 0.64, five at the ~0.41 the 50px field face produced.
+    similarities = (0.70, 0.41, 0.40, 0.42, 0.39, 0.41)
+    for frame_id, (timestamp, similarity) in enumerate(
+        zip((0.0, 0.2, 0.4, 0.6, 0.8, 1.0), similarities, strict=True)
+    ):
+        decisions.extend(
+            matcher.process(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                frame_shape=(200, 100, 3),
+                tracks=[_track()],
+                faces=[_face_with_similarity(50, similarity)],
+                target=_target(),
+                face_policies={0: policy},
+            )
+        )
+
+    assert not any(item.state == MatchState.CONFIRMED for item in decisions)
+    progress = matcher.track_progress()[7]
+    assert progress.observed == progress.required == 6
+    assert progress.qualifying == 1
+    assert progress.threshold == pytest.approx(settings.tiny_face_similarity_threshold)
+    assert progress.median_similarity == pytest.approx(0.41, abs=1e-2)
+    assert progress.best_similarity == pytest.approx(0.70, abs=1e-2)
+
+
+def test_track_progress_is_empty_before_any_evidence() -> None:
+    matcher = TrackConfirmation(Settings())
+    matcher.process(
+        frame_id=1,
+        timestamp=0.0,
+        frame_shape=(200, 100, 3),
+        tracks=[_track()],
+        faces=[],
+        target=_target(),
+    )
+    assert matcher.track_progress() == {}

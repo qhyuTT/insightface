@@ -28,6 +28,24 @@ class ConfirmationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TrackProgress:
+    """How close one track is to confirmation, and why it is not there yet.
+
+    ``observed`` counts every banked sample; under ``collect_all_observations``
+    that includes sub-threshold ones, so it saturates at ``required`` and says
+    nothing about progress. ``qualifying`` and ``median_similarity`` are what
+    the confirmation gate actually reads.
+    """
+
+    observed: int
+    required: int
+    qualifying: int
+    threshold: float
+    median_similarity: float | None
+    best_similarity: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class FaceMatchPolicy:
     threshold: float
     evidence_required: int
@@ -37,6 +55,8 @@ class FaceMatchPolicy:
     consistent_votes_required: int = 0
     min_observation_interval_seconds: float = 0.2
     min_detection_score: float = 0.0
+    # Enforced per frame by the caller (see service._run) before an observation
+    # reaches process(); it deliberately takes no part in the window verdict.
     min_top1_margin: float = 0.0
     collect_all_observations: bool = False
     requires_strict_association: bool = False
@@ -97,18 +117,38 @@ class TrackConfirmation:
             )
         }
 
-    def track_progress(self) -> dict[int, tuple[int, int]]:
-        """Return ``(observed, required)`` evidence counts for active tracks."""
-        return {
-            track_id: (
-                len(state.evidence),
-                state.policy.evidence_required
-                if state.policy is not None
-                else self.settings.evidence_required,
+    def track_progress(self) -> dict[int, TrackProgress]:
+        """Return per-track confirmation progress for active tracks."""
+        progress: dict[int, TrackProgress] = {}
+        for track_id, state in self._states.items():
+            if not (state.confirmed or state.shadow_confirmed or state.evidence):
+                continue
+            threshold = self._policy_threshold(state)
+            similarities = [item.similarity for item in state.evidence]
+            progress[track_id] = TrackProgress(
+                observed=len(state.evidence),
+                required=self._policy_required(state),
+                qualifying=sum(value >= threshold for value in similarities),
+                threshold=threshold,
+                median_similarity=float(np.median(similarities)) if similarities else None,
+                best_similarity=max(similarities) if similarities else None,
             )
-            for track_id, state in self._states.items()
-            if state.confirmed or state.shadow_confirmed or state.evidence
-        }
+        return progress
+
+    def _policy_threshold(self, state: _TrackState) -> float:
+        if state.policy is not None:
+            return state.policy.threshold
+        return self.settings.similarity_threshold
+
+    def _policy_required(self, state: _TrackState) -> int:
+        if state.policy is not None:
+            return state.policy.evidence_required
+        return self.settings.evidence_required
+
+    def _policy_window(self, state: _TrackState) -> float:
+        if state.policy is not None:
+            return state.policy.evidence_window_seconds
+        return self.settings.evidence_window_seconds
 
     def process(
         self,
@@ -263,28 +303,16 @@ class TrackConfirmation:
         )
 
     def _expire_evidence(self, state: _TrackState, timestamp: float) -> None:
-        window = (
-            state.policy.evidence_window_seconds
-            if state.policy is not None
-            else self.settings.evidence_window_seconds
-        )
+        window = self._policy_window(state)
         while state.evidence and timestamp - state.evidence[0].timestamp > window:
             state.evidence.popleft()
 
     def _is_confirmed(self, state: _TrackState, target: Target) -> bool:
-        required = (
-            state.policy.evidence_required
-            if state.policy is not None
-            else self.settings.evidence_required
-        )
+        required = self._policy_required(state)
         if len(state.evidence) < required:
             return False
         similarities = [item.similarity for item in state.evidence]
-        threshold = (
-            state.policy.threshold
-            if state.policy is not None
-            else self.settings.similarity_threshold
-        )
+        threshold = self._policy_threshold(state)
         if float(np.median(similarities)) < threshold:
             return False
         policy = state.policy

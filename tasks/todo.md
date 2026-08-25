@@ -162,3 +162,59 @@ tiny 策略要求 `det_score ≥ 0.65`，而全帧 640 下 18px 的脸达不到�
   不要留用默认的 0.64 / 0.68。
 - `.gitignore` 未忽略 `.env`。本次把 `.env` 记为开启远脸档的途径，而 RTSP URI 常带凭据，
   与代码里到处在做的 `_sanitize_source` 相抵。建议补一行，但不在本次改动范围内。
+
+## 远脸 `6/6帧` 恒满却永不确认：修复诊断盲区
+
+### 背景
+
+现场：目标登记 quality 0.96，画面人脸 ~50px，UI 徽标恒显 `6/6帧`，从不确认，
+`BEST SIMILARITY` 永远是 `—`。用户合理推断"6 帧太多"。
+
+**根因不是帧数。** 诊断面板 `evidence_eligible 428` 对 `above_threshold 5` ——
+只有约 1% 的样本越过 tiny 档的 0.64，而 `_is_confirmed` 要求**中位数** ≥ 阈值，
+确认在数学上不可能。而 `6/6` 是假信号：tiny 策略 `collect_all_observations=True`
+使 `accepts_observation` 恒真，**不论相似度高低所有样本都入队**，deque 被裁到 6，
+几秒填满并永久停在那里。真实相似度服务端一直在记
+（`_target_status["best_observed_similarity"]`），只是 `renderTargets` 从没渲染。
+
+用户在盲飞：唯一可见的进度条恒满，唯一能解释失败的数字没被显示。
+
+### 已完成（阶段一：只改可观测性，判定逻辑零变更）
+
+- [x] `confirmation.py`：`track_progress()` 由 `dict[int, tuple[int, int]]` 改为返回
+      `TrackProgress`（`observed` / `required` / `qualifying` / `threshold` /
+      `median_similarity` / `best_similarity`）。`observed` 的 docstring 明写它在
+      `collect_all_observations` 下会饱和、不代表进度。
+- [x] `confirmation.py`：抽出 `_policy_threshold` / `_policy_required` / `_policy_window`，
+      消除 `_is_confirmed` / `_expire_evidence` / `track_progress` 三处重复的判空分支，
+      保证进度上报与确认判定同源。
+- [x] `confirmation.py`：给 `min_top1_margin` 加注释说明它由调用方按帧过滤、
+      不参与窗口判定（此前读者会以为 `_is_confirmed` 漏了它）。
+- [x] `service.py`：progress 汇总改为按 **qualifying 票数**（并列时比中位数）挑 track，
+      而非按采集数——否则会持续上报一个满仓但全是低分的 track。
+- [x] `domain.py` / `service.py`：`TargetSearchView` 增 `qualifying_evidence` /
+      `median_similarity` / `required_similarity`。`required_similarity` 是关键，
+      用户必须看到"需 0.64"才知道差多远。
+- [x] `monitor.html`：徽标改为 `证据 6/6` + 次行 `最佳 0.41 / 需 0.64 · 中位 0.41 ·
+      达标 0/6 · 相似度不足`，并加 `REJECTION_TEXT` 中文映射。仍走 `textContent`，
+      目标名不进 innerHTML。
+- [x] `monitor.html`：`BEST SIMILARITY` 回退读 `best_observed_similarity`，
+      使其在抑制候选事件的远脸档也有值。`metrics.best_similarity` 语义
+      （已确认决策的最佳值）保持不被污染。
+- [x] 回归测试：`test_saturated_tiny_evidence_reports_qualifying_shortfall`（确认器层）
+      与 `test_saturated_tiny_evidence_surfaces_similarity_shortfall`（服务层，
+      用 0.41 复现现场数值）。此前**没有任何测试覆盖这个故障形态**。
+- [x] `uv run pytest` 134 passed；`uv run ruff check .` 全绿。
+
+### 仍未做（阶段二：据实测校准，不拍脑袋改阈值）
+
+- [ ] **真机复测**（唯一能证明修复有效的一步）：接现场 RTSP 重跑同一场景，
+      确认徽标显示实际相似度、不再出现恒满的 `6/6`。
+- [ ] **用分布定阈值**：`person-search-eval` 取两个直方图——同一人 50-63px 的相似度，
+      与**不同人**同尺寸的相似度。tiny 阈值应落在两者的分离点，而不是落在"能确认"
+      的位置。若两分布重叠严重，结论就是 50px 在本场景不可用；那是必须报告的真实
+      结论，不能靠降阈值掩盖。
+- [ ] **时间窗**：`tiny_face_evidence_window_seconds=3.0` 要求 6 个样本跨 3 秒，
+      移动机器人在 3 秒内姿态差异很大，低分姿态会把中位数拉下来。可考察缩短到
+      1.5-2.0s，或把中位数改为上四分位 / 最佳-K 均值（更贴合移动采样，但会提高
+      误报，必须用上面的负样本分布验证）。按实测决定，不预先承诺。

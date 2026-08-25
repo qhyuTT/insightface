@@ -25,3 +25,6 @@
 - 诊断面板漏掉一个已存在于 API 响应里的字段，等价于这个字段不存在。`rejection_counts` 一直在 `SearchMetrics.snapshot()` 里返回，但 8 个诊断格子没有它；面板能说「脸有多大」，说不出「为什么被拒」，定位零匹配时必须靠人读代码。新增统计字段时必须同步 `monitor.html`，否则它只是给未来的自己留了一个盲区。
 - 跳过/拒绝类计数器要按**原因**分桶，不能只按阶段。`budget_skips = {face_roi: 1498}` 说不出是撞了 `min_processed_fps` 地板还是没有预算余额——这两者的处置完全不同（前者要减负载，后者要改判据）。拆成 `face_roi_floor` / `face_roi_credit` 几乎零成本。
 - 开启一个 docstring 明写 "opt-in" 的档位时，改配置而不是翻库默认值。`tiny_face_enabled` 默认 False 被多处测试依赖：`tests/conftest.py` 的 `make_face` 默认 bbox 是 60×60，正落在 48-63 桶内，翻默认会静默改变一批用 `Settings()` 的测试的语义。部署差异用 `.env` / `deploy_t4.sh` 的 `--env` 表达，测试扰动为零。
+- 进度指示器必须与它所声称的判定门同源，否则它是负资产。远脸档 `collect_all_observations=True` 让**所有**样本（含远低于阈值的）都入队，deque 又被裁到 `evidence_required`，于是 `track_progress()` 返回的 `6/6` 在几秒内饱和并永久不动——它度量的是"采集了几个"，用户读到的是"差几帧就确认"。真实卡点（428 个样本仅 5 个越过 0.64，中位数结构性达不到）只存在于诊断计数里。上报进度时必须同时给出**达标数**和**判定用的统计量**（中位数/阈值），并且这些值要走与 `_is_confirmed` 相同的取值 helper，不能各自复算。
+- `suppress_candidate` 类"抑制事件"开关会连带掐断依赖该事件流的所有指标。远脸档不发 CANDIDATE，于是 `metrics.best_similarity`（只在决策时写入）永远为 None，UI 的 `BEST SIMILARITY` 恒显 `—`；而 `_target_status["best_observed_similarity"]` 一直有正确值，只是前端没读。加抑制开关时必须清查哪些指标以被抑制的事件为唯一数据源，并为它们提供不依赖该事件的回退源——否则最需要诊断的档位恰好是诊断最瞎的档位（与第 22 条"字段没渲染等于不存在"同源）。
+- 多候选里挑"最有希望"的那个，排序键必须是判定量而不是计数量。`max(progress, key=观测数)` 在饱和计数器下退化为任意选择，会持续上报一个满仓但全是低分的 track，掩盖另一个真正接近阈值的 track。

@@ -348,11 +348,44 @@ tiny 策略要求 `det_score ≥ 0.65`，而全帧 640 下 18px 的脸达不到�
 - 翻转 TTA 用桩识别器验证：**一次**推理拿到裁剪与镜像两行，特征相加归一化。
 - API 实启动，`/healthz` 200，`/monitor` 含两个新诊断格；monitor.html 脚本经 node 解析通过。
 
-### 仍未做（需要真机 / 真素材，本地无 GPU 无模型）
+### 已部署到 60 服务器（ky-sv / 192.168.17.60）
 
-- [ ] **T4 实测 `face_full` P95**：1280 档是唯一可能拖垮帧率的改动。
-      若 P95 增长到让 `processed_fps < required_sampling_hz × 3`，把
-      `PERSON_SEARCH_FACE_DEEP_SCAN_EVERY_N` 调到 2-3，而不是关掉大尺度。
+按仓库既有做法走 bundle：`~/deploy/insightface-release-<sha>` 逐版目录，从上一版
+clone 后 `git fetch <bundle>` + `merge --ff-only`，`models/yolox_tiny.onnx` 从上一版
+复制（SHA-256 校验通过）。GitHub 上的 `origin/main` 仍停在 `6ceb350`，未推送。
+
+两次部署：`0bd9e98`（计划原样）→ `ecf02f8`（按 T4 实测修正检测配置）。当前容器
+`person-search:t4` @ `ecf02f8`，`healthy`，`PERSON_SEARCH_HOST=0.0.0.0`，
+局域网 `http://192.168.17.60:8000/monitor` 可访问。旁边的
+`airport-robot-dispatch-{frontend,backend}` 未受影响，无 dangling 镜像残留。
+
+五层 GPU 核验全部通过：宿主 `Tesla T4` → 容器 `nvidia-smi` → ORT
+`CUDAExecutionProvider` → YOLOX `CUDAExecutionProvider` → InsightFace
+`CUDAExecutionProvider`。真实 SCRFD 多尺度调用返回正常（这是本地无法验证的那一段）。
+
+#### T4 实测：检测尺度（这条改变了计划的结论）
+
+| 配置 | p50 | 21px 脸 | 52px 脸 | 311px 脸 |
+|---|---|---|---|---|
+| `[128,640]`（原生产） | 108 ms | **漏检** | 0.75 | 0.90 |
+| `[128,640,1280]`（计划原案） | 181 ms | 0.69 | 0.82 | 0.91 |
+| `[1280]`（**实际部署**） | **57 ms** | 0.69 | 0.82 | 0.91 |
+
+单档 1280 比原生产**便宜一半**且每个尺寸都不更差。根因是 CUDA 上每换一次 ONNX
+输入形状约付 30 ms 重规划（单档实测 320=5ms / 640=18ms / 1280=53ms），「叠加一档」
+的钱几乎全花在形状切换上。同一原因下把 ROI 尺度从「逐裁剪取整」改成两档量化
+（233 ms/轮 → 136 ms/轮）——那是我当天刚写的代码，靠实测才发现。
+
+部署后 `face_full` p50 62 ms / p95 72 ms，低于 `face_detection_hz_cuda=10` 的 100 ms
+周期，远脸档要求的 `2.0 Hz` 有充足余量，**因此不需要动
+`PERSON_SEARCH_FACE_DEEP_SCAN_EVERY_N`**。
+
+另一处修正：`[128,640]` 对**检测框短边 <45px** 的脸是完全漏检，对 52px 则是
+检得到但分低。现场 1960 次检测说明用户那个距离属于后者，所以 1280 带来的是
+`0.75 → 0.82` 的分数抬升与更稳的关键点，不是「从无到有」——计划里把两者混为
+一谈，高估了这一刀的收益。
+
+### 仍未做（需要真机 RTSP + 画面里有人）
 - [ ] **同距离复测**：`face_size_counts` 中 `48_63` 占比、
       `rejection_counts.detection_score_low` 下降幅度、`associated > 0`、
       `证据` 是否单调上升、`相机位移 p95`。

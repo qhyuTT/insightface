@@ -14,6 +14,9 @@ T4_PIP_INDEX_CANDIDATES="${T4_PIP_INDEX_CANDIDATES-https://mirrors.aliyun.com/py
 T4_ORT_VERSION="${T4_ORT_VERSION:-1.23.2}"
 T4_BIND_HOST="${T4_BIND_HOST:-127.0.0.1}"
 T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
+# conservative keeps the calibrated far-face bar; responsive trades false-accept
+# headroom for a faster verdict and should wait for a calibrated threshold.
+T4_MATCH_PROFILE="${T4_MATCH_PROFILE:-conservative}"
 T4_YOLOX_MODEL_URL="${T4_YOLOX_MODEL_URL:-}"
 T4_PREFETCH_YOLOX="${T4_PREFETCH_YOLOX:-1}"
 # Prefix-style GitHub proxies, tried in order before the upstream URL itself.
@@ -187,6 +190,8 @@ docker run --detach \
   --env "PERSON_SEARCH_PREFER_CUDA=true" \
   --env "PERSON_SEARCH_TINY_FACE_ENABLED=true" \
   --env "PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false" \
+  --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=1280" \
+  --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}" \
   "${T4_IMAGE_NAME}" >/dev/null
 
 log "Waiting for API health check"

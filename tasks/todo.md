@@ -275,3 +275,94 @@ tiny 策略要求 `det_score ≥ 0.65`，而全帧 640 下 18px 的脸达不到�
       `test_effective_config_reports_the_resolved_rates_and_gates` 失败
       （该测试用真实 `camera/device_index=0`）。改法是先赋局部变量、`start()` 之后
       再发布 `self._thread`，或两者置于同一把锁下。
+
+## 移动机器人场景：远脸召回 + 确认速度
+
+计划：`~/.claude/plans/plan-cozy-flute.md`
+
+### 背景
+
+现场读数 `1 · 寻找中 · 49px · 证据 0/6 · 最佳 0.70 / 需 0.64 · 达标 0/6 · 人脸过小 / 检测置信度不足`。
+`最佳 0.70 ≥ 需 0.64` 说明**识别能力不是瓶颈**——有脸走完了嵌入并越过了远脸档的阈值。
+而 tiny 档 `collect_all_observations=True` 会把通过质量门 + 关联的观测**全部**入队，
+`证据 0/6` 因此意味着几乎没有观测走到确认器。故障在漏斗上游。
+
+机器人自己在动、人可能走可能坐；要求「准一点、快一点」；算力 T4；登记照只有一张；
+确认条件分两档用开关切。
+
+### 任务
+
+- [x] 0. 提交基线（单向棘轮修复）；修 `video.py` join 竞态；`.gitignore` 加 `.env`
+- [x] 1. `config.py`：多尺度 / 深扫 / 迟滞 / 运动补偿 / 翻转 TTA / `match_profile` 全部可调项
+      + `full_frame_detection_scales()` / `roi_detection_scale()`
+- [x] 2. `backends.py`：`detect_faces` 接受一组尺度（SCRFD 自己跨尺度 NMS）；
+      `embed_faces` 同批次翻转 TTA，登记侧走同一实现
+- [x] 3. `confirmation.py`：档位命名化 + `resolve_face_tier` 迟滞；`_window_statistic`
+      （median / top_k_mean）由 `_is_confirmed` 与 `track_progress` 共用；
+      `requires_strict_association` 拆出 `allows_relaxed_association`
+- [x] 4. `tracker.py`：`update(motion=...)` 在 IoU 前抵消全局位移；`velocity` 改为
+      观测间测量并按 `missed` 归一
+- [x] 5. `service.py`：`_estimate_camera_motion`（phaseCorrelate + Hanning 窗）、
+      深扫节奏、ROI 尺度自适应、`_track_tiers` 会话级档位、relaxed 关联按
+      `is_stricter_policy` 决定是否降档、拒绝原因与其人脸尺寸同源
+- [x] 6. `domain.py` / `monitor.html`：`window_similarity` + `window_statistic` + `tier`
+      + `last_rejection_face_px`；新增 `MOTION / SHARPNESS`、`MATCH PROFILE` 两格
+- [x] 7. `cli.py`：离线链路同步全部改动（多尺度、深扫、运动补偿、档位、关联语义）
+- [x] 8. `evaluation.py` + `cli.py`：`--dump-similarities` 与 `summarize_similarity_samples`
+- [x] 9. 回归测试 22 条；`uv run pytest` 159 passed；`uv run ruff check .` 全绿
+- [x] 10. `README.md` / `CLAUDE.md` / `.env.example` / `deploy_t4.sh` 同步
+
+### 复盘
+
+#### 改了什么（按根因）
+
+| 根因 | 处置 |
+|---|---|
+| 640 档把 49px 脸压到 ~16px（stride-8 下限），`det_score` 结构性达不到 0.65 | CUDA 叠加 1280 尺度，`face_deep_scan_every_n` 可降为隔轮深扫 |
+| ROI 定值 320 对大裁剪是**降采样** | 按裁剪自适应，320 为下限、640 为上限 |
+| 档位抖动每帧清空证据窗口 | `face_tier_hysteresis_px=6`，档位由 session 按轨迹解析一次 |
+| 相机运动 → IoU 关联失败 → 新 track id → 证据归零 | phaseCorrelate 估全局平移，关联前施加；顺手修 `velocity` 语义 |
+| 远脸档拒绝 `person_relaxed`，坐姿在结构上不可确认 | 拆出 `allows_relaxed_association`，默认允许；仍禁止 face-only |
+| 中位数对移动采样不友好、6 帧/3s 太慢 | `match_profile=responsive` → 4 帧/2s/top-K 均值/检测分 0.55，聚合门不动 |
+| 只有一张登记照，域差无解 | 翻转 TTA（同批次，登记与搜索同源），抬分布而非降门槛 |
+| 无法用分布定阈值 | `--dump-similarities` + 同人/异人分布摘要 |
+
+#### 两条被实测否掉的假设（写进计划、差点改代码）
+
+1. **清晰度阈值随尺寸缩放**：用 skimage 真实人脸裁剪实测，Laplacian 方差随人脸变小
+   **上升**（40px 3689 / 200px 821），固定 45 对小脸其实更宽松；归一化到 112 反而
+   把小脸压到门槛附近，是收紧。**放弃该改动**，只保留可观测性（blur p50/p95 上面板）。
+2. **`assess_face` 整数截断把 49px 量成 47px**：`int(x2)-int(x1)` 恒等于 `int(x2-x1)`
+   或再大 1，永远不会更小。真正的原因是**面板把两个不同观测拼成一行**：
+   `last_face_px`（见过的最大脸，49px、已接受、相似度 0.70）和 `last_rejection_reason`
+   （另一张 40px 脸的原因）。改为原因与其尺寸同源上报。
+
+#### 验证结果
+
+- `uv run pytest` 159 passed（原 137 + 新增 22）；连跑 5 次无 flaky；`ruff check .` 全绿。
+- 关键回归**已验证非恒真**：档位迟滞用 `face_tier_hysteresis_px=0` 对照，
+  抖动侧 `observed` 恒为 1 且从不确认，迟滞侧攒满 4 帧并确认；相机运动用同一段
+  90px/帧位移对照，补偿侧单一 track id，未补偿侧第二帧即换 id。
+- `_estimate_camera_motion` 对 `np.roll` 60px 的合成位移回报 60±2px（全帧像素，
+  估计跑在降采样图上）。
+- 翻转 TTA 用桩识别器验证：**一次**推理拿到裁剪与镜像两行，特征相加归一化。
+- API 实启动，`/healthz` 200，`/monitor` 含两个新诊断格；monitor.html 脚本经 node 解析通过。
+
+### 仍未做（需要真机 / 真素材，本地无 GPU 无模型）
+
+- [ ] **T4 实测 `face_full` P95**：1280 档是唯一可能拖垮帧率的改动。
+      若 P95 增长到让 `processed_fps < required_sampling_hz × 3`，把
+      `PERSON_SEARCH_FACE_DEEP_SCAN_EVERY_N` 调到 2-3，而不是关掉大尺度。
+- [ ] **同距离复测**：`face_size_counts` 中 `48_63` 占比、
+      `rejection_counts.detection_score_low` 下降幅度、`associated > 0`、
+      `证据` 是否单调上升、`相机位移 p95`。
+- [ ] **走近 + 坐下两段**：确认档位徽标随尺寸变化但不抖动，
+      `association_counts.person_relaxed` 在坐姿段出现。
+- [ ] **用分布定阈值**（lessons 第四次要求）：`--dump-similarities` 跑正负两份素材，
+      按同人/异人分离点设 `tiny_face_similarity_threshold` /
+      `tiny_face_aggregate_similarity_threshold`。重叠严重就如实报告该距离不可用。
+- [ ] **误报回归**：本轮是放宽方向，且翻转 TTA 改变了嵌入数值，
+      `cos(new, old) = 1.0` 那条等价性判据**不再适用**。改为：正样本素材
+      `confirmed_events` 只允许增加且逐条人工确认；负样本素材两档均必须为 0。
+- [ ] **首次确认耗时**：用户说的「快」目前没有任何指标表达，需要手工记录中位耗时。
+- [ ] ROI 多裁剪批量 ONNX 推理（上一轮遗留，T4 上收益要先看实测）。

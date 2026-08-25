@@ -19,6 +19,8 @@ RTSP / USB
 
 InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近距离大脸，640 负责视频中的较小人脸。可用 `PERSON_SEARCH_FACE_DETECTION_SIZE` 强制单一尺寸，但通常不建议覆盖默认值。
 
+1080P 下 640 那一档会把 1920 压到 640（0.333×），画面里 49 px 的脸到网络输入只剩约 16 px，正好是 SCRFD stride-8 的锚点下限，检测分因此无论人脸多干净都到不了超小脸档要求的 `0.65`。CUDA 环境默认额外叠加 `1280` 尺度（`PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA`，`0` 关闭），SCRFD 会跨尺度合并候选。若面板上的 `face_full` P95 超出循环能吸收的范围，用 `PERSON_SEARCH_FACE_DEEP_SCAN_EVERY_N` 把大尺度降为隔轮深扫，而不是把它关掉。CPU 默认不叠加。
+
 登记照和视频帧使用不同门控：登记照至少需要 `0.60` 检测分，并保持严格的正脸姿态要求；视频检测从 `0.45` 开始，不因 roll/yaw 直接拒绝，而是将姿态作为质量软分。视频帧仍使用更严格的运动模糊过滤，避免低质量帧成为确认依据。`PERSON_SEARCH_MAX_ABS_ROLL_DEGREES` 和 `PERSON_SEARCH_MAX_YAW_PROXY` 只约束登记照。
 
 ### 机场场景识别规则
@@ -27,18 +29,26 @@ InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近�
 
 - 普通人脸（短边 `>= 80 px`）：相似度至少 `0.55`，在 `1.5 s` 内取得 `3` 帧证据后确认；确认前可以发布 `candidate` 事件。
 - 小人脸（短边 `64-79 px`）：相似度至少 `0.60`，在 `2 s` 内取得 `4` 帧证据后确认；为控制误报，不发布 `candidate` 事件。
-- 超小人脸（短边 `48-63 px`）：默认关闭；开启 `PERSON_SEARCH_TINY_FACE_ENABLED=true` 后，仅接受检测分 `>=0.65` 且严格关联到人体轨迹的脸，在 `3 s` 内取得 `6` 帧，至少 `5` 帧相似度 `>=0.64`，且质量加权聚合相似度 `>=0.68` 才命中。多目标时 Top1/Top2 差值还必须 `>=0.08`，不发布 `candidate`。默认 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true`，命中只发布 `tiny_shadow_confirmed` 诊断事件，不将目标标记为已找到。`PERSON_SEARCH_TINY_FACE_MIN_PX` 只允许向上收紧，不能配置到 `48` 以下。
+- 超小人脸（短边 `48-63 px`）：默认关闭；开启 `PERSON_SEARCH_TINY_FACE_ENABLED=true` 后，仅接受检测分 `>=0.65` 的脸，在 `3 s` 内取得 `6` 帧，至少 `5` 帧相似度 `>=0.64`，且质量加权聚合相似度 `>=0.68` 才命中。多目标时 Top1/Top2 差值还必须 `>=0.08`，不发布 `candidate`。默认 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true`，命中只发布 `tiny_shadow_confirmed` 诊断事件，不将目标标记为已找到。`PERSON_SEARCH_TINY_FACE_MIN_PX` 只允许向上收紧，不能配置到 `48` 以下。
 - 短边 `<48 px`：始终标记为 `face_too_small`，不进入身份确认。超小脸开关关闭时，`<64 px` 仍按原有逻辑拒绝。
+
+档位边界带迟滞（`PERSON_SEARCH_FACE_TIER_HYSTERESIS_PX`，默认 `6 px`）：离开当前档必须越过边界这么多像素。换档会清空证据窗口，而移动中的机器人会让同一张脸在 `48/64/80` 三条边界上反复穿越，没有迟滞时窗口永远填不满——面板上看起来是「证据恒为 0」，实际是档位在抖。当前生效的档位随每个目标一起上报，监控页直接显示。
+
+窗口统计量默认是**中位数**。中位数只对「不收集低分样本」的档位是恒真的（那些档位窗口里全是达标样本），真正起作用的地方是超小脸档——它按设计收集全部观测。`PERSON_SEARCH_MATCH_PROFILE=responsive` 会把超小脸档换成 `4` 帧 / `2 s` / 最佳 K 均值（K=3）/ 检测分 `0.55`，聚合门 `0.68` 两档都保留（它是最便宜的误报闸）。profile 只填写环境变量没有显式设置的字段，因此 `.env` 里的设定永远优先。**responsive 是拿误报换速度，标定完成前不要用它驱动机器人动作。**
 
 人脸与人体轨迹按以下顺序关联，避免把拥挤画面中的脸分配给错误旅客：
 
 1. 主规则检查人脸中心是否位于人体框的横向范围和上方 `60%` 区域；多个人体框同时满足时选择面积最小的包含框，事件中的 `association` 为 `person_strict`。
 2. 坐姿、遮挡或人体框截断导致主规则失败时，只有在人脸中心被唯一一个完整人体框包含的情况下才放宽关联，记为 `person_relaxed`；若同时落入多个人体框则拒绝猜测。
-3. 仍无法关联人体时，可用人脸框 IoU 建立短时兜底轨迹，轨迹 ID 为负数，记为 `face_fallback`。放宽关联和人脸兜底都使用更严格的 `0.60 / 4 帧 / 2 s` 策略；`48-63 px` 超小脸不允许走这两条兜底路径。
+3. 仍无法关联人体时，可用人脸框 IoU 建立短时兜底轨迹，轨迹 ID 为负数，记为 `face_fallback`。放宽关联和人脸兜底都使用更严格的 `0.60 / 4 帧 / 2 s` 策略——但只在该策略确实更严时才替换；`48-63 px` 超小脸的档位比它更严，不会被它放宽。超小脸**不允许**走 `face_fallback`（没有任何人体证据），但**允许** `person_relaxed`（`PERSON_SEARCH_TINY_FACE_ALLOW_RELAXED_ASSOCIATION`，默认开启）：坐姿和人体框截断正是这条路径，而它已经拒绝在多个人体框重叠时猜测归属。关掉它，「远处坐着」在结构上就不可能被确认。
+
+移动机器人会让整个画面一起位移，纯 IoU 关联把这读成「所有轨迹都丢了」，而新的 `track_id` 会让证据窗口从零开始——这是移动中召回上不去的一个独立原因。`PERSON_SEARCH_CAMERA_MOTION_COMPENSATION`（默认开启）在降采样灰度图上用相位相关估计全局平移，在 IoU 关联前施加到轨迹框上；面板的 `相机位移 p95` 用于判断是否需要升级到仿射估计。
+
+只有一张登记照时，`PERSON_SEARCH_EMBEDDING_FLIP_TTA`（默认开启）把每个裁剪与其水平镜像放进同一个批次、特征相加后归一化，登记侧和搜索侧走同一条实现。它抬高的是相似度分布本身，而不是降低门槛。
 
 批量搜索会区分“完整身份竞争集”和“仍待确认目标集”：目标找到后不再累计证据，但仍保留在 Top1/Top2 身份竞争中。已找到目标继续出现在画面时，其人脸不会降级分配给剩余目标。
 
-CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px` 合格人脸的人体轨迹都会独立进入头肩 ROI 候选，不会被画面中的无关近脸关闭；每轮最多检测 `8` 个人体上方 `50%` 区域，T4 默认 `4 Hz`，CPU 默认关闭。ROI 只能改善检测和关键点稳定性，不会增加原始身份纹理。
+CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px` 合格人脸的人体轨迹都会独立进入头肩 ROI 候选，不会被画面中的无关近脸关闭；每轮最多检测 `8` 个人体上方 `50%` 区域，T4 默认 `4 Hz`，CPU 默认关闭。ROI 检测尺度按裁剪大小自适应：小裁剪仍上采样到 `PERSON_SEARCH_ROI_FACE_DETECTION_SIZE`（默认 `320`），大裁剪不再被压回该值（上限 `PERSON_SEARCH_ROI_FACE_DETECTION_MAX_SIZE`，默认 `640`）。ROI 只能改善检测和关键点稳定性，不会增加原始身份纹理。
 
 ## 使用 uv 安装
 
@@ -436,12 +446,28 @@ uv run person-search-eval \
   --output-dir artifacts/airport-eval
 ```
 
-每个 case 会生成独立的 `annotated.mp4` 和 schema v2 `report.json`，根目录报告按尺寸档汇总召回率和平均/P95 确认延迟。`aggregate` 和 `recommended_similarity_threshold` 只统计真实生产确认；Shadow 命中使用 `shadow_confirmed` 状态并单独进入 `shadow_metrics` / `shadow_aggregate`，绝不会据此生成生产阈值推荐。只有生产整体召回率至少 90%、误确认不超过每小时 0.01 次，并累计至少 100 小时非目标视频时才推荐阈值；数据不足或没有阈值通过时不会给出生产推荐。评测会复用线上的 ROI、详细关联、尺寸分层和人脸兜底策略。
+每个 case 会生成独立的 `annotated.mp4` 和 schema v2 `report.json`，根目录报告按尺寸档汇总召回率和平均/P95 确认延迟。`aggregate` 和 `recommended_similarity_threshold` 只统计真实生产确认；Shadow 命中使用 `shadow_confirmed` 状态并单独进入 `shadow_metrics` / `shadow_aggregate`，绝不会据此生成生产阈值推荐。只有生产整体召回率至少 90%、误确认不超过每小时 0.01 次，并累计至少 100 小时非目标视频时才推荐阈值；数据不足或没有阈值通过时不会给出生产推荐。评测会复用线上的多尺度检测、深扫节奏、相机运动补偿、ROI、详细关联、尺寸分层和人脸兜底策略。
+
+### 用分布定阈值
+
+只数确认次数无法回答「这个距离到底能不能用」。加上 `--dump-similarities` 会额外写出 `similarities.json`（每个通过质量门的观测一行：尺寸、尺寸档、检测分、清晰度、档位、关联方式、相似度）以及报告中的 `similarity_distribution`：
+
+```bash
+uv run person-search-eval \
+  --manifest evaluation/manifest.json \
+  --dump-similarities \
+  --output-dir artifacts/calibration
+```
+
+区间标注不含逐脸真值，所以标签是**推导**出来的，报告里会写明这一点：落在任何 `expected_intervals_seconds` 之外的帧目标不在场，其中每张脸都算异人样本；落在区间内的帧只取该帧相似度最高的那张脸作为同人样本，其余不猜。
+
+`tiny_face_similarity_threshold` / `tiny_face_aggregate_similarity_threshold` 应落在同人与异人两个分布的分离点，而不是落在「刚好能确认」的位置。**若两个分布在 `48-63 px` 上重叠严重，正确结论是该距离在本场景不可用、需要机器人先靠近，而不是继续降阈值。**
 
 ## 当前边界
 
 - ArcFace 无法识别背身或不可见的人脸；当前要求上游提供方向正确的视频帧。ByteTrack 只在短时间内延续人体轨迹，人脸 IoU 兜底也只用于短时连续画面，不能替代 Person ReID。
 - `48-63 px` 超小脸功能默认关闭，必须先完成尺寸分桶正负样本标定，再保持 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true` 验证；只有验收通过后才可设为 `false` 并驱动机器人身份动作。
+- `PERSON_SEARCH_MATCH_PROFILE=responsive` 是拿误报换确认速度。标定完成前只能用于观察「能不能识别到」，不能驱动机器人动作。
 - 未实现 Person ReID 和活体检测，照片或屏幕重放可能命中。
 - `buffalo_l` 预训练模型仅限非商业研究用途。代码可以用于内部 PoC，但产品化或客户交付前必须取得模型授权或替换成权利清晰的模型。
 - 当前为单进程内存状态，只能使用一个 Uvicorn worker；多机器人扩展需要外部任务队列和状态存储。

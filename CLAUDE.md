@@ -16,7 +16,7 @@ Everything goes through `uv` (Python pinned to 3.11 — `enum.StrEnum` requires 
 uv sync --extra test                          # test deps only — enough for the whole test suite
 uv sync --extra test --extra inference-cpu    # adds insightface + onnxruntime for real inference
 
-uv run pytest                                 # 43 tests, ~2s, no models required
+uv run pytest                                 # 159 tests, ~5s, no models required
 uv run pytest tests/test_tracker.py           # single file
 uv run pytest tests/test_service.py::test_enroll_requires_exactly_one_face   # single test
 uv run ruff check .                           # line-length 100, target py311
@@ -55,11 +55,19 @@ This is the reason `confirmation.py` exists and the thing most likely to be brok
 
 - `evidence_required` (3) samples inside a sliding `evidence_window_seconds` (1.5s) window,
 - samples ≥0.2s apart and from distinct `frame_id`s (no double-counting one frame),
-- **median** similarity across the window ≥ `similarity_threshold`.
+- the window's **statistic** (`evidence_statistic`: `median`, or `top_k_mean` under
+  `match_profile=responsive`) ≥ `similarity_threshold`. Note the median gate is
+  structurally satisfied for tiers that refuse sub-threshold observations — the
+  statistic only bites on the far-face tier, which banks everything by design.
 
 Only then does state flip `candidate` → `confirmed`. `confirmed_track_grace_seconds` keeps a confirmed track alive briefly when the track or face drops out, then emits `lost`.
 
 Face→track association (`associate_faces_to_tracks`) requires the face center to fall in the **upper 60%** of a person box, and picks the *smallest* containing box as least ambiguous. At most one face — the highest quality one — feeds a track per frame.
+
+Two things exist purely to stop earned evidence from being thrown away, and both are easy to undo by accident:
+
+- **Tier hysteresis** (`face_tier_hysteresis_px`). Changing tier clears the evidence window; a moving camera sweeps one face across 48/64/80 px repeatedly. Leaving a tier costs a margin, and the tier is resolved once per track by the *session* (`_track_tiers`), not per target, because it is a property of the observation. `resolve_face_tier` is the only place that decides it.
+- **Camera motion compensation** (`camera_motion_compensation`). `ByteTracker._states`-keyed evidence dies with a track id, and pure IoU reads a pan as "every track lost". `service._estimate_camera_motion` estimates global translation with `cv2.phaseCorrelate` on a downscaled gray frame and `ByteTracker.update(detections, motion=...)` applies it before association. Velocity is measured between *observations* (`observed_bbox`), never against the already-advanced prediction.
 
 ### Enrollment and search gates are deliberately different
 
@@ -75,6 +83,8 @@ Face→track association (`associate_faces_to_tracks`) requires the face center 
 Video frames get the *stricter* blur gate because motion blur must not become confirmation evidence; enrollment photos tolerate mild soft focus. Pose limits (`max_abs_roll_degrees`, `max_yaw_proxy`) constrain enrollment only. Do not unify these thresholds.
 
 Similarly, `face_detection_size: int = 0` means InsightFace 1.x Auto mode (128 **and** 640 dual-scale). 128 catches close-up faces that a fixed 640 pass misses. `tests/test_backend_config.py` exists solely to pin this default — don't hardcode 640.
+
+On CUDA the full-frame pass adds a third, larger scale (`face_detection_extra_scale_cuda`, default 1280). This is not a tuning preference: on 1080p the 640 pass leaves a 49px face at ~16px at the network input, SCRFD's stride-8 anchor floor, so its `det_score` cannot reach the far tier's 0.65 no matter how clean the face is. SCRFD merges scales itself through NMS, so `detect_faces` passes a list and pays one call. `face_deep_scan_every_n` drops the large scale on all but every Nth pass when it costs more than the loop can absorb — the credit bucket stays the only budget mechanism.
 
 ### Threading and lifecycle
 

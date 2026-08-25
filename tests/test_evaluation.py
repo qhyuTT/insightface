@@ -5,10 +5,13 @@ import json
 import pytest
 
 from person_search.evaluation import (
+    FACE_PX_BUCKETS,
     aggregate_threshold_results,
+    face_px_bucket,
     load_manifest,
     recommend_threshold,
     summarize_events,
+    summarize_similarity_samples,
     threshold_key,
     validate_thresholds,
 )
@@ -329,3 +332,51 @@ def test_thresholds_must_be_unique_and_bounded() -> None:
         validate_thresholds([0.55, 0.55])
     with pytest.raises(ValueError, match="between"):
         validate_thresholds([1.1])
+
+
+def test_similarity_distribution_derives_labels_from_expected_intervals() -> None:
+    """Interval-labelled footage has no per-face truth, so the labels are derived."""
+    samples = [
+        # Inside the interval: the highest-scoring face of the frame is the target,
+        # the other one is a bystander and is left out rather than guessed at.
+        {"frame_id": 0, "timestamp_seconds": 0.5, "similarity": 0.71, "face_px_bucket": "48-55"},
+        {"frame_id": 0, "timestamp_seconds": 0.5, "similarity": 0.18, "face_px_bucket": "48-55"},
+        {"frame_id": 1, "timestamp_seconds": 0.9, "similarity": 0.66, "face_px_bucket": "48-55"},
+        # Outside every interval the target is absent, so every face is an impostor.
+        {"frame_id": 9, "timestamp_seconds": 5.0, "similarity": 0.33, "face_px_bucket": "64-79"},
+        {"frame_id": 9, "timestamp_seconds": 5.0, "similarity": 0.29, "face_px_bucket": "64-79"},
+    ]
+
+    summary = summarize_similarity_samples(samples, ((0.0, 1.0),))
+
+    assert summary["labelling"] == "derived_from_expected_intervals"
+    assert summary["observations"] == 5
+    assert summary["genuine"]["count"] == 2
+    assert summary["genuine"]["min"] == pytest.approx(0.66)
+    assert summary["impostor"]["count"] == 2
+    assert summary["impostor"]["max"] == pytest.approx(0.33)
+    assert summary["by_face_px_bucket"]["64-79"]["observations"] == 2
+
+
+def test_similarity_distribution_reports_when_it_cannot_label() -> None:
+    samples = [
+        {"frame_id": 0, "timestamp_seconds": 0.5, "similarity": 0.71, "face_px_bucket": "48-55"}
+    ]
+
+    summary = summarize_similarity_samples(samples, None)
+
+    # Saying "unlabelled" is the point: a distribution nobody can split into
+    # genuine and impostor cannot justify a threshold.
+    assert summary["labelling"] == "unlabelled"
+    assert summary["genuine"] == {"count": 0}
+    assert summary["impostor"] == {"count": 0}
+    assert summary["by_face_px_bucket"]["48-55"]["observations"] == 1
+
+
+def test_face_px_bucket_uses_the_manifest_vocabulary() -> None:
+    assert face_px_bucket(47) == "<48"
+    assert face_px_bucket(48) == "48-55"
+    assert face_px_bucket(56) == "56-63"
+    assert face_px_bucket(64) == "64-79"
+    assert face_px_bucket(80) == ">=80"
+    assert face_px_bucket(80) in FACE_PX_BUCKETS

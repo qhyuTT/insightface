@@ -30,9 +30,11 @@ from .evaluation import (
     MIN_INTERVAL_RECALL,
     MIN_NEGATIVE_EXPOSURE_HOURS,
     aggregate_threshold_results,
+    face_px_bucket,
     load_manifest,
     recommend_threshold,
     summarize_events,
+    summarize_similarity_samples,
     threshold_key,
     validate_thresholds,
 )
@@ -50,6 +52,14 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts/eval"))
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--thresholds", type=float, nargs="+", default=None)
+    parser.add_argument(
+        "--dump-similarities",
+        action="store_true",
+        help=(
+            "write per-observation similarities and a genuine/impostor distribution "
+            "summary, which is what a threshold should be set from"
+        ),
+    )
     args = parser.parse_args()
 
     if args.threshold is not None and args.thresholds is not None:
@@ -61,7 +71,12 @@ def main() -> None:
             parser.error("batch evaluation uses --thresholds")
         try:
             thresholds = validate_thresholds(args.thresholds or DEFAULT_EVAL_THRESHOLDS)
-            run_manifest(args.manifest, args.output_dir, thresholds)
+            run_manifest(
+                args.manifest,
+                args.output_dir,
+                thresholds,
+                dump_similarities=args.dump_similarities,
+            )
         except (TypeError, ValueError) as exc:
             parser.error(str(exc))
         return
@@ -83,10 +98,17 @@ def main() -> None:
         args.output_dir,
         thresholds=thresholds,
         name=args.name,
+        dump_similarities=args.dump_similarities,
     )
 
 
-def run_manifest(manifest_path: Path, output_dir: Path, thresholds: tuple[float, ...]) -> None:
+def run_manifest(
+    manifest_path: Path,
+    output_dir: Path,
+    thresholds: tuple[float, ...],
+    *,
+    dump_similarities: bool = False,
+) -> None:
     cases = load_manifest(manifest_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     case_results: list[dict[str, object]] = []
@@ -102,6 +124,7 @@ def run_manifest(manifest_path: Path, output_dir: Path, thresholds: tuple[float,
             expected_intervals=case.expected_intervals_seconds,
             expected_face_px_buckets=case.expected_face_px_buckets,
             print_summary=False,
+            dump_similarities=dump_similarities,
         )
         result["case_id"] = case.case_id
         case_results.append(result)
@@ -142,6 +165,7 @@ def run_offline(
     expected_intervals: tuple[tuple[float, float], ...] | None = None,
     expected_face_px_buckets: tuple[str | None, ...] | None = None,
     print_summary: bool = True,
+    dump_similarities: bool = False,
 ) -> dict[str, object]:
     if thresholds is not None and threshold is not None:
         raise ValueError("threshold and thresholds cannot both be set")
@@ -239,6 +263,9 @@ def run_offline(
     # the hysteresis margin against one answer.
     track_tiers: dict[int, str] = {}
     previous_motion_gray = None
+    # Raw per-observation rows for threshold calibration. Collected only on request:
+    # a long clip produces one row per accepted face per face pass.
+    similarity_samples: list[dict[str, object]] = []
     frame_id = 0
     started = time.monotonic()
     person_hz = (
@@ -335,6 +362,19 @@ def run_offline(
             track_tiers = {
                 key: value for key, value in track_tiers.items() if key in live_track_ids
             }
+            if dump_similarities:
+                similarity_samples.extend(
+                    _similarity_sample(
+                        face,
+                        frame_id=frame_id,
+                        timestamp=timestamp,
+                        target_embedding=target.embedding,
+                        tier=canonical_policies[face_index].tier,
+                        association=association_modes.get(face_index, "unassociated"),
+                    )
+                    for face_index, face in enumerate(accepted)
+                    if face.embedding is not None
+                )
 
             decisions_by_threshold = {}
             for key, confirmation in confirmations.items():
@@ -473,6 +513,11 @@ def run_offline(
         },
         "threshold_results": threshold_results,
     }
+    if dump_similarities:
+        summary["similarity_distribution"] = summarize_similarity_samples(
+            similarity_samples, expected_intervals
+        )
+        _write_report(output_dir / "similarities.json", {"samples": similarity_samples})
     if len(selected_thresholds) == 1:
         only_result = threshold_results[threshold_key(selected_thresholds[0])]
         summary.update(
@@ -612,3 +657,27 @@ def _write_report(path: Path, payload: dict[str, object]) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _similarity_sample(
+    face: FaceObservation,
+    *,
+    frame_id: int,
+    timestamp: float,
+    target_embedding: np.ndarray,
+    tier: str,
+    association: str,
+) -> dict[str, object]:
+    """One row of the calibration dump: everything a gate reads, plus the score."""
+    return {
+        "frame_id": frame_id,
+        "timestamp_seconds": timestamp,
+        "similarity": float(target_embedding @ face.embedding),
+        "face_px": face.short_side,
+        "face_px_bucket": face_px_bucket(face.short_side),
+        "detection_score": face.detection_score,
+        "blur_variance": face.blur_variance,
+        "quality": face.quality,
+        "tier": tier,
+        "association": association,
+    }

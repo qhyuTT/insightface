@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,24 @@ MAX_FALSE_CONFIRMATIONS_PER_HOUR = 0.01
 MIN_NEGATIVE_EXPOSURE_HOURS = 100.0
 FACE_PX_BUCKETS = {"<48", "48-55", "56-63", "64-79", ">=80"}
 _CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def face_px_bucket(short_side: int) -> str:
+    """Map a face's short side onto the manifest's bucket vocabulary.
+
+    The runtime diagnostics use their own coarser names (``48_63``); this is the
+    vocabulary the manifest and the calibration report speak, and the two must not
+    be conflated.
+    """
+    if short_side < 48:
+        return "<48"
+    if short_side < 56:
+        return "48-55"
+    if short_side < 64:
+        return "56-63"
+    if short_side < 80:
+        return "64-79"
+    return ">=80"
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,3 +377,76 @@ def _resolve_manifest_path(base_dir: Path, value: Any, case_id: str, field: str)
         raise ValueError(f"case {case_id} must have a {field} path")
     candidate = Path(value)
     return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
+
+
+def summarize_similarity_samples(
+    samples: list[dict[str, Any]],
+    expected_intervals: tuple[tuple[float, float], ...] | None,
+) -> dict[str, Any]:
+    """Split per-observation similarities into genuine and impostor distributions.
+
+    Interval-labelled footage carries no per-face ground truth, so the labels are
+    derived: outside every expected interval the target is absent, so *every* face
+    is an impostor; inside one, the highest-scoring face of that frame is taken as
+    the target and the rest are ignored rather than guessed at.
+
+    Without the two distributions a threshold can only be tuned until something
+    confirms, which tunes it to the wrong thing. If they overlap heavily, the
+    honest conclusion is that the distance is unusable in this scene -- that is a
+    result to report, not to threshold away.
+    """
+    impostor: list[float] = []
+    genuine_by_frame: dict[int, list[float]] = {}
+    for sample in samples:
+        if expected_intervals is None:
+            continue
+        timestamp = float(sample["timestamp_seconds"])
+        similarity = float(sample["similarity"])
+        if any(start <= timestamp <= end for start, end in expected_intervals):
+            genuine_by_frame.setdefault(int(sample["frame_id"]), []).append(similarity)
+        else:
+            impostor.append(similarity)
+    genuine = [max(values) for values in genuine_by_frame.values()]
+    return {
+        "labelling": (
+            "unlabelled" if expected_intervals is None else "derived_from_expected_intervals"
+        ),
+        "observations": len(samples),
+        "genuine": _distribution(genuine),
+        "impostor": _distribution(impostor),
+        "by_face_px_bucket": {
+            bucket: {
+                "observations": count,
+                "similarity": _distribution(
+                    [
+                        float(sample["similarity"])
+                        for sample in samples
+                        if sample["face_px_bucket"] == bucket
+                    ]
+                ),
+            }
+            for bucket, count in sorted(
+                Counter(str(sample["face_px_bucket"]) for sample in samples).items()
+            )
+        },
+    }
+
+
+def _distribution(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0}
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "p05": _quantile(ordered, 0.05),
+        "p50": _quantile(ordered, 0.50),
+        "p95": _quantile(ordered, 0.95),
+        "max": ordered[-1],
+        "mean": sum(ordered) / len(ordered),
+    }
+
+
+def _quantile(ordered: list[float], quantile: float) -> float:
+    index = min(len(ordered) - 1, max(0, math.ceil(quantile * len(ordered)) - 1))
+    return ordered[index]

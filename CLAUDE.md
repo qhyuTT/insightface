@@ -79,10 +79,13 @@ Two things exist purely to stop earned evidence from being thrown away, and both
 | min face px | 100 | 80 |
 | min blur variance | 5.0 (lenient) | 45.0 (**stricter**) |
 | roll / yaw gates | enforced | not enforced (pose only feeds the soft score) |
+| detector scale | `enrollment_detection_size` (0 → Auto 128+640) | `face_detection_size` (1280 in production) |
 
 Video frames get the *stricter* blur gate because motion blur must not become confirmation evidence; enrollment photos tolerate mild soft focus. Pose limits (`max_abs_roll_degrees`, `max_yaw_proxy`) constrain enrollment only. Do not unify these thresholds.
 
-Similarly, `face_detection_size: int = 0` means InsightFace 1.x Auto mode (128 **and** 640 dual-scale). 128 catches close-up faces that a fixed 640 pass misses. `tests/test_backend_config.py` exists solely to pin this default — don't hardcode 640.
+The scale row is the same asymmetry and was learned the hard way. SCRFD upscales whatever it is handed to fill the input, with no ceiling, so a scale tuned for far faces destroys close-up recall: on a lone 1280 pass a portrait filling ≥45% of frame height is **missed outright** (measured MISS at 0.45–0.9, against 0.865–0.905 on Auto), because past ~500px at the network input the face overshoots the stride-32 anchors. Enrollment therefore resolves its own scales in `detect_faces` rather than letting `input_size=None` fall through to `prepare()` — that fallback is exactly how a search-side `PERSON_SEARCH_FACE_DETECTION_SIZE=1280` once turned every enrollment into `no_face`.
+
+Similarly, `face_detection_size: int = 0` means InsightFace 1.x Auto mode (128 **and** 640 dual-scale). 128 catches close-up faces that a fixed 640 pass misses. `tests/test_backend_config.py` exists solely to pin this default — don't hardcode 640. Note it is the **search** scale only: production pins it to 1280 and enrollment must not follow, per the table above.
 
 `face_detection_extra_scale_cuda` (default 1280) appends a larger scale on CUDA; SCRFD merges scales itself through NMS, so `detect_faces` passes a list and pays one call. But measured on a T4, **every distinct ONNX input shape costs ~30ms of re-planning**, which dwarfs the scale's own inference (1280 alone 53ms, 640 alone 18ms, 320 alone 5ms). So `[128,640]` costs 108ms and `[128,640,1280]` costs 181ms, while `[1280]` alone costs 57ms *and* scores higher at every face size (0.69 at a 21px face where `[128,640]` misses entirely; 0.82 against 0.75 at 52px). Production therefore *replaces* the scale — `PERSON_SEARCH_FACE_DETECTION_SIZE=1280` in `deploy_t4.sh` — rather than adding one. Same reason `roi_detection_scale` quantizes onto two rungs instead of rounding per crop: adaptive per-crop scales measured 233ms/pass against 136ms quantized. If you are tempted to add a scale, measure the shape-switch cost first; `face_deep_scan_every_n` is the escape hatch when a large scale must be amortised.
 

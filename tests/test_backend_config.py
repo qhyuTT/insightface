@@ -110,6 +110,56 @@ def test_resolve_input_size_maps_one_scale_or_many_onto_scrfd() -> None:
     assert _resolve_input_size([0]) is None
 
 
+class _RecordingDetector:
+    """Records the input_size SCRFD would actually be called with."""
+
+    def __init__(self) -> None:
+        self.input_sizes: list[object] = []
+
+    def detect(self, frame, input_size=None, max_num=0):
+        self.input_sizes.append(input_size)
+        return np.empty((0, 5), dtype=np.float32), None
+
+
+def _detect_scales(settings: Settings, *, enrollment: bool, detection_size=None) -> object:
+    backend = InsightFaceBackend(settings)
+    detector = _RecordingDetector()
+    backend._app = SimpleNamespace(det_model=detector)
+    backend.detect_faces(
+        np.zeros((1280, 960, 3), dtype=np.uint8),
+        enrollment=enrollment,
+        detection_size=detection_size,
+    )
+    return detector.input_sizes[0]
+
+
+def test_enrollment_keeps_auto_scales_when_search_pins_a_large_one() -> None:
+    """A 1280 search scale must not follow the enrollment photo into the detector.
+
+    SCRFD upscales to fill its input with no ceiling, so on a single 1280 pass a
+    frame-filling portrait overshoots the stride-32 anchors and is missed outright
+    (measured: MISS from 0.45 frame-height up, against 0.865-0.905 on Auto). The
+    detector used to inherit this scale through prepare(), which broke enrollment.
+    """
+    resolved = _detect_scales(Settings(face_detection_size=1280), enrollment=True)
+
+    assert resolved == [(128, 128), (640, 640)]
+
+
+def test_search_pass_is_unaffected_by_the_enrollment_scale() -> None:
+    # A search pass passes its scales explicitly and must keep doing so.
+    assert _detect_scales(Settings(face_detection_size=1280), enrollment=False) is None
+    assert _detect_scales(
+        Settings(enrollment_detection_size=320), enrollment=False, detection_size=[1280]
+    ) == [(1280, 1280)]
+
+
+def test_enrollment_scale_is_overridable_and_explicit_arguments_win() -> None:
+    assert _detect_scales(Settings(enrollment_detection_size=640), enrollment=True) == [(640, 640)]
+    # An explicit argument still wins, so an ROI caller keeps control of its crop.
+    assert _detect_scales(Settings(), enrollment=True, detection_size=320) == (320, 320)
+
+
 def _landmarked_face() -> FaceObservation:
     return FaceObservation(
         bbox=np.asarray([100, 100, 160, 160], dtype=np.float32),

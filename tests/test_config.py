@@ -71,6 +71,15 @@ def test_full_frame_detection_scales_add_the_large_pass_only_on_cuda() -> None:
     ) == (128, 640)
 
 
+def test_enrollment_scales_stay_on_auto_whatever_search_pins() -> None:
+    assert Settings().enrollment_detection_scales() == (128, 640)
+    # Production pins 1280 for search frames. An enrollment photo is a close-up, and
+    # a lone large scale upscales it past SCRFD's stride-32 anchors into a miss, so
+    # the search setting must not reach this pass.
+    assert Settings(face_detection_size=1280).enrollment_detection_scales() == (128, 640)
+    assert Settings(enrollment_detection_size=640).enrollment_detection_scales() == (640,)
+
+
 def test_roi_detection_scale_upsamples_small_crops_and_never_shrinks_large_ones() -> None:
     settings = Settings(roi_face_detection_size=320, roi_face_detection_max_size=640)
 

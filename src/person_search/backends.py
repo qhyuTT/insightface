@@ -98,10 +98,20 @@ class InsightFaceBackend:
         enrollment: bool = False,
         detection_size: int | Sequence[int] | None = None,
     ) -> list[FaceObservation]:
-        """Run detection and quality only. The embedding is deferred to embed_faces()."""
+        """Run detection and quality only. The embedding is deferred to embed_faces().
+
+        An enrollment pass resolves its own scales instead of letting ``input_size``
+        fall through to whatever ``prepare()`` configured. That fallback is how the
+        search-side ``face_detection_size`` silently became the enrollment scale, and
+        a single large scale misses the close-up a portrait always is -- see
+        ``Settings.enrollment_detection_scales``. An explicit argument still wins, so
+        callers that know their crop keep full control.
+        """
         self.ensure_ready()
         app = self._app
         assert app is not None
+        if detection_size is None and enrollment:
+            detection_size = list(self.settings.enrollment_detection_scales())
         input_size = _resolve_input_size(detection_size)
         with self._lock:
             bboxes, kpss = app.det_model.detect(frame, input_size=input_size, max_num=0)

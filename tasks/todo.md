@@ -385,6 +385,49 @@ clone 后 `git fetch <bundle>` + `merge --ff-only`，`models/yolox_tiny.onnx` �
 `0.75 → 0.82` 的分数抬升与更稳的关键点，不是「从无到有」——计划里把两者混为
 一谈，高估了这一刀的收益。
 
+### 回归修复：`FACE_DETECTION_SIZE=1280` 打死了人脸登记
+
+用户反馈「人脸登记无法使用，检测不到人脸」。是上一条部署引入的回归，已定位、实测
+复现并修好。
+
+根因是那个变量有**两个消费者，只测了一个**。搜索路径显式传尺度（`[1280]`，测过）；
+登记路径 `analyze(enrollment=True)` 传 `detection_size=None`，SCRFD 回落到
+`prepare()` 设的 `input_sizes`，于是登记也跑在从未测过的单档 1280 上。而 SCRFD 会把
+图**放大**到输入尺寸且无上限，脸在网络输入上超过约 500px 就越过 stride-32 锚点上限，
+**整脸漏检**。登记照按定义是近距离大脸，所以必然失败，不是偶发。
+
+用真人脸贴入画布实测（`buffalo_l`，CPU）：
+
+| 画布 / 占高 | 脸 px | `auto[128,640]` | `[640]` | `[1280]` |
+|---|---|---|---|---|
+| 960×1280 / 0.75 | 960 | 0.905 | 0.721 | **MISS** |
+| 960×1280 / 0.60 | 768 | 0.873 | 0.844 | **MISS** |
+| 960×1280 / 0.45 | 576 | 0.865 | 0.865 | **MISS** |
+| 1920×1080 / 0.90 | 972 | 0.885 | 0.885 | **MISS** |
+
+端到端复现与修复后对比（同一张人像，`face_detection_size=1280`）：
+
+```
+修复前: EnrollmentError: no face detected  code=no_face
+修复后: OK 482x661px det=0.867 q=0.927   （搜索尺度仍为 (1280,)）
+```
+
+修法：登记不再继承搜索尺度。新增 `enrollment_detection_size`（0 = Auto 128+640），
+`detect_faces` 在 `enrollment=True` 且未显式传尺度时自行解析，不再依赖 `prepare()`
+回落；显式传参仍然优先，ROI 通道不受影响。1280 对搜索的实测收益全部保留。
+
+- [x] `config.py`：`enrollment_detection_size` + `enrollment_detection_scales()`
+- [x] `backends.py`：`detect_faces` 登记路径显式传尺度
+- [x] 回归测试按「生产配置下断言行为」写，不再只钉默认值（163 passed）
+- [x] `CLAUDE.md` 登记/搜索差异表加尺度行；`.env.example`；`lessons.md` 三条
+
+**已知边界，未动**：搜索侧单档 1280 对占 1080p 画面高度 ≥65% 的脸同样漏检。机器人
+工作距离的脸是 100–300px，不在该区间，近距离行人另有 ROI（320/640）兜底。按本文件
+第 44 条，加尺度前必须先量形状切换成本，所以这里只记录不顺手改。
+
+- [ ] **真机复测登记**：在 .60 用真实登记照走一遍 `POST /v1/targets`，确认返回
+      `face_width/face_height` 与 `detection_score`，而不是 `no_face`。
+
 ### 仍未做（需要真机 RTSP + 画面里有人）
 - [ ] **同距离复测**：`face_size_counts` 中 `48_63` 占比、
       `rejection_counts.detection_score_low` 下降幅度、`associated > 0`、

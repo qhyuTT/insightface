@@ -40,7 +40,13 @@ class Settings(BaseSettings):
     prefer_cuda: bool = True
     # 0 uses InsightFace 1.x Auto mode: 128x128 + 640x640. The small pass is
     # important for close-up faces that can be missed by a fixed 640x640 pass.
+    # This is the *search* scale. Enrollment does not read it -- see
+    # enrollment_detection_size, which stays on Auto whatever this is set to.
     face_detection_size: int = 0
+    # Enrollment photos are close-ups, so they need their own scale rather than the
+    # search scale: 0 keeps Auto's 128+640. Only override with measurements taken on
+    # real enrollment photos, not on the far faces face_detection_size is tuned for.
+    enrollment_detection_size: int = Field(default=0, ge=0)
     # An extra, larger full-frame scale. On 1080p the 640 pass shrinks a 49px face
     # to ~16px at the network input -- the stride-8 anchor floor -- so its
     # det_score cannot reach the far-face tier's bar however clean the face is.
@@ -184,6 +190,24 @@ class Settings(BaseSettings):
         """Return the configured search limit without crossing the safety floor."""
         configured = self.tiny_face_min_px if self.tiny_face_enabled else self.min_search_face_px
         return max(HARD_MIN_SEARCH_FACE_PX, configured)
+
+    def enrollment_detection_scales(self) -> tuple[int, ...]:
+        """Return the detector input scales for an enrollment photo, ascending.
+
+        Deliberately independent of ``face_detection_size``. That setting is tuned
+        against *search* frames, where the face is far away and a single large scale
+        wins; an enrollment photo is a close-up by definition, and SCRFD upscales
+        whatever it is given to fill the input, with no ceiling. Past roughly 500px
+        at the network input a face overshoots the stride-32 anchors and is missed
+        outright -- so ``PERSON_SEARCH_FACE_DETECTION_SIZE=1280`` (what production
+        pins for search) makes an ordinary portrait undetectable: measured MISS at
+        every frame fraction from 0.45 up, against 0.865-0.905 on Auto. The 128 pass
+        is what shrinks a frame-filling face back under the anchor ceiling, which is
+        why enrollment must keep the dual-scale default whatever search uses.
+        """
+        if self.enrollment_detection_size > 0:
+            return (self.enrollment_detection_size,)
+        return AUTO_DETECTION_SCALES
 
     def full_frame_detection_scales(self, *, is_cuda: bool, deep: bool = True) -> tuple[int, ...]:
         """Return the detector input scales for one full-frame pass, ascending.

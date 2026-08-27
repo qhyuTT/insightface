@@ -365,6 +365,7 @@ FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时�
 - `GET /v1/searches/{search_id}`：查询状态、provider、FPS、P95 延迟和累计人脸诊断计数。
 - `GET /v1/searches/{search_id}/preview.mjpg`：获取后端画框后的实时 MJPEG 预览。
 - `WS /v1/searches/{search_id}/events?after_seq=0`：订阅 `candidate`、`confirmed`、`lost` 和 `search_status`。
+- `GET /v1/searches/{search_id}/evidence/{evidence_id}?variant=face_crop`：在命中后拉取短时有效的命中人脸裁剪；`variant=frame` 可拉取同一时刻原始帧。请求必须带 `X-API-Key`，并配置 `PERSON_SEARCH_EVIDENCE_API_KEY`。
 - `DELETE /v1/searches/{search_id}`：停止任务并清除登记数据。
 
 搜索请求示例：
@@ -413,6 +414,18 @@ curl -X POST http://127.0.0.1:8000/v1/batch-searches \
 接口立即返回 `search_id`。每个目标首次确认后发布 `target_found`，并从后续匹配名单中移除；
 其他未找到目标继续搜索。全部找到后发布 `all_found` 并进入 `completed`。可选的
 `timeout_seconds` 超时后会进入 `timed_out`，查询响应中的 `unfound_target_ids` 给出未找到名单。
+
+### 命中证据交接
+
+正式 `confirmed`（及其后续的 `target_found`）事件可能带有不透明的 `data.evidence_id`。执行器仅把
+对应的 JPEG 原始帧和人脸裁剪保存在进程内存，默认最长 120 秒；证据绝不写入日志、事件 payload、磁盘或数据库。
+控制面应在收到 `confirmed` 后立即使用其共享密钥拉取裁剪，随后自行按隐私策略加密保存。任务被停止、完成、超时或失败时，执行器会立即清空全部证据，因此终态补发的 `target_found` 中的 ID 仅可用于关联，不能再下载图片。
+
+```bash
+curl -H "X-API-Key: $PERSON_SEARCH_EVIDENCE_API_KEY" \
+  'http://127.0.0.1:8000/v1/searches/SEARCH_ID/evidence/EVIDENCE_ID?variant=face_crop' \
+  --output matched-face.jpg
+```
 
 ## 离线视频验证
 

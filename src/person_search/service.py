@@ -124,6 +124,15 @@ class PreviewHub:
             return self._subscribers > 0
 
 
+@dataclass(frozen=True, slots=True)
+class _EvidenceItem:
+    """Encoded evidence that is never persisted or included in event payloads."""
+
+    frame_jpeg: bytes
+    face_crop_jpeg: bytes
+    expires_at: float
+
+
 @dataclass
 class SearchSession:
     search_id: str
@@ -205,6 +214,7 @@ class SearchSession:
         self._finished = threading.Event()
         self._stop_requested = False
         self._deferred_events: list[tuple[str, dict[str, Any]]] = []
+        self._evidence: dict[str, _EvidenceItem] = {}
 
     def start(self) -> None:
         self._worker = threading.Thread(
@@ -219,6 +229,7 @@ class SearchSession:
     def stop(self, timeout: float = STOP_WAIT_SECONDS) -> None:
         self._stop.set()
         self._stop_requested = True
+        self.clear_evidence()
         self._transition(SearchStatus.STOPPING, None)
         if self._reader:
             self._reader.stop()
@@ -228,6 +239,52 @@ class SearchSession:
             and not self._finished.wait(timeout=timeout)
         ):
             raise SearchStopTimeoutError("搜索线程未能在停止时限内退出；请稍后重试或重启识别服务")
+
+    def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
+        """Return a single short-lived image held exclusively in process memory."""
+        with self._lock:
+            item = self._evidence.get(evidence_id)
+            if item is None or item.expires_at <= time.monotonic() or self._stop.is_set():
+                self._evidence.pop(evidence_id, None)
+                raise PersonSearchError(
+                    "evidence not found", code="evidence_not_found", status_code=404
+                )
+            if variant == "frame":
+                return item.frame_jpeg, "image/jpeg"
+            if variant == "face_crop":
+                return item.face_crop_jpeg, "image/jpeg"
+        raise PersonSearchError(
+            "evidence variant must be frame or face_crop",
+            code="invalid_evidence_variant",
+            status_code=422,
+        )
+
+    def clear_evidence(self) -> None:
+        with self._lock:
+            self._evidence.clear()
+
+    def _store_evidence(self, frame: np.ndarray, bbox: np.ndarray) -> str | None:
+        """JPEG-encode the confirmation frame and face crop without touching disk."""
+        x1, y1, x2, y2 = (round(value) for value in bbox)
+        height, width = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(width, x2), min(height, y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        frame_ok, frame_jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        crop_ok, crop_jpeg = cv2.imencode(
+            ".jpg", frame[y1:y2, x1:x2], [cv2.IMWRITE_JPEG_QUALITY, 92]
+        )
+        if not frame_ok or not crop_ok:
+            return None
+        evidence_id = str(uuid.uuid4())
+        with self._lock:
+            self._evidence[evidence_id] = _EvidenceItem(
+                frame_jpeg=frame_jpeg.tobytes(),
+                face_crop_jpeg=crop_jpeg.tobytes(),
+                expires_at=time.monotonic() + self.settings.evidence_ttl_seconds,
+            )
+        return evidence_id
 
     def view(self) -> SearchView:
         with self._lock:
@@ -636,7 +693,7 @@ class SearchSession:
                             self.metrics.match_stage_counts.get("evidence_collected", 0)
                             + confirmation_result.evidence_collected
                         )
-                    self._handle_decisions(target_id, target, decisions, packet.frame.shape)
+                    self._handle_decisions(target_id, target, decisions, packet.frame)
                     progress = confirmation.track_progress(target)
                     if progress:
                         # Rank by qualifying samples, not banked ones: under
@@ -791,10 +848,11 @@ class SearchSession:
         target_id: str,
         target: Target | None,
         decisions: list,
-        frame_shape: tuple[int, ...],
+        frame: np.ndarray | tuple[int, ...],
     ) -> None:
         if target is None:
             return
+        frame_shape = frame.shape if isinstance(frame, np.ndarray) else frame
         for decision in decisions:
             event = SearchEvent(
                 search_id=self.search_id,
@@ -810,7 +868,15 @@ class SearchSession:
                 model=self.face_backend.model_name,
                 association=decision.association,
             )
-            payload = event.model_dump(mode="json")
+            payload = event.model_dump(mode="json", exclude_none=True)
+            if (
+                not decision.shadow
+                and decision.state.value == "confirmed"
+                and isinstance(frame, np.ndarray)
+            ):
+                evidence_id = self._store_evidence(frame, decision.bbox)
+                if evidence_id is not None:
+                    payload["evidence_id"] = evidence_id
             if decision.shadow:
                 event_type = f"tiny_shadow_{decision.state.value}"
                 payload["state"] = event_type.removeprefix("tiny_")
@@ -1169,6 +1235,13 @@ class SearchSession:
                 return
             self.status = status
             self.error = error
+        if status in {
+            SearchStatus.STOPPED,
+            SearchStatus.FAILED,
+            SearchStatus.COMPLETED,
+            SearchStatus.TIMED_OUT,
+        }:
+            self.clear_evidence()
         if publish:
             self.events.publish(
                 "search_status",

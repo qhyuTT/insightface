@@ -13,6 +13,9 @@ T4_PIP_INDEX_URL="${T4_PIP_INDEX_URL:-}"
 T4_PIP_INDEX_CANDIDATES="${T4_PIP_INDEX_CANDIDATES-https://mirrors.aliyun.com/pypi/simple https://mirrors.ustc.edu.cn/pypi/simple https://pypi.org/simple}"
 T4_ORT_VERSION="${T4_ORT_VERSION:-1.23.2}"
 T4_BIND_HOST="${T4_BIND_HOST:-127.0.0.1}"
+# Enables GET /v1/searches/{id}/evidence/{id}. Must match the dispatch platform's
+# DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY, or every confirmed hit loses its face crop.
+T4_EVIDENCE_API_KEY="${T4_EVIDENCE_API_KEY:-}"
 T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
 # conservative keeps the calibrated far-face bar; responsive trades false-accept
 # headroom for a faster verdict and should wait for a calibrated threshold.
@@ -185,6 +188,9 @@ fi
 docker volume create "${T4_MODEL_VOLUME}" >/dev/null
 
 log "Starting ${T4_CONTAINER_NAME} with host networking"
+if [[ -z "${T4_EVIDENCE_API_KEY}" ]]; then
+  log "WARNING: T4_EVIDENCE_API_KEY is empty; the confirmed-hit evidence endpoint will return 503"
+fi
 docker run --detach \
   --gpus all \
   --restart unless-stopped \
@@ -199,6 +205,7 @@ docker run --detach \
   --env "PERSON_SEARCH_FACE_DETECTION_SIZE=${T4_FACE_DETECTION_SIZE}" \
   --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}" \
   --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}" \
+  --env "PERSON_SEARCH_EVIDENCE_API_KEY=${T4_EVIDENCE_API_KEY}" \
   "${T4_IMAGE_NAME}" >/dev/null
 
 log "Waiting for API health check"

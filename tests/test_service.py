@@ -842,6 +842,60 @@ def test_tiny_face_does_not_use_face_only_fallback(monkeypatch) -> None:
     assert session.view().association_counts == {}
 
 
+def test_confirmed_event_keeps_frame_and_crop_only_until_search_stops() -> None:
+    target_view = TargetView(
+        target_id="target-evidence",
+        name="Evidence 目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        "target-evidence", np.asarray([1.0, 0.0], dtype=np.float32), target_view, "Evidence 目标"
+    )
+    session = SearchSession(
+        search_id="search-evidence",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(evidence_ttl_seconds=60),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    frame = np.full((160, 160, 3), 127, dtype=np.uint8)
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [
+            MatchDecision(
+                state=MatchState.CONFIRMED,
+                track_id=7,
+                bbox=np.asarray([20, 30, 120, 140], dtype=np.float32),
+                similarity=0.75,
+                quality=0.8,
+                evidence_count=3,
+                association="person_strict",
+                shadow=False,
+            )
+        ],
+        frame,
+    )
+
+    confirmed = session.events.after(0, timeout=0)[0]
+    evidence_id = confirmed["data"]["evidence_id"]
+    crop, crop_type = session.get_evidence(evidence_id, "face_crop")
+    full_frame, frame_type = session.get_evidence(evidence_id, "frame")
+    assert crop_type == frame_type == "image/jpeg"
+    assert len(crop) > 0
+    assert len(full_frame) > len(crop)
+
+    session.stop(timeout=0)
+    with pytest.raises(PersonSearchError, match="evidence not found"):
+        session.get_evidence(evidence_id, "face_crop")
+
+
 def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:
     manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
     target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")

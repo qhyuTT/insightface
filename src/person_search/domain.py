@@ -153,6 +153,9 @@ class SearchEvent(BaseModel):
     evidence_count: int
     model: str
     association: str = "person_strict"
+    # Opaque, short-lived reference to evidence held only by this executor. It
+    # is intentionally not an image URL and has no meaning after the task ends.
+    evidence_id: str | None = None
 
 
 @dataclass(slots=True)

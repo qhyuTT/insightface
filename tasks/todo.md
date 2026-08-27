@@ -1,5 +1,12 @@
 # 提升 SearchSession 处理帧率
 
+## 命中证据内存交接
+
+- [x] `service.py`：正式 `confirmed` 时编码原始帧和人脸裁剪，仅短时保存在进程内存，并在停止/终态立即清除。
+- [x] `domain.py`：`confirmed` / `target_found` payload 支持不透明 `evidence_id`，不嵌入图片。
+- [x] `api.py`：新增 `GET /v1/searches/{search_id}/evidence/{evidence_id}`，要求 `PERSON_SEARCH_EVIDENCE_API_KEY` 的 `X-API-Key`；支持 `face_crop`（默认）和 `frame`。
+- [x] 覆盖确认、读取、清除和 API 鉴权测试；图片不落日志、磁盘、fixture 或仓库。
+
 计划：`~/.claude/plans/rtsp-admin-kaiya-4012-192-168-30-26-8554-reflective-snail.md`
 
 ## 背景

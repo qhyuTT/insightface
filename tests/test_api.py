@@ -233,3 +233,33 @@ def test_search_can_be_reconciled_by_request_id_after_terminal_state(monkeypatch
         missing = client.get("/v1/searches/by-request/does-not-exist")
         assert missing.status_code == 200
         assert missing.json() is None
+
+
+def test_evidence_endpoint_requires_key_and_never_sets_cache_headers() -> None:
+    class EvidenceSession:
+        def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
+            assert evidence_id == "opaque-evidence-id"
+            assert variant == "face_crop"
+            return b"jpeg-evidence", "image/jpeg"
+
+    class EvidenceManager:
+        def get_session(self, search_id: str) -> EvidenceSession:
+            assert search_id == "search-evidence"
+            return EvidenceSession()
+
+        def shutdown(self) -> None:
+            pass
+
+    settings = Settings(evidence_api_key="test-evidence-key")
+    with TestClient(create_app(settings, EvidenceManager())) as client:  # type: ignore[arg-type]
+        rejected = client.get("/v1/searches/search-evidence/evidence/opaque-evidence-id")
+        assert rejected.status_code == 403
+
+        response = client.get(
+            "/v1/searches/search-evidence/evidence/opaque-evidence-id",
+            headers={"X-API-Key": "test-evidence-key"},
+        )
+    assert response.status_code == 200
+    assert response.content == b"jpeg-evidence"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"

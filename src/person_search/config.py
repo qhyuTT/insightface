@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "info"
+    # Evidence is intentionally an opt-in, short-lived in-memory hand-off. The
+    # executor does not expose a face image unless its caller configured a
+    # separate shared credential.
+    evidence_api_key: str | None = None
+    evidence_ttl_seconds: float = Field(default=120.0, gt=0, le=3600)
 
     insightface_model: str = "buffalo_l"
     insightface_root: Path = Path("~/.insightface").expanduser()

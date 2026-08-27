@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     Request,
     Response,
     UploadFile,
@@ -261,6 +263,37 @@ def create_app(
     @app.get("/v1/searches/{search_id}", response_model=SearchView)
     async def get_search(search_id: str) -> SearchView:
         return manager.get_search(search_id)
+
+    @app.get("/v1/searches/{search_id}/evidence/{evidence_id}")
+    async def get_evidence(
+        search_id: str,
+        evidence_id: str,
+        variant: str = "face_crop",
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        """Fetch a short-lived, in-memory confirmation image.
+
+        The opaque id is delivered only in a confirmed event.  No image is
+        embedded in events or written to a file, log, or persistence layer.
+        """
+        if not settings.evidence_api_key:
+            raise PersonSearchError(
+                "evidence retrieval is not configured",
+                code="evidence_access_not_configured",
+                status_code=503,
+            )
+        if x_api_key is None or not hmac.compare_digest(x_api_key, settings.evidence_api_key):
+            raise PersonSearchError(
+                "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
+            )
+        payload, media_type = await asyncio.to_thread(
+            manager.get_session(search_id).get_evidence, evidence_id, variant
+        )
+        return Response(
+            content=payload,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     @app.get(
         "/v1/searches/{search_id}/preview.mjpg",

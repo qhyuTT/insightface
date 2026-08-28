@@ -14,15 +14,42 @@ HARD_MIN_SEARCH_FACE_PX = 48
 # insightface.app.face_analysis.DEFAULT_DET_SIZES.
 AUTO_DETECTION_SCALES = (128, 640)
 
-# The "responsive" profile trades false-accept headroom for time-to-confirmation.
-# It only fills in fields the operator did not set explicitly, so an env override
-# always wins over the profile.
-RESPONSIVE_PROFILE_OVERRIDES: dict[str, object] = {
-    "tiny_face_evidence_required": 4,
-    "tiny_face_evidence_window_seconds": 2.0,
-    "tiny_face_consistent_votes_required": 3,
-    "tiny_face_detection_threshold": 0.55,
-    "evidence_statistic": "top_k_mean",
+# Named bundles of evidence settings, one per deployment scene. A profile only
+# fills in fields the operator did not set explicitly, so an env override always
+# wins over the profile -- it is a set of defaults, never an override.
+#
+# "responsive" trades false-accept headroom for time-to-confirmation.
+#
+# "transit" is for a hall where the subject walks past rather than lingers: it
+# shortens the far-face window and drops the minimum gap between samples, so a
+# short dwell can still fill a window. Its numbers are UNCALIBRATED -- they are
+# deliberately no looser than "responsive" on any similarity threshold, because
+# choosing a threshold without a same-person/different-person distribution is
+# just writing false accepts into a default. Measure with
+# `person-search-eval --dump-similarities` and override per field from the
+# environment.
+MATCH_PROFILE_OVERRIDES: dict[str, dict[str, object]] = {
+    "conservative": {},
+    "responsive": {
+        "tiny_face_evidence_required": 4,
+        "tiny_face_evidence_window_seconds": 2.0,
+        "tiny_face_consistent_votes_required": 3,
+        "tiny_face_detection_threshold": 0.55,
+        "evidence_statistic": "top_k_mean",
+    },
+    "transit": {
+        "tiny_face_evidence_required": 4,
+        "tiny_face_evidence_window_seconds": 2.0,
+        "tiny_face_consistent_votes_required": 3,
+        "tiny_face_detection_threshold": 0.55,
+        "evidence_statistic": "top_k_mean",
+        # A walker is frame-starved, not sample-redundant: consecutive frames are
+        # genuinely different looks at a moving face, so the 0.2s spacing that
+        # keeps a *stationary* subject from banking the same pose six times is
+        # pure loss here. Duplicate frames are already refused by frame_id.
+        "evidence_min_interval_seconds": 0.1,
+        "tiny_face_evidence_min_interval_seconds": 0.1,
+    },
 }
 
 
@@ -101,13 +128,18 @@ class Settings(BaseSettings):
     tiny_face_consistent_votes_required: int = Field(default=5, ge=1)
     tiny_face_evidence_window_seconds: float = Field(default=3.0, gt=0)
     tiny_face_evidence_min_interval_seconds: float = Field(default=0.2, ge=0)
+    # Minimum gap between two banked samples on one track, for the normal and small
+    # tiers. It buys temporal diversity, not de-duplication -- one frame can never
+    # be banked twice, that is enforced by frame_id. Lower it when the subject
+    # moves through frame too fast to supply spaced-out samples.
+    evidence_min_interval_seconds: float = Field(default=0.2, ge=0)
     tiny_face_min_top1_margin: float = Field(default=0.08, ge=0.0, le=2.0)
     # A far face that only reaches the relaxed association path (exactly one person
     # box contains its center) is the seated or truncated case, not an ambiguous
     # one. Dropping it outright made "sitting at a distance" unconfirmable by
     # construction, which is the opposite of what the strict flag was for.
     tiny_face_allow_relaxed_association: bool = True
-    match_profile: Literal["conservative", "responsive"] = "conservative"
+    match_profile: Literal["conservative", "responsive", "transit"] = "conservative"
     # How a window of similarities is reduced to the one number the verdict reads.
     # A moving robot samples plenty of bad poses, and those drag a median down even
     # when the good frames sit well clear of the threshold.
@@ -125,6 +157,16 @@ class Settings(BaseSettings):
     # IoU association. A panning robot breaks pure-IoU association, and every new
     # track id restarts the evidence window from zero.
     camera_motion_compensation: bool = True
+    # A track that leaves before it can fill an evidence window is the one failure
+    # the tier system cannot help with: the frames simply were not there. When
+    # enabled, such a track is judged once on its way out, trading the frames it
+    # never got for a higher bar on the frames it did, and reports through the
+    # existing shadow channel (`tiny_shadow_confirmed`) rather than as a production
+    # confirmation -- it is a lead for a human, not grounds for a robot to act.
+    # Off by default: it is a deliberate move toward false accepts.
+    departure_adjudication_enabled: bool = False
+    departure_min_samples: int = Field(default=2, ge=1)
+    departure_similarity_margin: float = Field(default=0.05, ge=0.0, le=1.0)
     confirmed_track_grace_seconds: float = 2.0
     candidate_emit_interval_seconds: float = 0.5
     face_track_iou_threshold: float = Field(default=0.25, ge=0.0, le=1.0)
@@ -164,15 +206,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def apply_match_profile(self) -> Self:
-        """Fill in the responsive profile for fields the operator left alone.
+        """Fill in the selected scene profile for fields the operator left alone.
 
         Runs before ``validate_face_tiers`` so the profile's values are the ones
         checked for consistency. Anything set through the environment stays put:
         the profile is a default, never an override.
         """
-        if self.match_profile != "responsive":
-            return self
-        for name, value in RESPONSIVE_PROFILE_OVERRIDES.items():
+        for name, value in MATCH_PROFILE_OVERRIDES.get(self.match_profile, {}).items():
             if name not in self.model_fields_set:
                 setattr(self, name, value)
         return self

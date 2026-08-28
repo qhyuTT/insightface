@@ -253,6 +253,14 @@ class SearchMetrics:
     end_to_end_latencies_ms: list[float] = field(default_factory=list)
     camera_motion_px: list[float] = field(default_factory=list)
     blur_variances: list[float] = field(default_factory=list)
+    # Per-track outcomes, recorded once per track. These are the only numbers that
+    # can separate "the person was never sampled often enough" from "the samples
+    # never scored high enough" --- the two failure modes look identical on every
+    # other counter, because a track's state is dropped the moment it goes away.
+    time_to_confirm_seconds: list[float] = field(default_factory=list)
+    track_dwell_seconds: list[float] = field(default_factory=list)
+    track_sampling_hz: list[float] = field(default_factory=list)
+    unconfirmed_gate_counts: dict[str, int] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = 0.0
@@ -306,6 +314,15 @@ class SearchMetrics:
             "camera_motion_px_p95": _percentile(self.camera_motion_px, 95),
             "blur_variance_p50": _percentile(self.blur_variances, 50),
             "blur_variance_p95": _percentile(self.blur_variances, 95),
+            "time_to_confirm_p50_seconds": _percentile(self.time_to_confirm_seconds, 50),
+            "time_to_confirm_p95_seconds": _percentile(self.time_to_confirm_seconds, 95),
+            "track_dwell_p50_seconds": _percentile(self.track_dwell_seconds, 50),
+            # The sampling rate tracks actually achieved. Compare against
+            # effective_config.required_sampling_hz: below it, the evidence quorum
+            # cannot be met inside the window however good the faces are.
+            "achieved_sampling_hz": _percentile(self.track_sampling_hz, 50),
+            "confirmed_tracks": len(self.time_to_confirm_seconds),
+            "unconfirmed_gate_counts": dict(sorted(self.unconfirmed_gate_counts.items())),
         }
 
 

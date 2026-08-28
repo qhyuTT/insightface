@@ -177,6 +177,8 @@
             <div class="diagnostic-cell"><small>EFFECTIVE GATES</small><output id="configGatesDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>MOTION / SHARPNESS</small><output id="motionDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>MATCH PROFILE</small><output id="profileDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>TIME TO CONFIRM</small><output id="confirmLatencyDiag">尚无样本</output></div>
+            <div class="diagnostic-cell"><small>CONFIRMATION BLOCKERS</small><output id="blockerDiag">尚无样本</output></div>
           </div>
         </div>
       </section>
@@ -284,19 +286,52 @@
 
       // The confirmation window needs a minimum sampling rate; below it the
       // evidence quorum cannot be met and confirmation becomes incidental.
-      const processed = Number(body.processed_fps || 0);
+      // Prefer the rate tracks actually achieved over processed_fps. The loop rate
+      // is only an upper bound: a frame that found no face, or one banked inside
+      // the minimum observation interval, contributes nothing to the window. Where
+      // no track has yet been sampled twice there is no rate to report, and the
+      // loop rate is named as the estimate it is rather than passed off as measured.
+      const achieved = Number(body.achieved_sampling_hz || 0);
+      const measured = achieved > 0;
+      const actual = measured ? achieved : Number(body.processed_fps || 0);
       const needed = Number(config.required_sampling_hz || 0);
       const neededSmall = Number(config.small_face_required_sampling_hz || 0);
       const verdict = (required) => {
         if (!required) return 'n/a';
-        const ratio = processed / required;
+        const ratio = actual / required;
         return `${num(ratio, 1)}×${ratio < 1 ? ' 不足' : ''}`;
       };
       $('samplingDiag').textContent = [
+        `实际 ${num(actual, 2)}Hz${measured ? '' : '(估:循环率)'}`,
         `≥${config.preferred_search_face_px ?? '?'}px 需 ${num(needed, 2)}Hz → ${verdict(needed)}`,
         `小脸需 ${num(neededSmall, 2)}Hz → ${verdict(neededSmall)}`,
         `预算跳过 ${countText(body.budget_skips)}`,
       ].join('  /  ');
+
+      // Time-to-confirm and the gate that stopped the tracks which never made it.
+      // Together these separate "not sampled enough" from "never scored enough",
+      // which every other counter reports identically.
+      const confirmedTracks = Number(body.confirmed_tracks || 0);
+      $('confirmLatencyDiag').textContent = confirmedTracks
+        ? [
+            `中位 ${num(body.time_to_confirm_p50_seconds, 2)}s`,
+            `p95 ${num(body.time_to_confirm_p95_seconds, 2)}s`,
+            `已确认轨迹 ${confirmedTracks}`,
+            `停留中位 ${num(body.track_dwell_p50_seconds, 2)}s`,
+          ].join('  /  ')
+        : `尚无确认  /  停留中位 ${num(body.track_dwell_p50_seconds, 2)}s`;
+
+      const gateLabels = {
+        insufficient_samples: '帧数不足',
+        window_statistic_low: '统计量不足',
+        votes_low: '达标票不足',
+        aggregate_low: '聚合不足',
+      };
+      const gates = body.unconfirmed_gate_counts || {};
+      const gateEntries = Object.entries(gates);
+      $('blockerDiag').textContent = gateEntries.length
+        ? gateEntries.map(([key, value]) => `${gateLabels[key] || key} ${value}`).join('  /  ')
+        : '尚无样本';
 
       $('configRatesDiag').textContent = [
         `person ${num(config.person_detection_hz)}Hz`,
@@ -317,6 +352,10 @@
         `模糊 ${num(config.min_search_blur_variance, 0)}`,
         `检测阈 ${num(config.face_detection_threshold, 2)}`,
         `证据 ${config.evidence_required ?? '?'}/${num(config.evidence_window_seconds, 1)}s`,
+        `采样间隔 ${num(config.evidence_min_interval_seconds, 2)}s`,
+        config.departure_adjudication_enabled
+          ? `离场结算 开(≥${config.departure_min_samples ?? '?'}帧 +${num(config.departure_similarity_margin, 2)})`
+          : '离场结算 关',
       ].join('  /  ');
 
       // A panning robot is the reason tracks churn, and sharpness is a gate whose

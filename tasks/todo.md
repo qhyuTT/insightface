@@ -501,3 +501,54 @@ clone 后 `git fetch <bundle>` + `merge --ff-only`，`models/yolox_tiny.onnx` �
 - [ ] **`evidence_discarded` 现场验证**：命中后立刻手工结束任务，确认调度端一次
       判定为失败并显示「已随寻人会话销毁」，而不是转圈到 600 秒。
 - [ ] 上一轮遗留的远脸召回真机复测项（见上文各节）仍然全部未做。
+
+## 候机厅场景特调：先仪表，后调优（2026-08-28）
+
+现场反馈：快速走过的旅客完全不确认；低头玩手机的坐姿检不到脸；相似度上不去；远脸认不出。
+相机随机器人持续移动，取舍是**宁可误报也不能漏**。
+
+先把问题定住：「凑够 N 帧」是硬条件且分三档（80px 以上 0.55/3 帧/1.5s；64-79px 0.60/4 帧/2s；
+48-63px 0.64/6 帧/3s + 5 票 + 聚合 0.68），每档隐含 **2.0 Hz 最低采样率**。但候机厅一帧 6-10
+张脸时嵌入成本（lessons 20：6 张脸 400ms，再叠 flip TTA 翻倍）很可能把循环压到 1-2 Hz，正卡在
+需求线下面——此时调阈值毫无意义。而「帧不够」和「分不够」当时**没有任何指标能区分**。
+
+### Phase 1：仪表（不改变任何判定）
+
+- [x] 门集中到 `_evaluate`，返回第一个失败的门；`_is_confirmed` = `gate is None`
+- [x] `TrackOutcome` 轨迹验尸：确认时发（带首次确认耗时），未确认轨迹删除时发（带卡点门）
+- [x] 保留「离确认最近的一次尝试」快照——删除时窗口必然已空，读实时值会恒报「帧数不足」
+- [x] `SearchMetrics`：`time_to_confirm_seconds` / `track_dwell_seconds` /
+      `track_sampling_hz` / `unconfirmed_gate_counts`，snapshot 出 p50/p95
+- [x] `monitor.html` 两个新格子（TIME TO CONFIRM / CONFIRMATION BLOCKERS），
+      SAMPLING HEADROOM 改用实测 `achieved_sampling_hz`，无实测时标注「估:循环率」
+- [x] `person-search-eval` 每个阈值输出 `track_outcomes`
+
+### Phase 2：机制到位，默认全关
+
+- [x] `MATCH_PROFILE_OVERRIDES` 注册表 + `transit` 场景档（缩窗口/缩采样间隔/降票数，
+      **不动任何相似度阈值**）；`evidence_min_interval_seconds` 变成可配
+- [x] 离场结算 `departure_adjudication_enabled`（默认 false）：只救 `insufficient_samples`，
+      要求 `窗口统计量 >= 阈值 + 0.05`，走 shadow 通道成对发 confirmed/lost
+- [x] `deploy_t4.sh` 暴露 `T4_MATCH_PROFILE=transit` 与 `T4_DEPARTURE_ADJUDICATION`
+
+### 验证
+
+- `uv run pytest` **195 passed**（原 177 + 18），`uv run ruff check .` 通过
+- 等价性：新增 2000 次随机扫描，逐例对比 `_evaluate(...).gate is None` 与**改动前原样抄下来的**
+  `_is_confirmed`，并断言扫描里既有确认也有不确认（否则恒真）
+- 非恒真反向验证：把验尸改成读实时窗口 → 6 个测试失败；把聚合门与票数门顺序对调 → 2 个测试
+  失败，而等价性扫描仍然通过（顺序只影响上报、不影响判定，正是想要的分工）
+
+### 仍未做（需要真机 / 素材）
+
+- [ ] **现场读数**：跑一次真实寻人，读 `实际采样率 vs 需求采样率` 与 `未确认卡点` 分桶。
+      实际 < 需求 → 减负载（关 flip TTA、降 face_detection_hz、缩 ROI 路数）；
+      实际 ≥ 需求但卡在统计量/聚合 → 才轮到标定阈值。**这一步之前不要调任何阈值。**
+- [ ] **坐姿低头**：先看 `budget_skips` 的 `face_roi_floor`/`face_roi_credit` 是否又把 ROI
+      补检饿死（lessons 18/24 已犯过两次）。静止的人时间管够，恰恰是 ROI 最该救的对象；
+      `roi_max_tracks_per_pass=3` 对候机厅偏紧，lessons 10 的基线是 8。
+      但要诚实：机器人站立高度看低头的人，SCRFD 可能根本给不出框，这是几何问题不是阈值问题。
+- [ ] **用分布定阈值**（lessons 第五次要求）：`--dump-similarities` 跑正负两份素材再定
+      `tiny_face_similarity_threshold` / `tiny_face_aggregate_similarity_threshold`。
+- [ ] **离场结算下游**：shadow 事件是 `tiny_shadow_confirmed`，调度端目前只消费 `target_found`。
+      要真正用上这条线索通道，dispatch 侧需要订阅并以「线索」而非「命中」呈现。

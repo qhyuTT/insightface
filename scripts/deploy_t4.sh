@@ -19,7 +19,15 @@ T4_EVIDENCE_API_KEY="${T4_EVIDENCE_API_KEY:-}"
 T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
 # conservative keeps the calibrated far-face bar; responsive trades false-accept
 # headroom for a faster verdict and should wait for a calibrated threshold.
+# transit additionally shortens the far-face window and the gap between samples,
+# for a hall where the subject walks past instead of lingering. None of them move a
+# similarity threshold: that needs a measured distribution, not a scene name.
 T4_MATCH_PROFILE="${T4_MATCH_PROFILE:-conservative}"
+# Judge a track once on its way out when it ran out of frames rather than out of
+# similarity, and report it on the shadow channel (tiny_shadow_confirmed) as a lead
+# rather than as a production confirmation. Off unless the operator asks for it:
+# it is a deliberate move toward false accepts.
+T4_DEPARTURE_ADJUDICATION="${T4_DEPARTURE_ADJUDICATION:-false}"
 # One 1280 pass rather than Auto's 128+640: measured on a T4 it is both cheaper
 # (57ms against 108ms) and better at every face size, because each extra ONNX input
 # shape costs ~30ms of re-planning -- far more than the scale's own inference. The
@@ -205,6 +213,7 @@ docker run --detach \
   --env "PERSON_SEARCH_FACE_DETECTION_SIZE=${T4_FACE_DETECTION_SIZE}" \
   --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}" \
   --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}" \
+  --env "PERSON_SEARCH_DEPARTURE_ADJUDICATION_ENABLED=${T4_DEPARTURE_ADJUDICATION}" \
   --env "PERSON_SEARCH_EVIDENCE_API_KEY=${T4_EVIDENCE_API_KEY}" \
   "${T4_IMAGE_NAME}" >/dev/null
 

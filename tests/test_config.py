@@ -96,3 +96,43 @@ def test_roi_detection_scale_upsamples_small_crops_and_never_shrinks_large_ones(
         settings.roi_detection_scale(size, size) for size in range(64, 900, 7)
     }
     assert scales == {320, 640}
+
+
+def test_transit_profile_shortens_the_window_without_touching_thresholds() -> None:
+    """A scene profile may spend frames; it may not spend calibration.
+
+    ``transit`` exists because a passenger walking through a hall cannot supply the
+    samples a lingering one can. Trading window length and sample spacing for that
+    is a measurable choice; moving a similarity threshold without a same-person /
+    different-person distribution is not, so no threshold here may sit below what
+    ``responsive`` already ships.
+    """
+    conservative = Settings()
+    transit = Settings(match_profile="transit")
+
+    assert transit.tiny_face_evidence_required == 4
+    assert transit.tiny_face_evidence_window_seconds == pytest.approx(2.0)
+    assert transit.tiny_face_consistent_votes_required == 3
+    assert transit.evidence_statistic == "top_k_mean"
+    assert transit.evidence_min_interval_seconds == pytest.approx(0.1)
+    assert transit.tiny_face_evidence_min_interval_seconds == pytest.approx(0.1)
+
+    assert conservative.evidence_min_interval_seconds == pytest.approx(0.2)
+    for name in (
+        "similarity_threshold",
+        "small_face_similarity_threshold",
+        "tiny_face_similarity_threshold",
+        "tiny_face_aggregate_similarity_threshold",
+    ):
+        assert getattr(transit, name) == getattr(conservative, name), name
+
+
+def test_scene_profiles_never_override_an_explicit_setting() -> None:
+    explicit = Settings(match_profile="transit", tiny_face_evidence_required=8)
+    assert explicit.tiny_face_evidence_required == 8
+    assert explicit.evidence_min_interval_seconds == pytest.approx(0.1)
+
+
+def test_conservative_profile_changes_nothing() -> None:
+    """The default path must stay a no-op now that the profiles are a registry."""
+    assert Settings(match_profile="conservative").model_dump() == Settings().model_dump()

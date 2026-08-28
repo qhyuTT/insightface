@@ -16,6 +16,7 @@ from .config import Settings
 from .confirmation import (
     FaceMatchPolicy,
     TrackConfirmation,
+    TrackOutcome,
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
     fallback_face_match_policy,
@@ -224,6 +225,7 @@ def run_offline(
         confirmations,
         key=lambda key: abs(float(key) - settings.similarity_threshold),
     )
+    outcomes_by_threshold: dict[str, list[TrackOutcome]] = {key: [] for key in confirmations}
     rejection_counts: Counter[str] = Counter()
     association_counts: Counter[str] = Counter()
     unassociated_faces = 0
@@ -403,6 +405,7 @@ def run_offline(
                 )
                 decisions_by_threshold[key] = confirmation_result.decisions
                 counts["evidence_collected"] += confirmation_result.evidence_collected
+                outcomes_by_threshold[key].extend(confirmation_result.outcomes)
             for key, decisions in decisions_by_threshold.items():
                 for decision in decisions:
                     state = _offline_decision_state(decision.state.value, decision.shadow)
@@ -480,6 +483,7 @@ def run_offline(
             "confirmed_events": sum(item["state"] == "confirmed" for item in events),
             "shadow_confirmed_events": sum(item["state"] == "shadow_confirmed" for item in events),
             "match_stage_counts": dict(stage_counts_by_threshold[key]),
+            "track_outcomes": _summarize_track_outcomes(outcomes_by_threshold[key]),
             "events": events,
         }
         if expected_intervals is not None:
@@ -650,6 +654,46 @@ def _confirmation_input_counts(
 
 def _is_matchable_face(face: FaceObservation, settings: Settings) -> bool:
     return bool(face.accepted and face.short_side >= settings.effective_search_min_face_px)
+
+
+def _summarize_track_outcomes(outcomes: list[TrackOutcome]) -> dict[str, object]:
+    """Aggregate per-track post-mortems for one threshold.
+
+    Confirmation counts alone cannot say whether a threshold failed because the
+    footage never sampled a track often enough or because the samples never scored
+    high enough --- the two are indistinguishable in the event stream. Splitting
+    the unconfirmed tracks by the gate that stopped them is what makes a sweep
+    actionable rather than just a list of zeroes.
+    """
+    confirm_times = [
+        outcome.time_to_confirm_seconds
+        for outcome in outcomes
+        if outcome.time_to_confirm_seconds is not None
+    ]
+    dwells = [outcome.dwell_seconds for outcome in outcomes]
+    rates = [
+        outcome.sampled / outcome.dwell_seconds
+        for outcome in outcomes
+        if outcome.dwell_seconds > 0 and outcome.sampled > 1
+    ]
+    gates: Counter[str] = Counter(
+        outcome.blocking_gate
+        for outcome in outcomes
+        if not outcome.confirmed and outcome.blocking_gate is not None
+    )
+    return {
+        "tracks": len(outcomes),
+        "confirmed_tracks": len(confirm_times),
+        "time_to_confirm_p50_seconds": _percentile(confirm_times, 50),
+        "time_to_confirm_p95_seconds": _percentile(confirm_times, 95),
+        "track_dwell_p50_seconds": _percentile(dwells, 50),
+        "achieved_sampling_hz": _percentile(rates, 50),
+        "unconfirmed_gate_counts": dict(sorted(gates.items())),
+    }
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    return float(np.percentile(values, percentile)) if values else 0.0
 
 
 def _offline_decision_state(state: str, shadow: bool) -> str:

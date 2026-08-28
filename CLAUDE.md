@@ -56,9 +56,32 @@ This is the reason `confirmation.py` exists and the thing most likely to be brok
 - `evidence_required` (3) samples inside a sliding `evidence_window_seconds` (1.5s) window,
 - samples ≥0.2s apart and from distinct `frame_id`s (no double-counting one frame),
 - the window's **statistic** (`evidence_statistic`: `median`, or `top_k_mean` under
-  `match_profile=responsive`) ≥ `similarity_threshold`. Note the median gate is
+  `match_profile=responsive`/`transit`) ≥ `similarity_threshold`. Note the median gate is
   structurally satisfied for tiers that refuse sub-threshold observations — the
   statistic only bites on the far-face tier, which banks everything by design.
+
+`match_profile` is a registry of scene presets (`MATCH_PROFILE_OVERRIDES` in `config.py`),
+not a mode switch: a profile only fills in fields the environment left unset, so an env var
+always wins. No profile moves a similarity threshold — that needs a measured distribution,
+so profiles spend *frames* (window length, sample spacing, vote counts) and never
+calibration.
+
+When a track goes away, `TrackConfirmation` records a `TrackOutcome` naming the first gate
+that stopped it (`insufficient_samples` / `window_statistic_low` / `votes_low` /
+`aggregate_low`). This exists because "the person was never sampled enough" and "the samples
+never scored enough" are otherwise indistinguishable — every other counter reports them
+identically. The gates live in exactly one place, `_evaluate`; `_is_confirmed` is
+`gate is None`, and `track_progress` and the post-mortem render the same object, so the
+panel can never disagree with the verdict. Compare `achieved_sampling_hz` (measured, per
+track) against `required_sampling_hz` before touching any threshold.
+
+`departure_adjudication_enabled` (default **off**) judges a track once on its way out when
+it failed on `insufficient_samples` alone, trading the frames it never got for a margin
+above the threshold on the ones it did. It reports through the existing shadow channel
+(`tiny_shadow_confirmed`/`tiny_shadow_lost`, emitted as a pair in the same frame) — a lead
+for a human, never grounds for the robot to act. A track that *was* sampled enough and still
+scored too low is never rescued: that would be an uncalibrated threshold cut under another
+name.
 
 Only then does state flip `candidate` → `confirmed`. `confirmed_track_grace_seconds` keeps a confirmed track alive briefly when the track or face drops out, then emits `lost`.
 

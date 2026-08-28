@@ -17,6 +17,7 @@ from .config import Settings
 from .confirmation import (
     FaceMatchPolicy,
     TrackConfirmation,
+    TrackOutcome,
     associate_faces_to_tracks_detailed,
     default_face_match_policy,
     fallback_face_match_policy,
@@ -562,6 +563,13 @@ class SearchSession:
             "face_detection_threshold": settings.face_detection_threshold,
             "evidence_required": settings.evidence_required,
             "evidence_window_seconds": settings.evidence_window_seconds,
+            "evidence_min_interval_seconds": settings.evidence_min_interval_seconds,
+            "tiny_face_evidence_min_interval_seconds": (
+                settings.tiny_face_evidence_min_interval_seconds
+            ),
+            "departure_adjudication_enabled": settings.departure_adjudication_enabled,
+            "departure_min_samples": settings.departure_min_samples,
+            "departure_similarity_margin": settings.departure_similarity_margin,
             "small_face_evidence_required": settings.small_face_evidence_required,
             "small_face_evidence_window_seconds": settings.small_face_evidence_window_seconds,
             # The sampling rate the confirmation window implies. Below this, the
@@ -873,6 +881,7 @@ class SearchSession:
                             self.metrics.match_stage_counts.get("evidence_collected", 0)
                             + confirmation_result.evidence_collected
                         )
+                    self._record_track_outcomes(confirmation_result.outcomes)
                     self._handle_decisions(target_id, target, decisions, packet.frame)
                     progress = confirmation.track_progress(target)
                     if progress:
@@ -1225,6 +1234,30 @@ class SearchSession:
             key=lambda item: item[1],
             reverse=True,
         )
+
+    def _record_track_outcomes(self, outcomes: list[TrackOutcome]) -> None:
+        """Fold one frame's per-track post-mortems into the metrics.
+
+        ``track_sampling_hz`` needs a dwell to divide by, so a track confirmed on
+        its very first banked sample contributes nothing to it. That is honest:
+        a single sample says nothing about a rate, and inventing one would make
+        the achieved-vs-required comparison read high exactly when it matters.
+        """
+        if not outcomes:
+            return
+        with self._lock:
+            for outcome in outcomes:
+                if outcome.time_to_confirm_seconds is not None:
+                    self.metrics.time_to_confirm_seconds.append(outcome.time_to_confirm_seconds)
+                self.metrics.track_dwell_seconds.append(outcome.dwell_seconds)
+                if outcome.dwell_seconds > 0 and outcome.sampled > 1:
+                    self.metrics.track_sampling_hz.append(
+                        outcome.sampled / outcome.dwell_seconds
+                    )
+                if not outcome.confirmed and outcome.blocking_gate is not None:
+                    self.metrics.unconfirmed_gate_counts[outcome.blocking_gate] = (
+                        self.metrics.unconfirmed_gate_counts.get(outcome.blocking_gate, 0) + 1
+                    )
 
     def _is_face_matchable(self, face: FaceObservation) -> bool:
         return bool(face.accepted and face.short_side >= self.settings.effective_search_min_face_px)

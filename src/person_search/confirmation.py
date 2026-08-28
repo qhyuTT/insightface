@@ -14,6 +14,21 @@ TIER_NORMAL = "normal"
 TIER_SMALL = "small"
 TIER_TINY = "tiny"
 
+# The confirmation gates, named so a track that never confirmed can say which one
+# stopped it. Ordered furthest-from-confirmation first: a post-mortem reports the
+# closest the track ever came, so "closer" has to be an explicit ranking rather
+# than something implied by the order of the checks in _evaluate.
+GATE_INSUFFICIENT_SAMPLES = "insufficient_samples"
+GATE_WINDOW_STATISTIC_LOW = "window_statistic_low"
+GATE_VOTES_LOW = "votes_low"
+GATE_AGGREGATE_LOW = "aggregate_low"
+GATE_ORDER: tuple[str, ...] = (
+    GATE_INSUFFICIENT_SAMPLES,
+    GATE_WINDOW_STATISTIC_LOW,
+    GATE_VOTES_LOW,
+    GATE_AGGREGATE_LOW,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MatchDecision:
@@ -31,9 +46,51 @@ class MatchDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class TrackOutcome:
+    """How one track ended, recorded once per track rather than per frame.
+
+    Emitted at confirmation, and at deletion for a track that banked evidence but
+    never confirmed. It exists because the two ways a search fails --- "the person
+    was never sampled enough times" and "the samples never scored high enough" ---
+    are indistinguishable on the panel today: the state is dropped and everything
+    it knew goes with it.
+
+    The window is necessarily *empty* by the time an unconfirmed track is deleted
+    (it had to expire for the track to be dropped at all), so the gate fields come
+    from the snapshot taken when the track was **closest** to confirming, not from
+    the deque at deletion time. Reading the deque would make every post-mortem say
+    "0 samples" regardless of what actually happened.
+
+    ``banked`` is the in-window count the gate reads; ``sampled`` counts every
+    observation ever banked on this track and, over ``dwell_seconds``, is the
+    achieved sampling rate to compare against the rate the window requires.
+    """
+
+    track_id: int
+    confirmed: bool
+    tier: str | None
+    association: str
+    banked: int
+    sampled: int
+    required: int
+    qualifying: int
+    threshold: float
+    window_similarity: float | None
+    window_statistic: str
+    best_similarity: float | None
+    aggregate_similarity: float | None
+    aggregate_threshold: float | None
+    dwell_seconds: float
+    blocking_gate: str | None = None
+    time_to_confirm_seconds: float | None = None
+    shadow: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ConfirmationResult:
     decisions: list[MatchDecision]
     evidence_collected: int = 0
+    outcomes: list[TrackOutcome] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +157,32 @@ class FaceMatchPolicy:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Attempt:
+    """One evaluation of the confirmation gates for a track.
+
+    ``gate`` is the first gate that failed, or ``None`` when all of them passed.
+    ``TrackProgress``, ``_is_confirmed`` and the post-mortem are all built from
+    this one object so the panel, the verdict and the diagnosis cannot disagree.
+    """
+
+    gate: str | None
+    banked: int
+    required: int
+    qualifying: int
+    threshold: float
+    window_similarity: float | None
+    window_statistic: str
+    best_similarity: float | None
+    aggregate_similarity: float | None
+    aggregate_threshold: float | None
+
+    def rank(self) -> tuple[int, int, float]:
+        """How close this attempt came to confirming, for picking a track's best."""
+        ordinal = len(GATE_ORDER) if self.gate is None else GATE_ORDER.index(self.gate)
+        return (ordinal, self.qualifying, self.window_similarity or -1.0)
+
+
 @dataclass(slots=True)
 class _Evidence:
     frame_id: int
@@ -124,6 +207,16 @@ class _TrackState:
     last_association: str = "person_strict"
     policy: FaceMatchPolicy | None = None
     tier: str | None = None
+    # Post-mortem bookkeeping. ``first_evidence_at`` is never reset once set --- a
+    # policy change clears the evidence window, but the track was still being
+    # observed the whole time, and dwell has to span that. ``sampled`` likewise
+    # counts every observation ever banked, so ``sampled / dwell`` is the sampling
+    # rate the track actually achieved rather than what survived in the window.
+    first_evidence_at: float | None = None
+    last_evidence_at: float = 0.0
+    sampled: int = 0
+    best_attempt: _Attempt | None = None
+    outcome_emitted: bool = False
 
 
 class TrackConfirmation:
@@ -161,29 +254,17 @@ class TrackConfirmation:
         for track_id, state in self._states.items():
             if not (state.confirmed or state.shadow_confirmed or state.evidence):
                 continue
-            threshold = self._policy_threshold(state)
-            similarities = [item.similarity for item in state.evidence]
-            aggregate_threshold = (
-                state.policy.aggregate_threshold if state.policy is not None else None
-            )
-            aggregate_similarity = (
-                self._aggregate_similarity(state, target)
-                if target is not None and aggregate_threshold is not None
-                else None
-            )
-            statistic, top_k = self._policy_statistic(state)
+            attempt = self._evaluate(state, target)
             progress[track_id] = TrackProgress(
-                observed=len(state.evidence),
-                required=self._policy_required(state),
-                qualifying=sum(value >= threshold for value in similarities),
-                threshold=threshold,
-                window_similarity=(
-                    _window_statistic(similarities, statistic, top_k) if similarities else None
-                ),
-                best_similarity=max(similarities) if similarities else None,
-                window_statistic=statistic,
-                aggregate_similarity=aggregate_similarity,
-                aggregate_threshold=aggregate_threshold,
+                observed=attempt.banked,
+                required=attempt.required,
+                qualifying=attempt.qualifying,
+                threshold=attempt.threshold,
+                window_similarity=attempt.window_similarity,
+                best_similarity=attempt.best_similarity,
+                window_statistic=attempt.window_statistic,
+                aggregate_similarity=attempt.aggregate_similarity,
+                aggregate_threshold=attempt.aggregate_threshold,
                 tier=state.tier,
             )
         return progress
@@ -257,6 +338,7 @@ class TrackConfirmation:
         face_policies: dict[int, FaceMatchPolicy] | None = None,
     ) -> ConfirmationResult:
         decisions: list[MatchDecision] = []
+        outcomes: list[TrackOutcome] = []
         evidence_collected = 0
         tracks_by_id = {track.track_id: track for track in tracks}
         for track in tracks:
@@ -285,6 +367,7 @@ class TrackConfirmation:
                 threshold=self.settings.similarity_threshold,
                 evidence_required=self.settings.evidence_required,
                 evidence_window_seconds=self.settings.evidence_window_seconds,
+                min_observation_interval_seconds=self.settings.evidence_min_interval_seconds,
             )
             if state.policy is None:
                 state.policy = policy
@@ -346,6 +429,10 @@ class TrackConfirmation:
                     )
                 )
                 evidence_collected += 1
+                if state.first_evidence_at is None:
+                    state.first_evidence_at = timestamp
+                state.last_evidence_at = timestamp
+                state.sampled += 1
                 if policy.collect_all_observations:
                     while len(state.evidence) > policy.evidence_required:
                         state.evidence.popleft()
@@ -358,12 +445,37 @@ class TrackConfirmation:
                 ):
                     decisions.append(self._decision(MatchState.CANDIDATE, track_id, state))
                     state.last_candidate_emit = timestamp
-                if self._is_confirmed(state, target):
-                    if self._is_shadow_policy(state.policy):
+                attempt = self._evaluate(state, target)
+                # Keep the closest this track ever came, not the last thing it did:
+                # by the time an unconfirmed track is deleted its window has expired
+                # to nothing, and a post-mortem read off the empty deque would blame
+                # every failure on "not enough samples".
+                if state.best_attempt is None or attempt.rank() > state.best_attempt.rank():
+                    state.best_attempt = attempt
+                if attempt.gate is None:
+                    shadow = self._is_shadow_policy(state.policy)
+                    if shadow:
                         state.shadow_confirmed = True
                     else:
                         state.confirmed = True
                     decisions.append(self._decision(MatchState.CONFIRMED, track_id, state))
+                    outcomes.append(
+                        self._outcome(
+                            track_id,
+                            state,
+                            attempt,
+                            confirmed=True,
+                            shadow=shadow,
+                            # `or` would read a first sample at t=0.0 as "unset"
+                            # and report every such confirmation as instantaneous.
+                            time_to_confirm_seconds=timestamp
+                            - (
+                                timestamp
+                                if state.first_evidence_at is None
+                                else state.first_evidence_at
+                            ),
+                        )
+                    )
 
         grace = self.settings.confirmed_track_grace_seconds
         for track_id, state in list(self._states.items()):
@@ -380,11 +492,124 @@ class TrackConfirmation:
                 and track_id not in tracks_by_id
                 and timestamp - state.last_track_seen >= grace
             ):
+                self._record_unconfirmed_outcome(track_id, state, outcomes, decisions)
                 del self._states[track_id]
 
         return ConfirmationResult(
             decisions=decisions,
             evidence_collected=evidence_collected,
+            outcomes=outcomes,
+        )
+
+    def _record_unconfirmed_outcome(
+        self,
+        track_id: int,
+        state: _TrackState,
+        outcomes: list[TrackOutcome],
+        decisions: list[MatchDecision],
+    ) -> None:
+        """Report why a track that banked evidence went away without confirming.
+
+        Tracks that never banked anything are skipped: every passer-by whose face
+        was never matchable would otherwise drown the one track that got close.
+        """
+        if state.outcome_emitted or state.first_evidence_at is None:
+            return
+        attempt = state.best_attempt
+        if attempt is None:
+            return
+        adjudicated = self._adjudicate_departure(attempt)
+        dwell = max(0.0, state.last_evidence_at - state.first_evidence_at)
+        if adjudicated:
+            decisions.append(
+                self._decision(
+                    MatchState.CONFIRMED,
+                    track_id,
+                    state,
+                    shadow=True,
+                    evidence_count=attempt.banked,
+                )
+            )
+            # The track is already gone, so the pair has to close in the same frame.
+            # A shadow hit with no matching lost leaves the console showing a live
+            # lead for someone who has left, and the pairing is what every consumer
+            # of the shadow channel is written against.
+            decisions.append(
+                self._decision(
+                    MatchState.LOST,
+                    track_id,
+                    state,
+                    shadow=True,
+                    evidence_count=attempt.banked,
+                )
+            )
+        outcomes.append(
+            self._outcome(
+                track_id,
+                state,
+                attempt,
+                confirmed=adjudicated,
+                shadow=adjudicated,
+                time_to_confirm_seconds=dwell if adjudicated else None,
+            )
+        )
+
+    def _adjudicate_departure(self, attempt: _Attempt) -> bool:
+        """Whether a track that ran out of frames still earns a lead-grade hit.
+
+        Only ``insufficient_samples`` is eligible. A track that *was* sampled
+        enough and still scored too low has already been judged; re-judging it on
+        the way out at a lower bar is how an uncalibrated threshold cut gets
+        smuggled in under another name. What is traded here is frames --- the ones
+        the subject never stayed still long enough to give --- against a higher bar
+        on the frames there were.
+        """
+        settings = self.settings
+        if not settings.departure_adjudication_enabled:
+            return False
+        if attempt.gate != GATE_INSUFFICIENT_SAMPLES:
+            return False
+        if attempt.banked < settings.departure_min_samples:
+            return False
+        if attempt.window_similarity is None:
+            return False
+        return (
+            attempt.window_similarity >= attempt.threshold + settings.departure_similarity_margin
+        )
+
+    def _outcome(
+        self,
+        track_id: int,
+        state: _TrackState,
+        attempt: _Attempt,
+        *,
+        confirmed: bool,
+        shadow: bool = False,
+        time_to_confirm_seconds: float | None = None,
+    ) -> TrackOutcome:
+        state.outcome_emitted = True
+        first_at = state.first_evidence_at
+        return TrackOutcome(
+            track_id=track_id,
+            confirmed=confirmed,
+            tier=state.tier,
+            association=state.last_association,
+            banked=attempt.banked,
+            sampled=state.sampled,
+            required=attempt.required,
+            qualifying=attempt.qualifying,
+            threshold=attempt.threshold,
+            window_similarity=attempt.window_similarity,
+            window_statistic=attempt.window_statistic,
+            best_similarity=attempt.best_similarity,
+            aggregate_similarity=attempt.aggregate_similarity,
+            aggregate_threshold=attempt.aggregate_threshold,
+            dwell_seconds=(
+                0.0 if first_at is None else max(0.0, state.last_evidence_at - first_at)
+            ),
+            blocking_gate=attempt.gate,
+            time_to_confirm_seconds=time_to_confirm_seconds,
+            shadow=shadow,
         )
 
     def _expire_evidence(self, state: _TrackState, timestamp: float) -> None:
@@ -392,26 +617,62 @@ class TrackConfirmation:
         while state.evidence and timestamp - state.evidence[0].timestamp > window:
             state.evidence.popleft()
 
-    def _is_confirmed(self, state: _TrackState, target: Target) -> bool:
-        required = self._policy_required(state)
-        if len(state.evidence) < required:
-            return False
+    def _evaluate(self, state: _TrackState, target: Target | None) -> _Attempt:
+        """Run the confirmation gates in order and report the first one that fails.
+
+        The single place the gates live. ``_is_confirmed`` is ``gate is None``,
+        ``track_progress`` renders the same object, and a track's post-mortem
+        names ``gate`` --- so what the panel shows, what the verdict used and why
+        a track failed are by construction the same numbers.
+
+        ``target`` may be ``None`` when only the progress fields are wanted; the
+        aggregate gate then fails for want of a comparison, exactly as it already
+        did when the weighted mean was unusable.
+        """
+        policy = state.policy
         similarities = [item.similarity for item in state.evidence]
+        required = self._policy_required(state)
         threshold = self._policy_threshold(state)
         statistic, top_k = self._policy_statistic(state)
-        if _window_statistic(similarities, statistic, top_k) < threshold:
-            return False
-        policy = state.policy
+        aggregate_threshold = policy.aggregate_threshold if policy is not None else None
+        aggregate_similarity = (
+            self._aggregate_similarity(state, target)
+            if target is not None and aggregate_threshold is not None
+            else None
+        )
+        window_similarity = (
+            _window_statistic(similarities, statistic, top_k) if similarities else None
+        )
+        qualifying = sum(value >= threshold for value in similarities)
         votes_required = policy.consistent_votes_required if policy is not None else 0
-        if votes_required and sum(value >= threshold for value in similarities) < votes_required:
-            return False
-        if policy is not None and policy.aggregate_threshold is not None:
-            aggregate_similarity = self._aggregate_similarity(state, target)
-            if aggregate_similarity is None:
-                return False
-            if aggregate_similarity < policy.aggregate_threshold:
-                return False
-        return True
+
+        gate: str | None = None
+        if len(state.evidence) < required:
+            gate = GATE_INSUFFICIENT_SAMPLES
+        elif window_similarity is None or window_similarity < threshold:
+            gate = GATE_WINDOW_STATISTIC_LOW
+        elif votes_required and qualifying < votes_required:
+            gate = GATE_VOTES_LOW
+        elif aggregate_threshold is not None and (
+            aggregate_similarity is None or aggregate_similarity < aggregate_threshold
+        ):
+            gate = GATE_AGGREGATE_LOW
+
+        return _Attempt(
+            gate=gate,
+            banked=len(state.evidence),
+            required=required,
+            qualifying=qualifying,
+            threshold=threshold,
+            window_similarity=window_similarity,
+            window_statistic=statistic,
+            best_similarity=max(similarities) if similarities else None,
+            aggregate_similarity=aggregate_similarity,
+            aggregate_threshold=aggregate_threshold,
+        )
+
+    def _is_confirmed(self, state: _TrackState, target: Target) -> bool:
+        return self._evaluate(state, target).gate is None
 
     def _aggregate_similarity(self, state: _TrackState, target: Target) -> float | None:
         """Cosine between the target and the window's quality-weighted mean embedding.
@@ -433,15 +694,29 @@ class TrackConfirmation:
             return None
         return float(np.dot(target.embedding, aggregate / magnitude))
 
-    def _decision(self, state_name: MatchState, track_id: int, state: _TrackState) -> MatchDecision:
-        shadow = self._is_shadow_policy(state.policy)
+    def _decision(
+        self,
+        state_name: MatchState,
+        track_id: int,
+        state: _TrackState,
+        *,
+        shadow: bool | None = None,
+        evidence_count: int | None = None,
+    ) -> MatchDecision:
+        """Build one decision from a track's state.
+
+        ``shadow`` and ``evidence_count`` are normally derived from the state, but
+        a departure adjudication happens after the window has expired: the deque is
+        empty, so the count has to come from the attempt that was actually judged.
+        """
+        shadow = self._is_shadow_policy(state.policy) if shadow is None else shadow
         return MatchDecision(
             state=state_name,
             track_id=track_id,
             bbox=state.last_bbox.copy(),
             similarity=state.last_similarity,
             quality=state.last_quality,
-            evidence_count=len(state.evidence),
+            evidence_count=len(state.evidence) if evidence_count is None else evidence_count,
             face_bbox=None if state.last_face_bbox is None else state.last_face_bbox.copy(),
             association=state.last_association,
             shadow=shadow,
@@ -545,6 +820,7 @@ def default_face_match_policy(
         threshold=settings.similarity_threshold,
         evidence_required=settings.evidence_required,
         evidence_window_seconds=settings.evidence_window_seconds,
+        min_observation_interval_seconds=settings.evidence_min_interval_seconds,
         tier=TIER_NORMAL,
         statistic=settings.evidence_statistic,
         top_k=settings.evidence_top_k,
@@ -556,6 +832,7 @@ def fallback_face_match_policy(settings: Settings) -> FaceMatchPolicy:
         threshold=settings.small_face_similarity_threshold,
         evidence_required=settings.small_face_evidence_required,
         evidence_window_seconds=settings.small_face_evidence_window_seconds,
+        min_observation_interval_seconds=settings.evidence_min_interval_seconds,
         suppress_candidate=True,
         tier=TIER_SMALL,
         statistic=settings.evidence_statistic,

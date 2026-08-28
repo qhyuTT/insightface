@@ -449,3 +449,55 @@ clone 后 `git fetch <bundle>` + `merge --ff-only`，`models/yolox_tiny.onnx` �
       `confirmed_events` 只允许增加且逐条人工确认；负样本素材两档均必须为 0。
 - [ ] **首次确认耗时**：用户说的「快」目前没有任何指标表达，需要手工记录中位耗时。
 - [ ] ROI 多裁剪批量 ONNX 推理（上一轮遗留，T4 上收益要先看实测）。
+
+## 命中证据交接：裁错框与失败语义（2026-08-28）
+
+接手 codex 未完成的工作（会话中途 402 中断，改动未自查未提交）。codex 的主体改动是
+完整的，复查时找到两个真实缺陷并补了回归测试。
+
+### codex 已完成、我复核通过
+
+- [x] `MatchDecision.face_bbox` 携带人脸检测框，裁剪不再用人体轨迹框
+- [x] TTL 120s → 600s；自动完成不再清空证据（显式停止/超时/失败仍立即清空）
+- [x] `DELETE .../evidence/{id}` 释放接口，对刚释放的 ID 幂等
+- [x] `SearchView.confirmed_results` 作为事件漏收时的对账源
+- [x] `privacy.py`：uvicorn 访问日志脱敏证据路径中的两个 ID
+- [x] `/healthz` 增加 `confirmed_evidence_v1` 能力位
+
+### 我修的两个缺陷（均已验证测试非恒真）
+
+- [x] 终态补发的 `target_found` 沿用命中时的 payload，而字节已被 `_transition`
+      清空，事件里 `evidence_available` 仍是 true → 调度端只能拉到 404 并白等重试
+      窗口。改为发布前按当下可用性重算（`_refresh_evidence_availability`）。
+- [x] 「随搜索销毁」与「你已释放」共用 `evidence_released` 404，而 404 在调度端
+      可重试 → 不可恢复的情况被重试到 600 秒耗尽。拆出 `evidence_discarded`（410），
+      调度端映射为永久失败，一次判定。
+
+### 验证
+
+- insightface：pytest **177 passed**（连跑 3 次无 flaky）、ruff 通过
+- dispatch 后端：pytest **79 passed**、ruff 通过；前端 vitest **39 passed**、
+  typecheck / lint / build 通过
+- 两个缺陷分别用「移除修复」对照验证过会失败，不是恒真断言
+
+### 部署（192.168.17.60）
+
+- [x] insightface `0dffc78` 推送并部署，容器 healthy，`CUDAExecutionProvider` 已验证
+- [x] `/healthz` 返回新能力位 `confirmed_evidence_v1`；`openapi.json` 含 `delete`
+- [x] 无密钥 DELETE → 403（接口存在且强制鉴权）
+- [x] dispatch `c210d48` 推送并部署，alembic 升到 `0007`
+
+**部署时踩到的坑**：本机 `.env.production` 缺 `DISPATCH_EVIDENCE_ENCRYPTION_KEY` 与
+`DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY`（上一轮直接在服务器上配的，没回写本机），
+而 `deploy.sh` 会用本机文件**整体覆盖**服务器的 `shared/.env`。若直接部署，compose
+的 `:?` 会当场失败，且服务器上唯一的密钥副本被覆盖丢失。已先从服务器读回这两个值
+补进本机文件，再逐键 diff 确认无遗漏才部署。
+
+### 仍未做（需要真机 + 授权照片）
+
+- [ ] **端到端验收命中裁剪**：真实寻人任务命中后，确认管理台从「同步中」翻到
+      「已保存」，且弹窗能同时显示登记照与**人脸特写**（不是整个人的大图）——
+      这正是本轮修的那个 bug 的现场判据。
+- [ ] **`evidence_discarded` 现场验证**：命中后立刻手工结束任务，确认调度端一次
+      判定为失败并显示「已随寻人会话销毁」，而不是转圈到 600 秒。
+- [ ] 上一轮遗留的远脸召回真机复测项（见上文各节）仍然全部未做。

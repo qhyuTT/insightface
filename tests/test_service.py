@@ -545,6 +545,7 @@ def test_unassociated_small_face_confirms_through_face_fallback(monkeypatch) -> 
         target=target,
         source=SourceConfig(type="camera", device_index=0),
         settings=Settings(
+            evidence_api_key="test-evidence-key",
             small_face_evidence_required=4,
             small_face_evidence_window_seconds=2.0,
         ),
@@ -562,6 +563,17 @@ def test_unassociated_small_face_confirms_through_face_fallback(monkeypatch) -> 
     assert confirmed[0]["data"]["association"] == "face_fallback"
     assert confirmed[0]["data"]["track_id"] < 0
     assert confirmed[0]["data"]["evidence_count"] == 4
+    assert confirmed[0]["data"]["face_bbox"] == [0.125, 0.125, 0.525, 0.525]
+    # The worker has already auto-transitioned to completed here; evidence must
+    # remain fetchable for HTTP reconciliation instead of being cleared in the
+    # terminal transition.
+    completed_crop, _ = session.get_evidence(
+        confirmed[0]["data"]["evidence_id"], "face_crop"
+    )
+    decoded_crop = cv2.imdecode(
+        np.frombuffer(completed_crop, dtype=np.uint8), cv2.IMREAD_COLOR
+    )
+    assert decoded_crop.shape[:2] == (64, 64)
     assert session._track_states[confirmed[0]["data"]["track_id"]][0] == "confirmed"
     assert session.status == SearchStatus.COMPLETED
     view = session.view()
@@ -842,7 +854,7 @@ def test_tiny_face_does_not_use_face_only_fallback(monkeypatch) -> None:
     assert session.view().association_counts == {}
 
 
-def test_confirmed_event_keeps_frame_and_crop_only_until_search_stops() -> None:
+def test_completed_search_keeps_real_face_crop_until_release_or_stop() -> None:
     target_view = TargetView(
         target_id="target-evidence",
         name="Evidence 目标",
@@ -859,7 +871,7 @@ def test_confirmed_event_keeps_frame_and_crop_only_until_search_stops() -> None:
         search_id="search-evidence",
         target=target,
         source=SourceConfig(type="camera", device_index=0),
-        settings=Settings(evidence_ttl_seconds=60),
+        settings=Settings(evidence_api_key="test-evidence-key", evidence_ttl_seconds=60),
         face_backend=FakeFaceBackend([]),
         person_detector=FakePersonDetector([]),
         on_finished=lambda search_id, target_ids: None,
@@ -873,6 +885,7 @@ def test_confirmed_event_keeps_frame_and_crop_only_until_search_stops() -> None:
                 state=MatchState.CONFIRMED,
                 track_id=7,
                 bbox=np.asarray([20, 30, 120, 140], dtype=np.float32),
+                face_bbox=np.asarray([40, 50, 80, 90], dtype=np.float32),
                 similarity=0.75,
                 quality=0.8,
                 evidence_count=3,
@@ -885,15 +898,264 @@ def test_confirmed_event_keeps_frame_and_crop_only_until_search_stops() -> None:
 
     confirmed = session.events.after(0, timeout=0)[0]
     evidence_id = confirmed["data"]["evidence_id"]
+    assert confirmed["data"]["bbox"] == [0.125, 0.1875, 0.75, 0.875]
+    assert confirmed["data"]["face_bbox"] == [0.25, 0.3125, 0.5, 0.5625]
+    assert confirmed["data"]["evidence_available"] is True
+    assert confirmed["data"]["evidence_expires_at_ms"] > int(time.time() * 1000)
+
+    session._transition(SearchStatus.COMPLETED, None, publish=False)
     crop, crop_type = session.get_evidence(evidence_id, "face_crop")
     full_frame, frame_type = session.get_evidence(evidence_id, "frame")
     assert crop_type == frame_type == "image/jpeg"
-    assert len(crop) > 0
+    decoded_crop = cv2.imdecode(np.frombuffer(crop, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded_crop.shape[:2] == (40, 40)
     assert len(full_frame) > len(crop)
+    result = session.view().confirmed_results[0]
+    assert result.evidence_id == evidence_id
+    assert result.evidence_available is True
+    assert result.face_bbox == (0.25, 0.3125, 0.5, 0.5625)
 
     session.stop(timeout=0)
-    with pytest.raises(PersonSearchError, match="evidence not found"):
+    assert session.view().confirmed_results[0].evidence_available is False
+    # A stop destroyed bytes nobody claimed. That is a different outcome from a
+    # consumer acknowledging delivery, and the code has to say so: the caller
+    # must stop retrying, and its operator must not read "released" and believe
+    # the crop was stored somewhere downstream.
+    with pytest.raises(PersonSearchError) as exc_info:
         session.get_evidence(evidence_id, "face_crop")
+    assert exc_info.value.code == "evidence_discarded"
+    assert exc_info.value.status_code == 410
+
+
+def test_confirmed_decision_without_face_box_never_falls_back_to_body_crop() -> None:
+    target_view = TargetView(
+        target_id="target-no-face-crop",
+        name="No Crop",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        target_view.name,
+    )
+    session = SearchSession(
+        search_id="search-no-face-crop",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [
+            MatchDecision(
+                state=MatchState.CONFIRMED,
+                track_id=10,
+                bbox=np.asarray([0, 0, 120, 150], dtype=np.float32),
+                similarity=0.8,
+                quality=0.9,
+                evidence_count=3,
+            )
+        ],
+        np.full((160, 160, 3), 100, dtype=np.uint8),
+    )
+
+    confirmed = session.events.after(0, timeout=0)[0]["data"]
+    assert confirmed["evidence_available"] is False
+    assert "evidence_id" not in confirmed
+    assert session._evidence == {}
+
+
+def test_unconfigured_evidence_endpoint_does_not_encode_or_advertise_a_crop() -> None:
+    target_view = TargetView(
+        target_id="target-no-evidence-key",
+        name="No Evidence Key",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        target_view.name,
+    )
+    session = SearchSession(
+        search_id="search-no-evidence-key",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [
+            MatchDecision(
+                state=MatchState.CONFIRMED,
+                track_id=12,
+                bbox=np.asarray([0, 0, 120, 150], dtype=np.float32),
+                face_bbox=np.asarray([20, 20, 60, 60], dtype=np.float32),
+                similarity=0.8,
+                quality=0.9,
+                evidence_count=3,
+            )
+        ],
+        np.full((160, 160, 3), 100, dtype=np.uint8),
+    )
+
+    confirmed = session.events.after(0, timeout=0)[0]["data"]
+    assert confirmed["evidence_available"] is False
+    assert "evidence_id" not in confirmed
+    assert session._evidence == {}
+
+
+def test_evidence_encoding_failure_does_not_undo_completed_match(monkeypatch) -> None:
+    target_view = TargetView(
+        target_id="target-evidence-failure",
+        name="Evidence Failure",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        target_view.name,
+    )
+    session = SearchSession(
+        search_id="search-evidence-failure",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    monkeypatch.setattr(
+        session,
+        "_store_evidence",
+        lambda frame, bbox: (_ for _ in ()).throw(RuntimeError("JPEG encoding failed")),
+    )
+
+    original_handle = session._handle_decisions
+
+    def confirm_on_first_frame(target_id, current_target, decisions, frame) -> None:
+        original_handle(
+            target_id,
+            current_target,
+            [
+                MatchDecision(
+                    state=MatchState.CONFIRMED,
+                    track_id=11,
+                    bbox=np.asarray([0, 0, 120, 150], dtype=np.float32),
+                    face_bbox=np.asarray([20, 20, 60, 60], dtype=np.float32),
+                    similarity=0.8,
+                    quality=0.9,
+                    evidence_count=3,
+                )
+            ],
+            frame,
+        )
+
+    monkeypatch.setattr(session, "_handle_decisions", confirm_on_first_frame)
+    packets = [
+        SimpleNamespace(
+            frame_id=1,
+            captured_at=1.0,
+            frame=np.full((160, 160, 3), 100, dtype=np.uint8),
+        )
+    ]
+    monkeypatch.setattr("person_search.service.LatestFrameReader", _fake_reader(packets))
+
+    session._run()
+
+    events = session.events.after(0, timeout=0)
+    confirmed = next(event for event in events if event["type"] == "confirmed")
+    found = next(event for event in events if event["type"] == "target_found")
+    assert confirmed["data"]["evidence_available"] is False
+    assert found["data"]["evidence_available"] is False
+    assert "evidence_id" not in confirmed["data"]
+    assert [event["type"] for event in events][-3:] == [
+        "search_status",
+        "target_found",
+        "all_found",
+    ]
+    assert session.status == SearchStatus.COMPLETED
+    assert session.view().targets[0].status.value == "found"
+    assert session.view().confirmed_results[0].evidence_available is False
+    assert target.target_id not in session._active_targets
+
+
+def test_evidence_ttl_actively_reclaims_completed_session_bytes() -> None:
+    target_view = TargetView(
+        target_id="target-expiring-evidence",
+        name="TTL 目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        target_view.name,
+    )
+    session = SearchSession(
+        search_id="search-expiring-evidence",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=Settings(evidence_api_key="test-evidence-key", evidence_ttl_seconds=0.05),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+    session._handle_decisions(
+        target.target_id,
+        target,
+        [
+            MatchDecision(
+                state=MatchState.CONFIRMED,
+                track_id=9,
+                bbox=np.asarray([0, 0, 100, 150], dtype=np.float32),
+                face_bbox=np.asarray([20, 20, 60, 60], dtype=np.float32),
+                similarity=0.8,
+                quality=0.9,
+                evidence_count=3,
+            )
+        ],
+        np.full((160, 160, 3), 100, dtype=np.uint8),
+    )
+    session._transition(SearchStatus.COMPLETED, None, publish=False)
+    evidence_id = session.events.after(0, timeout=0)[0]["data"]["evidence_id"]
+
+    deadline = time.monotonic() + 1.0
+    while evidence_id in session._evidence and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert evidence_id not in session._evidence
+    assert session.view().confirmed_results[0].evidence_available is False
+    with pytest.raises(PersonSearchError) as exc_info:
+        session.get_evidence(evidence_id, "face_crop")
+    assert exc_info.value.code == "evidence_expired"
+    assert exc_info.value.status_code == 410
 
 
 def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:
@@ -1440,3 +1702,107 @@ def test_camera_motion_estimate_is_skipped_when_disabled() -> None:
     frame = np.zeros((540, 960, 3), dtype=np.uint8)
 
     assert SearchSession._estimate_camera_motion(session, frame, None) == (None, None)
+
+
+def _evidence_session(search_id: str, *, settings: Settings | None = None):
+    """A session wired for evidence tests, with its confirmed decision helper."""
+    target_view = TargetView(
+        target_id=f"{search_id}-target",
+        name="Evidence 目标",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    target = Target(
+        target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        target_view,
+        target_view.name,
+    )
+    session = SearchSession(
+        search_id=search_id,
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings
+        or Settings(evidence_api_key="test-evidence-key", evidence_ttl_seconds=600),
+        face_backend=FakeFaceBackend([]),
+        person_detector=FakePersonDetector([]),
+        on_finished=lambda search_id, target_ids: None,
+    )
+
+    def confirm() -> str:
+        session._handle_decisions(
+            target.target_id,
+            target,
+            [
+                MatchDecision(
+                    state=MatchState.CONFIRMED,
+                    track_id=7,
+                    bbox=np.asarray([20, 30, 120, 140], dtype=np.float32),
+                    face_bbox=np.asarray([40, 50, 80, 90], dtype=np.float32),
+                    similarity=0.75,
+                    quality=0.8,
+                    evidence_count=3,
+                )
+            ],
+            np.full((160, 160, 3), 127, dtype=np.uint8),
+        )
+        return session.events.after(0, timeout=0)[0]["data"]["evidence_id"]
+
+    return session, confirm
+
+
+def test_acknowledged_release_stays_distinct_from_a_lifecycle_discard() -> None:
+    session, confirm = _evidence_session("search-release-vs-discard")
+    evidence_id = confirm()
+
+    session.release_evidence(evidence_id)
+    # Idempotent inside the TTL window so a lost 204 can be safely retried.
+    session.release_evidence(evidence_id)
+
+    with pytest.raises(PersonSearchError) as exc_info:
+        session.get_evidence(evidence_id, "face_crop")
+    assert exc_info.value.code == "evidence_released"
+    assert exc_info.value.status_code == 404
+    assert session.view().confirmed_results[0].evidence_available is False
+
+
+def test_deferred_target_found_reports_evidence_wiped_by_the_terminal_transition() -> None:
+    """A timed-out search must not advertise a crop it already destroyed.
+
+    ``target_found`` is built at confirmation time but published at the terminal
+    transition. Between the two, a timeout wipes the JPEGs, so the confirmation
+    -time ``evidence_available`` is stale by the time anyone reads it.
+    """
+    session, confirm = _evidence_session("search-deferred-target-found")
+    evidence_id = confirm()
+    assert session._deferred_events[0][1]["evidence_available"] is True
+
+    session._transition(SearchStatus.TIMED_OUT, None, publish=False)
+    session._publish_terminal_event()
+
+    found = [
+        event for event in session.events.after(0, timeout=0) if event["type"] == "target_found"
+    ]
+    assert len(found) == 1
+    assert found[0]["data"]["evidence_id"] == evidence_id
+    assert found[0]["data"]["evidence_available"] is False
+
+
+def test_deferred_target_found_keeps_evidence_live_through_normal_completion() -> None:
+    """The refresh must not zero out the case the whole feature exists for."""
+    session, confirm = _evidence_session("search-completed-target-found")
+    evidence_id = confirm()
+
+    session._transition(SearchStatus.COMPLETED, None, publish=False)
+    session._publish_terminal_event()
+
+    found = [
+        event for event in session.events.after(0, timeout=0) if event["type"] == "target_found"
+    ]
+    assert found[0]["data"]["evidence_available"] is True
+    crop, media_type = session.get_evidence(evidence_id, "face_crop")
+    assert media_type == "image/jpeg"
+    assert crop

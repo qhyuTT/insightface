@@ -4,6 +4,7 @@ import uvicorn
 
 from .api import create_app
 from .config import get_settings
+from .privacy import uvicorn_log_config
 
 app = create_app()
 
@@ -15,6 +16,7 @@ def run() -> None:
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
+        log_config=uvicorn_log_config(),
         workers=1,
     )
 

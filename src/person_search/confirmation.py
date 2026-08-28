@@ -25,6 +25,9 @@ class MatchDecision:
     evidence_count: int
     association: str = "person_strict"
     shadow: bool = False
+    # The tracked person box stays in ``bbox`` for event compatibility.  This is
+    # the actual face detector box and must be used when making a face crop.
+    face_bbox: np.ndarray | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +118,7 @@ class _TrackState:
     last_face_seen: float = 0.0
     last_candidate_emit: float = -1e9
     last_bbox: np.ndarray = field(default_factory=lambda: np.zeros(4, dtype=np.float32))
+    last_face_bbox: np.ndarray | None = None
     last_similarity: float = -1.0
     last_quality: float = 0.0
     last_association: str = "person_strict"
@@ -312,6 +316,11 @@ class TrackConfirmation:
             similarity = float(np.dot(target.embedding, face.embedding))
             if not policy.accepts_observation(face.detection_score, similarity):
                 continue
+            # The crop belongs to the observation that is currently driving the
+            # verdict. Keep it independent of ``last_face_seen``: a collect-all
+            # policy may legally confirm on a sub-threshold final sample when the
+            # complete evidence window still passes its aggregate gates.
+            state.last_face_bbox = face.bbox.copy()
             if similarity >= policy.threshold:
                 # A sub-threshold tiny-face sample counts as evidence, not as a sighting:
                 # it must not refresh the reported state or the confirmed-track grace timer.
@@ -433,6 +442,7 @@ class TrackConfirmation:
             similarity=state.last_similarity,
             quality=state.last_quality,
             evidence_count=len(state.evidence),
+            face_bbox=None if state.last_face_bbox is None else state.last_face_bbox.copy(),
             association=state.last_association,
             shadow=shadow,
         )

@@ -89,6 +89,27 @@ class TargetSearchView(BaseModel):
     last_rejection_face_px: int | None = None
 
 
+class ConfirmedSearchResult(BaseModel):
+    """A confirmed event retained as the HTTP reconciliation source of truth."""
+
+    search_id: str
+    target_id: str
+    target_name: str = "目标"
+    state: MatchState = MatchState.CONFIRMED
+    timestamp_ms: int
+    track_id: int
+    bbox: tuple[float, float, float, float]
+    face_bbox: tuple[float, float, float, float] | None = None
+    similarity: float
+    quality: float
+    evidence_count: int
+    model: str
+    association: str = "person_strict"
+    evidence_id: str | None = None
+    evidence_expires_at_ms: int | None = None
+    evidence_available: bool = False
+
+
 class SearchView(BaseModel):
     search_id: str
     target_id: str | None = None
@@ -128,6 +149,9 @@ class SearchView(BaseModel):
     unfound_target_ids: list[str] = Field(default_factory=list)
     timeout_seconds: float | None = None
     request_id: str | None = None
+    # Confirmed payloads are retained with the session so HTTP reconciliation can
+    # recover a hit even when the websocket event was missed.
+    confirmed_results: list[ConfirmedSearchResult] = Field(default_factory=list)
 
 
 class TargetView(BaseModel):
@@ -148,6 +172,9 @@ class SearchEvent(BaseModel):
     timestamp_ms: int
     track_id: int
     bbox: tuple[float, float, float, float]
+    # ``bbox`` remains the tracked person box for backwards compatibility;
+    # ``face_bbox`` is the detector box used for the evidence crop.
+    face_bbox: tuple[float, float, float, float] | None = None
     similarity: float
     quality: float
     evidence_count: int
@@ -156,6 +183,8 @@ class SearchEvent(BaseModel):
     # Opaque, short-lived reference to evidence held only by this executor. It
     # is intentionally not an image URL and has no meaning after the task ends.
     evidence_id: str | None = None
+    evidence_expires_at_ms: int | None = None
+    evidence_available: bool | None = None
 
 
 @dataclass(slots=True)

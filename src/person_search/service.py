@@ -26,6 +26,7 @@ from .confirmation import (
 from .detector import PersonDetector, YoloXOnnxDetector
 from .domain import (
     FaceObservation,
+    MatchState,
     SearchEvent,
     SearchMetrics,
     SearchStatus,
@@ -131,6 +132,7 @@ class _EvidenceItem:
     frame_jpeg: bytes
     face_crop_jpeg: bytes
     expires_at: float
+    expires_at_ms: int = 0
 
 
 @dataclass
@@ -215,6 +217,18 @@ class SearchSession:
         self._stop_requested = False
         self._deferred_events: list[tuple[str, dict[str, Any]]] = []
         self._evidence: dict[str, _EvidenceItem] = {}
+        # Keep the metadata after the bytes are claimed/released so HTTP
+        # reconciliation can still explain why a crop is unavailable.
+        self._confirmed_results: list[dict[str, Any]] = []
+        # Explicitly acknowledged ids are retained for one TTL window so DELETE
+        # can be retried safely without allowing tombstones to grow forever.
+        self._released_evidence: dict[str, float] = {}
+        # Ids whose bytes a lifecycle wipe destroyed before any consumer claimed
+        # them.  Kept apart from ``_released_evidence`` so a stop/timeout/failure
+        # is never reported as a successful downstream hand-off.
+        self._discarded_evidence: set[str] = set()
+        self._evidence_cleanup_timer: threading.Timer | None = None
+        self._evidence_cleanup_generation = 0
 
     def start(self) -> None:
         self._worker = threading.Thread(
@@ -229,6 +243,9 @@ class SearchSession:
     def stop(self, timeout: float = STOP_WAIT_SECONDS) -> None:
         self._stop.set()
         self._stop_requested = True
+        # An explicit stop is a caller-requested abort, so its evidence must not
+        # outlive the search.  Automatic completion follows a different path and
+        # intentionally keeps the bytes until their TTL or an acknowledgement.
         self.clear_evidence()
         self._transition(SearchStatus.STOPPING, None)
         if self._reader:
@@ -243,12 +260,11 @@ class SearchSession:
     def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
         """Return a single short-lived image held exclusively in process memory."""
         with self._lock:
+            self._cleanup_expired_evidence_locked()
             item = self._evidence.get(evidence_id)
             if item is None or item.expires_at <= time.monotonic() or self._stop.is_set():
                 self._evidence.pop(evidence_id, None)
-                raise PersonSearchError(
-                    "evidence not found", code="evidence_not_found", status_code=404
-                )
+                self._raise_missing_evidence_locked(evidence_id)
             if variant == "frame":
                 return item.frame_jpeg, "image/jpeg"
             if variant == "face_crop":
@@ -259,9 +275,131 @@ class SearchSession:
             status_code=422,
         )
 
+    def release_evidence(self, evidence_id: str) -> None:
+        """Release one evidence item after a downstream consumer has persisted it.
+
+        The operation is idempotent for a recently released id, which lets a
+        caller safely retry its acknowledgement after a lost HTTP response.
+        Expired and unknown ids remain a 404 so callers can distinguish a late
+        acknowledgement from a successful claim.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self._cleanup_expired_evidence_locked(now)
+            item = self._evidence.pop(evidence_id, None)
+            if item is not None:
+                self._released_evidence[evidence_id] = item.expires_at
+                self._set_evidence_available_locked(evidence_id, False)
+                self._schedule_evidence_cleanup_locked()
+                return
+            released_until = self._released_evidence.get(evidence_id)
+            if released_until is not None and released_until > now:
+                return
+            self._released_evidence.pop(evidence_id, None)
+            self._raise_missing_evidence_locked(evidence_id)
+
+    def _raise_missing_evidence_locked(self, evidence_id: str) -> None:
+        if evidence_id in self._discarded_evidence:
+            # 410: the bytes are gone for good, so a caller must stop retrying.
+            # A distinct code keeps "the search ended" apart from "you released
+            # it" and from "you were too slow".
+            raise PersonSearchError(
+                "evidence discarded with the search",
+                code="evidence_discarded",
+                status_code=410,
+            )
+        result = next(
+            (
+                item
+                for item in self._confirmed_results
+                if item.get("evidence_id") == evidence_id
+            ),
+            None,
+        )
+        if result is not None:
+            expires_at_ms = result.get("evidence_expires_at_ms")
+            if isinstance(expires_at_ms, int) and expires_at_ms <= int(time.time() * 1000):
+                raise PersonSearchError(
+                    "evidence expired", code="evidence_expired", status_code=410
+                )
+            raise PersonSearchError(
+                "evidence not found (released)", code="evidence_released", status_code=404
+            )
+        raise PersonSearchError("evidence not found", code="evidence_not_found", status_code=404)
+
     def clear_evidence(self) -> None:
         with self._lock:
+            # Anything still held was destroyed without being claimed; remember
+            # which ids so a late GET/DELETE can say so instead of implying the
+            # consumer already took delivery.
+            self._discarded_evidence.update(self._evidence)
             self._evidence.clear()
+            self._released_evidence.clear()
+            self._evidence_cleanup_generation += 1
+            timer = self._evidence_cleanup_timer
+            self._evidence_cleanup_timer = None
+            if timer is not None:
+                timer.cancel()
+            for result in self._confirmed_results:
+                if result.get("evidence_id"):
+                    result["evidence_available"] = False
+
+    def cleanup_expired_evidence(self) -> int:
+        """Drop expired JPEGs and return the number removed.
+
+        This is safe to call from the deadline timer as well as from request
+        paths. Metadata is intentionally retained in ``confirmed_results``.
+        """
+        with self._lock:
+            removed = self._cleanup_expired_evidence_locked()
+            if self._evidence_cleanup_timer is None and (
+                self._evidence or self._released_evidence
+            ):
+                self._schedule_evidence_cleanup_locked()
+            return removed
+
+    def _cleanup_expired_evidence_locked(self, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        expired = [eid for eid, item in self._evidence.items() if item.expires_at <= now]
+        for evidence_id in expired:
+            self._evidence.pop(evidence_id, None)
+            self._set_evidence_available_locked(evidence_id, False)
+        stale_released = [
+            evidence_id
+            for evidence_id, released_until in self._released_evidence.items()
+            if released_until <= now
+        ]
+        for evidence_id in stale_released:
+            self._released_evidence.pop(evidence_id, None)
+        return len(expired)
+
+    def _set_evidence_available_locked(self, evidence_id: str, available: bool) -> None:
+        for result in self._confirmed_results:
+            if result.get("evidence_id") == evidence_id:
+                result["evidence_available"] = available
+
+    def _refresh_evidence_availability(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Re-check evidence liveness at publish time.
+
+        ``target_found`` is built when the track confirms but published at the
+        terminal transition, and a stop, timeout or failure wipes the bytes in
+        between.  Publishing the confirmation-time flag would send the control
+        plane after a crop that no longer exists, costing it a retry budget and
+        a misleading error.
+        """
+        evidence_id = payload.get("evidence_id")
+        if not evidence_id:
+            return payload
+        with self._lock:
+            available = self._evidence_is_available_locked(str(evidence_id))
+        if available == payload.get("evidence_available"):
+            return payload
+        return {**payload, "evidence_available": available}
+
+    def _evidence_is_available_locked(self, evidence_id: str, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        item = self._evidence.get(evidence_id)
+        return item is not None and item.expires_at > now and not self._stop.is_set()
 
     def _store_evidence(self, frame: np.ndarray, bbox: np.ndarray) -> str | None:
         """JPEG-encode the confirmation frame and face crop without touching disk."""
@@ -278,16 +416,47 @@ class SearchSession:
         if not frame_ok or not crop_ok:
             return None
         evidence_id = str(uuid.uuid4())
+        now_mono = time.monotonic()
+        expires_at = now_mono + self.settings.evidence_ttl_seconds
+        expires_at_ms = int((time.time() + self.settings.evidence_ttl_seconds) * 1000)
         with self._lock:
             self._evidence[evidence_id] = _EvidenceItem(
                 frame_jpeg=frame_jpeg.tobytes(),
                 face_crop_jpeg=crop_jpeg.tobytes(),
-                expires_at=time.monotonic() + self.settings.evidence_ttl_seconds,
+                expires_at=expires_at,
+                expires_at_ms=expires_at_ms,
             )
+            self._schedule_evidence_cleanup_locked()
         return evidence_id
+
+    def _schedule_evidence_cleanup_locked(self) -> None:
+        self._evidence_cleanup_generation += 1
+        generation = self._evidence_cleanup_generation
+        timer = self._evidence_cleanup_timer
+        if timer is not None:
+            timer.cancel()
+        deadlines = [item.expires_at for item in self._evidence.values()]
+        deadlines.extend(self._released_evidence.values())
+        if not deadlines:
+            self._evidence_cleanup_timer = None
+            return
+        delay = max(0.001, min(deadlines) - time.monotonic())
+        timer = threading.Timer(delay, self._run_evidence_cleanup, args=(generation,))
+        timer.daemon = True
+        self._evidence_cleanup_timer = timer
+        timer.start()
+
+    def _run_evidence_cleanup(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._evidence_cleanup_generation:
+                return
+            self._evidence_cleanup_timer = None
+            self._cleanup_expired_evidence_locked()
+            self._schedule_evidence_cleanup_locked()
 
     def view(self) -> SearchView:
         with self._lock:
+            self._cleanup_expired_evidence_locked()
             metrics = self.metrics.snapshot()
             target_views = [
                 TargetSearchView(
@@ -316,6 +485,17 @@ class SearchSession:
                 request_id=self.request_id,
                 effective_config=self._effective_config(),
                 **metrics,
+                confirmed_results=[
+                    {
+                        **result,
+                        "evidence_available": (
+                            self._evidence_is_available_locked(str(result["evidence_id"]))
+                            if result.get("evidence_id")
+                            else False
+                        ),
+                    }
+                    for result in self._confirmed_results
+                ],
             )
 
     def _effective_config(self) -> dict[str, object]:
@@ -862,6 +1042,11 @@ class SearchSession:
                 timestamp_ms=int(time.time() * 1000),
                 track_id=decision.track_id,
                 bbox=normalize_bbox(decision.bbox, frame_shape),
+                face_bbox=(
+                    None
+                    if decision.face_bbox is None
+                    else normalize_bbox(decision.face_bbox, frame_shape)
+                ),
                 similarity=decision.similarity,
                 quality=decision.quality,
                 evidence_count=decision.evidence_count,
@@ -873,10 +1058,37 @@ class SearchSession:
                 not decision.shadow
                 and decision.state.value == "confirmed"
                 and isinstance(frame, np.ndarray)
+                and decision.face_bbox is not None
+                and bool(self.settings.evidence_api_key)
             ):
-                evidence_id = self._store_evidence(frame, decision.bbox)
+                # The person track box is intentionally retained in the public
+                # ``bbox`` field.  Crop from the detector's actual face box so a
+                # full-body track cannot produce a misleading giant crop.
+                try:
+                    evidence_id = self._store_evidence(frame, decision.face_bbox)
+                except Exception:  # noqa: BLE001 - optional evidence must not undo a hit
+                    # JPEG encoding is an auxiliary hand-off. A malformed box,
+                    # OpenCV failure, or memory pressure must leave the confirmed
+                    # recognition intact and surface only as unavailable evidence.
+                    evidence_id = None
                 if evidence_id is not None:
                     payload["evidence_id"] = evidence_id
+                    with self._lock:
+                        item = self._evidence.get(evidence_id)
+                    if item is not None:
+                        payload["evidence_expires_at_ms"] = item.expires_at_ms
+            if not decision.shadow and decision.state.value == "confirmed":
+                payload["evidence_available"] = bool(payload.get("evidence_id"))
+                # Store an immutable-ish dict snapshot.  SearchView validates it
+                # through ConfirmedSearchResult, while the availability bit is
+                # refreshed on every view after TTL/release cleanup.
+                with self._lock:
+                    self._confirmed_results.append(
+                        {
+                            **payload,
+                            "state": MatchState.CONFIRMED.value,
+                        }
+                    )
             if decision.shadow:
                 event_type = f"tiny_shadow_{decision.state.value}"
                 payload["state"] = event_type.removeprefix("tiny_")
@@ -1238,7 +1450,6 @@ class SearchSession:
         if status in {
             SearchStatus.STOPPED,
             SearchStatus.FAILED,
-            SearchStatus.COMPLETED,
             SearchStatus.TIMED_OUT,
         }:
             self.clear_evidence()
@@ -1255,7 +1466,7 @@ class SearchSession:
             {"search_id": self.search_id, "status": status.value, "error": self.error},
         )
         for event_type, payload in self._deferred_events:
-            self.events.publish(event_type, payload)
+            self.events.publish(event_type, self._refresh_evidence_availability(payload))
         self._deferred_events.clear()
         if status == SearchStatus.COMPLETED:
             self.events.publish("all_found", {"search_id": self.search_id})
@@ -1439,6 +1650,9 @@ class SearchManager:
         with self._lifecycle_lock:
             session = self._get_session(search_id)
             if session.finished.is_set():
+                # DELETE remains an explicit resource stop even when the worker
+                # happened to auto-complete just before the request arrived.
+                session.clear_evidence()
                 return
             session.stop()
 
@@ -1459,7 +1673,10 @@ class SearchManager:
                 # caller will still see a clear timeout if this is an API stop.
                 pass
         with self._lock:
+            sessions = list(self._sessions.values())
             self._targets.clear()
+        for session in sessions:
+            session.clear_evidence()
 
     def _get_session(self, search_id: str) -> SearchSession:
         with self._lock:

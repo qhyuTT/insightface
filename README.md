@@ -418,8 +418,21 @@ curl -X POST http://127.0.0.1:8000/v1/batch-searches \
 ### 命中证据交接
 
 正式 `confirmed`（及其后续的 `target_found`）事件可能带有不透明的 `data.evidence_id`。执行器仅把
-对应的 JPEG 原始帧和人脸裁剪保存在进程内存，默认最长 120 秒；证据绝不写入日志、事件 payload、磁盘或数据库。
-控制面应在收到 `confirmed` 后立即使用其共享密钥拉取裁剪，随后自行按隐私策略加密保存。任务被停止、完成、超时或失败时，执行器会立即清空全部证据，因此终态补发的 `target_found` 中的 ID 仅可用于关联，不能再下载图片。
+对应的 JPEG 原始帧和人脸裁剪保存在进程内存，默认最长 600 秒；证据绝不写入日志、事件 payload、磁盘或数据库。
+控制面可在收到 `confirmed` 后使用其共享密钥拉取裁剪，随后自行按隐私策略加密保存，并调用同一路径的 `DELETE` 确认释放。自动完成（`completed`）时证据会保留到 TTL；显式停止、超时或失败时立即清空。`GET /v1/searches/{search_id}` 的 `confirmed_results` 可作为事件漏收时的可靠查询源，其中的 `evidence_available` 表示该条裁剪此刻是否仍可下载。
+
+`confirmed` 事件同时带 `face_bbox`（人脸检测框）与 `bbox`（人体跟踪框），两者都是归一化坐标；裁剪取自 `face_bbox`。未配置 `PERSON_SEARCH_EVIDENCE_API_KEY` 时不会编码任何图片，事件里也不会出现 `evidence_id`。
+
+取图与释放的失败语义各不相同，调用方必须区别对待：
+
+| 状态 | `code` | 含义 | 是否应重试 |
+| --- | --- | --- | --- |
+| 404 | `evidence_not_found` | ID 未知 | 否 |
+| 404 | `evidence_released` | 已被自己的 `DELETE` 释放 | 否（幂等成功） |
+| 410 | `evidence_expired` | 超过 TTL | 否 |
+| 410 | `evidence_discarded` | 随搜索显式停止/超时/失败被清空 | 否 |
+| 403 | `invalid_evidence_api_key` | 密钥不匹配 | 否 |
+| 503 | `evidence_access_not_configured` | 执行器未配置密钥 | 否 |
 
 ```bash
 curl -H "X-API-Key: $PERSON_SEARCH_EVIDENCE_API_KEY" \

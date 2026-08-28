@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # executor does not expose a face image unless its caller configured a
     # separate shared credential.
     evidence_api_key: str | None = None
-    evidence_ttl_seconds: float = Field(default=120.0, gt=0, le=3600)
+    evidence_ttl_seconds: float = Field(default=600.0, gt=0, le=3600)
 
     insightface_model: str = "buffalo_l"
     insightface_root: Path = Path("~/.insightface").expanduser()

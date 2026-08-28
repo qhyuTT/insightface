@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .config import Settings, get_settings
 from .domain import SearchCreate, SearchView, SourceConfig, SourceType, TargetView
 from .errors import PersonSearchError
+from .privacy import install_evidence_access_log_filter
 from .service import SearchManager
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -39,6 +40,7 @@ def create_app(
     settings: Settings | None = None,
     manager: SearchManager | None = None,
 ) -> FastAPI:
+    install_evidence_access_log_filter()
     settings = settings or get_settings()
     manager = manager or SearchManager(settings)
 
@@ -66,15 +68,19 @@ def create_app(
     @app.get("/healthz")
     async def health() -> dict[str, Any]:
         active = manager.active_search()
+        capabilities = [
+            "replace_active",
+            "active_search",
+            "search_timeout",
+            "request_lookup",
+            "event_replay",
+        ]
+        if settings.evidence_api_key:
+            capabilities.append("confirmed_evidence_v1")
         return {
             "status": "ok",
             "api_version": "0.2.0",
-            "capabilities": [
-                "replace_active",
-                "active_search",
-                "search_timeout",
-                "request_lookup",
-            ],
+            "capabilities": capabilities,
             "active_search": active is not None,
         }
 
@@ -294,6 +300,29 @@ def create_app(
             media_type=media_type,
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
+
+    @app.delete("/v1/searches/{search_id}/evidence/{evidence_id}", status_code=204)
+    async def release_evidence(
+        search_id: str,
+        evidence_id: str,
+        x_api_key: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        """Acknowledge durable downstream storage and release in-memory JPEGs."""
+        if not settings.evidence_api_key:
+            raise PersonSearchError(
+                "evidence retrieval is not configured",
+                code="evidence_access_not_configured",
+                status_code=503,
+            )
+        if x_api_key is None or not hmac.compare_digest(x_api_key, settings.evidence_api_key):
+            raise PersonSearchError(
+                "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
+            )
+        await asyncio.to_thread(
+            manager.get_session(search_id).release_evidence,
+            evidence_id,
+        )
+        return Response(status_code=204)
 
     @app.get(
         "/v1/searches/{search_id}/preview.mjpg",

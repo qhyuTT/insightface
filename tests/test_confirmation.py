@@ -81,6 +81,9 @@ def test_three_separated_frames_confirm_then_face_timeout_loses() -> None:
         states.extend(item.state for item in decisions)
     assert states.count(MatchState.CONFIRMED) == 1
     assert states[-1] == MatchState.CONFIRMED
+    confirmed = next(item for item in decisions if item.state == MatchState.CONFIRMED)
+    np.testing.assert_array_equal(confirmed.bbox, track.bbox)
+    np.testing.assert_array_equal(confirmed.face_bbox, face.bbox)
 
     before_timeout = matcher.process(
         frame_id=3,

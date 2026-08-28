@@ -416,6 +416,11 @@ def run_offline(
                             "shadow": decision.shadow,
                             "track_id": decision.track_id,
                             "bbox": normalize_bbox(decision.bbox, frame.shape),
+                            "face_bbox": (
+                                None
+                                if decision.face_bbox is None
+                                else normalize_bbox(decision.face_bbox, frame.shape)
+                            ),
                             "similarity": decision.similarity,
                             "quality": decision.quality,
                             "evidence_count": decision.evidence_count,

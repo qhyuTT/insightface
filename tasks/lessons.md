@@ -74,3 +74,10 @@
 - 测试里 `assert a is None is expected` 是链式比较，等价于 `(a is None) and (None is
   expected)`，对 `expected=True` 恒假、对 `expected=None` 恒真——两种都不是想断言的东西。
   布尔等价断言要显式加括号写成 `(a is None) == expected`。
+- `cp -a` 复制出来的部署目录会把 `origin` 一起复制走。60 服务器的 release 目录是逐代
+  `cp -a` 的，`origin` 指向**上一个 release 目录**而不是 GitHub（cb1c82c ← 0dffc78 ←
+  1d2e477 ← ecf02f8），于是 `git fetch origin main && git merge --ff-only` 报
+  「Already up to date」、`git status` 干净、流程每一步都成功——构建的却是旧代码。
+  这类静默失败不能靠「命令有没有报错」判断，必须核对**结果**：
+  `git rev-parse --short HEAD` 等于目标 commit 才算数。同理 `current` 符号链接上一次
+  忘了更新（停在 6ceb350），照 README 的 `cp -a current` 会从错误的基线分叉。

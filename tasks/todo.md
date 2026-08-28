@@ -552,3 +552,23 @@ clone 后 `git fetch <bundle>` + `merge --ff-only`，`models/yolox_tiny.onnx` �
       `tiny_face_similarity_threshold` / `tiny_face_aggregate_similarity_threshold`。
 - [ ] **离场结算下游**：shadow 事件是 `tiny_shadow_confirmed`，调度端目前只消费 `target_found`。
       要真正用上这条线索通道，dispatch 侧需要订阅并以「线索」而非「命中」呈现。
+
+### 部署（192.168.17.60，2026-08-28）
+
+- [x] `cb1c82c` 推送 GitHub，服务器 `insightface-release-cb1c82c` 构建部署，容器 healthy，
+      部署日志验证 `CUDAExecutionProvider`
+- [x] 回滚点 `person-search:t4.rollback-0dffc78-20260828T081235Z`（上一次 0dffc78 上线
+      漏了打标签，这次补上）
+- [x] `current` 符号链接更新到 cb1c82c（此前停在 6ceb350，已停留三代）
+- [x] 生产配置核对：`match_profile=conservative`、`departure_adjudication=False`、
+      远脸仍 `6/3.0s/5 票`、`evidence_statistic=median`、`face_detection_size=1280`
+      —— **本次上线行为零变化**，只多了可观测性
+- [x] `/monitor` 已带 `confirmLatencyDiag` / `blockerDiag` 两个新格子
+
+**踩到的坑**：release 目录逐代 `cp -a`，`origin` 指向上一个 release 目录而非 GitHub，
+`git fetch origin main` 静默 no-op、HEAD 停在 0dffc78 而 `git status` 干净。已 `remote
+set-url` 修正并把这条写进服务器 `~/deploy/README.txt` 与 lessons。
+
+- [ ] 下一步仍是**现场读数**：跑一次真实寻人，看 `实际采样率 vs 需求采样率` 和
+      `未确认卡点` 分桶，再决定是减负载还是标定阈值。切 transit 档只需
+      `T4_MATCH_PROFILE=transit ./scripts/deploy_t4.sh` 重跑一次。

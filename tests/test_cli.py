@@ -483,6 +483,8 @@ def test_offline_embedding_uses_live_budget_and_microbatch_path(monkeypatch, tmp
     assert diagnostics["embedding_candidates"] == 2
     assert diagnostics["faces_dropped_by_budget"] == 1
     assert diagnostics["embedding_batch_count"] == 1
+    assert diagnostics["embedding_failures"] == 0
+    assert diagnostics["embedding_provider_failures"] == 0
     # The enrollment photo is embedded once before the live clip; the bounded
     # replay path contributes the second single-row call.
     assert backend.batch_inputs == [1, 1]

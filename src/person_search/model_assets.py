@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import sys
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 YOLOX_TINY_URL = (
@@ -12,6 +13,28 @@ YOLOX_TINY_URL = (
 )
 YOLOX_TINY_SHA256 = "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
 DEFAULT_DESTINATION = Path("models/yolox_tiny.onnx")
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingModelManifest:
+    model_name: str
+    recognition_filename: str
+    recognition_sha256: str
+    embedding_dimension: int
+    input_size: tuple[int, int]
+
+
+BUFFALO_L_EMBEDDING_MANIFEST = EmbeddingModelManifest(
+    model_name="buffalo_l",
+    recognition_filename="w600k_r50.onnx",
+    recognition_sha256="4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43",
+    embedding_dimension=512,
+    input_size=(112, 112),
+)
+
+EMBEDDING_MODEL_MANIFESTS = {
+    BUFFALO_L_EMBEDDING_MANIFEST.model_name: BUFFALO_L_EMBEDDING_MANIFEST,
+}
 
 
 def main() -> None:

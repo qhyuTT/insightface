@@ -12,6 +12,9 @@ import numpy as np
 
 from .config import Settings
 from .domain import SearchStatus, SourceConfig, SourceType
+from .errors import SearchStopTimeoutError
+
+_READER_STOP_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +75,11 @@ class LatestFrameReader:
         with self._lifecycle_lock:
             thread = self._thread
         if thread and thread is not threading.current_thread():
-            thread.join(timeout=3.0)
+            thread.join(timeout=_READER_STOP_TIMEOUT_SECONDS)
+            if thread.is_alive():
+                raise SearchStopTimeoutError(
+                    "video reader thread did not exit within the stop timeout"
+                )
 
     def clear(self) -> None:
         """Drop decoded frames that would otherwise keep camera buffers alive."""

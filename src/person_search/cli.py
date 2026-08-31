@@ -248,6 +248,7 @@ def run_offline(
     roi_context = SimpleNamespace(
         settings=settings,
         face_backend=face_backend,
+        embedding_contract=getattr(face_backend, "embedding_contract", None),
         _roi_misses={},
         _roi_skips={},
         _track_states={},

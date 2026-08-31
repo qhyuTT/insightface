@@ -29,9 +29,11 @@ from person_search.service import (
     SearchManager,
     SearchSession,
     _clone_target,
+    _coerce_face_bbox,
     _merge_faces,
     _normalize_request_id,
     _safe_error,
+    _safe_normalize_embedding,
     _sanitize_source,
 )
 
@@ -89,6 +91,7 @@ def test_target_embedding_is_normalized_and_can_be_deleted() -> None:
     manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
     target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), " Alice ")
     assert target_view.name == "Alice"
+    assert target_view.embedding_contract_id == FakeFaceBackend.embedding_contract.contract_id
     assert manager.get_target(target_view.target_id).name == "Alice"
     assert np.linalg.norm(manager.get_target(target_view.target_id).embedding) == pytest.approx(1.0)
     assert manager.delete_target(target_view.target_id)
@@ -96,6 +99,27 @@ def test_target_embedding_is_normalized_and_can_be_deleted() -> None:
     with pytest.raises(PersonSearchError) as caught:
         manager.get_target(target_view.target_id)
     assert caught.value.code == "target_not_found"
+
+
+def test_manager_readiness_exposes_complete_provider_and_embedding_contract() -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([]), FakePersonDetector())
+
+    readiness = manager.ensure_ready()
+
+    assert readiness["providers"] == {
+        "person_detection": "CPUExecutionProvider",
+        "face_detection": "CPUExecutionProvider",
+        "face_recognition": "CPUExecutionProvider",
+    }
+    assert readiness["embedding_contract"] == {
+        "schema_version": "arcface-v1",
+        "model_name": "fake-arcface",
+        "model_sha256": "0" * 64,
+        "embedding_dimension": 2,
+        "input_size": [112, 112],
+        "flip_tta": False,
+        "contract_id": FakeFaceBackend.embedding_contract.contract_id,
+    }
 
 
 def test_enroll_rejects_blank_target_name() -> None:
@@ -291,6 +315,103 @@ def test_live_embedding_chunk_drops_malformed_provider_results(provider_result) 
 
     assert embedded == []
     assert session.metrics.embedding_failures == 1
+    assert session.metrics.embedding_output_failures == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        1.0,
+        [],
+        [[1.0, 0.0]],
+        [0.0, 0.0],
+        [np.nan, 0.0],
+        [np.inf, 0.0],
+        np.asarray([1.0 + 1.0j, 0.0]),
+    ],
+)
+def test_safe_normalize_embedding_rejects_malformed_values(value) -> None:
+    assert _safe_normalize_embedding(value) is None
+
+
+def test_safe_normalize_embedding_handles_float32_extremes_without_returning_zero() -> None:
+    normalized = _safe_normalize_embedding(np.asarray([3e38, 3e38], dtype=np.float32))
+
+    assert normalized is not None
+    assert normalized.dtype == np.float32
+    assert normalized.flags.c_contiguous
+    assert np.linalg.norm(normalized) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, [0, 0, 1], [0, 0, np.nan, 1], [1, 0, 0, 1], [0, 1, 1, 0]],
+)
+def test_coerce_face_bbox_rejects_malformed_values(value) -> None:
+    assert _coerce_face_bbox(value) is None
+
+
+def test_live_embedding_results_are_reordered_by_bbox_and_written_to_inputs() -> None:
+    session = _evidence_session("search-reordered-embedding")[0]
+    first = make_face(bbox=(0, 0, 60, 60))
+    second = make_face(bbox=(80, 0, 140, 60))
+    session.face_backend.embed_faces = lambda frame, faces: [  # type: ignore[method-assign]
+        replace(second, embedding=np.asarray([0.0, 4.0], dtype=np.float32)),
+        replace(first, embedding=np.asarray([3.0, 0.0], dtype=np.float32)),
+    ]
+
+    embedded = session._embed_face_chunk(
+        np.zeros((160, 160, 3), dtype=np.uint8), [first, second]
+    )
+
+    assert len(embedded) == 2
+    assert embedded[0] is first
+    assert embedded[1] is second
+    np.testing.assert_array_equal(first.embedding, [1.0, 0.0])
+    np.testing.assert_array_equal(second.embedding, [0.0, 1.0])
+    assert session.metrics.embedding_failures == 0
+    assert session.metrics.embedding_output_failures == 0
+
+
+def test_partial_duplicate_bbox_embedding_response_fails_closed() -> None:
+    session = _evidence_session("search-duplicate-embedding")[0]
+    faces = [make_face(), make_face()]
+    session.face_backend.embed_faces = lambda frame, inputs: [  # type: ignore[method-assign]
+        replace(inputs[0], embedding=np.asarray([1.0, 0.0], dtype=np.float32))
+    ]
+
+    embedded = session._embed_face_chunk(
+        np.zeros((160, 160, 3), dtype=np.uint8), faces
+    )
+
+    assert embedded == []
+    assert session.metrics.embedding_failures == 1
+    assert session.metrics.embedding_output_failures == 2
+
+
+def test_oom_split_counts_failed_call_without_double_counting_face_outputs() -> None:
+    session = _evidence_session("search-oom-split")[0]
+    faces = [
+        make_face(bbox=(0, 0, 60, 60)),
+        make_face(bbox=(80, 0, 140, 60)),
+    ]
+
+    def embed(frame, inputs):
+        if len(inputs) > 1:
+            raise MemoryError("out of memory")
+        return [replace(inputs[0], embedding=np.asarray([1.0, 0.0], dtype=np.float32))]
+
+    session.face_backend.embed_faces = embed  # type: ignore[method-assign]
+
+    embedded = session._embed_face_chunk(
+        np.zeros((160, 160, 3), dtype=np.uint8), faces
+    )
+
+    assert len(embedded) == 2
+    assert session.metrics.embedding_batch_count == 3
+    assert session.metrics.embedding_failures == 1
+    assert session.metrics.embedding_output_failures == 0
 
 
 def test_roi_selection_is_per_track_and_not_suppressed_by_an_unrelated_near_face() -> None:
@@ -530,6 +651,9 @@ def test_found_target_remains_an_identity_competitor_until_real_runner_up_appear
     class SequenceFaceBackend:
         model_name = "fake-arcface"
         provider_name = "CPUExecutionProvider"
+        detection_provider_name = "CPUExecutionProvider"
+        recognition_provider_name = "CPUExecutionProvider"
+        embedding_contract = FakeFaceBackend.embedding_contract
 
         def __init__(self, observations):
             self.observations = list(observations)
@@ -1278,6 +1402,33 @@ def test_start_failure_rolls_back_session_and_active_slot(monkeypatch) -> None:
     assert manager.get_target(target.target_id).target_id == target.target_id
 
 
+def test_replace_active_with_same_target_stages_embedding_before_old_callback(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    monkeypatch.setattr(SearchSession, "start", lambda session: None)
+    first = manager.start_batch_search(
+        [target.target_id], SourceConfig(type="camera", device_index=0)
+    )
+    first_session = manager.get_session(first.search_id)
+
+    def finish_old_session(timeout=15.0) -> None:
+        first_session._finished.set()
+        manager._on_finished(first.search_id, [target.target_id])
+
+    first_session.stop = finish_old_session  # type: ignore[method-assign]
+    replacement = manager.start_batch_search(
+        [target.target_id],
+        SourceConfig(type="camera", device_index=1),
+        replace_active=True,
+    )
+    replacement_session = manager.get_session(replacement.search_id)
+
+    embedding = replacement_session.targets[0].embedding
+    assert embedding is not None
+    np.testing.assert_array_equal(embedding, [1.0, 0.0])
+    assert target.target_id not in manager._targets
+
+
 def test_active_search_is_idempotent_by_request_id(monkeypatch) -> None:
     manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
     target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
@@ -1954,6 +2105,26 @@ def test_sensitive_cleanup_retries_after_one_component_fails() -> None:
     assert calls == 2
     assert session._sensitive_cleared is True
     assert all(target.embedding is None for target in session.targets)
+
+
+def test_deferred_sensitive_cleanup_retries_transient_component_failure() -> None:
+    session, _ = _evidence_session("search-auto-retry-sensitive-cleanup")
+    confirmation = next(iter(session._confirmations.values()))
+    calls = 0
+
+    def flaky_cleanup() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated transient cleanup failure")
+
+    confirmation.clear_sensitive = flaky_cleanup  # type: ignore[method-assign]
+
+    session.defer_sensitive_cleanup()
+
+    assert calls == 2
+    assert session._sensitive_cleared is True
+    assert session._sensitive_cleanup_failed is False
 
 
 def test_sensitive_cleanup_continues_after_debug_reader_and_tracker_failures(monkeypatch) -> None:

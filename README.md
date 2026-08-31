@@ -84,7 +84,8 @@ CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px
 `face_roi_floor`（处理帧率已触及下限）和 `face_roi_credit`（信用桶余额不足）。
 `end_to_end_p95_latency_ms` 是从帧采集到本轮处理完成的 P95，可作为 frame age（帧龄）
 的聚合代理，不能用浏览器预览延迟代替。`faces_dropped_by_budget` 既包含每帧上限淘汰，
-也包含嵌入容量回退时本帧放弃的脸；`embedding_failures` 则表示可恢复的嵌入调用错误。
+也包含嵌入容量回退时本帧放弃的脸；`embedding_failures` 表示可恢复的 provider 调用或
+坏响应次数，`embedding_output_failures` 表示没有拿到合法向量的人脸输入数。
 
 YOLOX 的 ONNX Runtime 可选调优变量为 `PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS`、
 `PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS` 和 `PERSON_SEARCH_ORT_CUDA_DEVICE_ID`。留空时
@@ -201,13 +202,17 @@ T4_BIND_HOST=0.0.0.0 ./scripts/deploy_t4.sh
 T4_CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 \
   ./scripts/deploy_t4.sh
 
-# 从国内对象存储下载 YOLOX，并在部署时预下载 buffalo_l
+# 从国内对象存储下载 YOLOX
 T4_YOLOX_MODEL_URL=https://your-cn-oss.example/yolox_tiny.onnx \
-T4_PRELOAD_INSIGHTFACE=1 \
   ./scripts/deploy_t4.sh
 ```
 
-`T4_PRELOAD_INSIGHTFACE=1` 会在部署阶段下载 `buffalo_l`；若服务器无法访问 InsightFace 上游，可保持默认值 `0`，并将准备好的模型目录放入 Docker volume `person-search-models`。
+部署会在切换旧容器前调用候选容器的 `/readyz`，强制加载 YOLOX、SCRFD 和 ArcFace，并校验 package/API/build revision、embedding contract 以及三个 CUDA provider。若服务器无法访问 InsightFace 上游，请提前将完整 `buffalo_l` 模型目录放入 Docker volume `person-search-models`；该门禁不可跳过。
+
+当前生产 embedding contract 固定为 `buffalo_l/w600k_r50.onnx`、512 维、112×112 输入，
+认可的 SHA-256 为
+`4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43`。
+替换权重必须显式更新 manifest、重新标定阈值并走完整回归，不能只沿用 `buffalo_l` 目录名。
 
 部署脚本默认以 shadow 模式运行超小脸确认。只有同时设置
 `T4_TINY_FACE_SHADOW_MODE=false` 和 `T4_ALLOW_PHYSICAL_ACTIONS=true` 才允许该档触发正式动作。

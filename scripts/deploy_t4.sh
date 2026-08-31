@@ -36,10 +36,10 @@ T4_ORT_INTER_OP_NUM_THREADS="${T4_ORT_INTER_OP_NUM_THREADS:-}"
 T4_ORT_CUDA_DEVICE_ID="${T4_ORT_CUDA_DEVICE_ID:-}"
 T4_HEALTH_ATTEMPTS="${T4_HEALTH_ATTEMPTS:-30}"
 T4_HEALTH_INTERVAL_SECONDS="${T4_HEALTH_INTERVAL_SECONDS:-2}"
+T4_READY_TIMEOUT_SECONDS="${T4_READY_TIMEOUT_SECONDS:-900}"
 # Enables GET /v1/searches/{id}/evidence/{id}. Must match the dispatch platform's
 # DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY, or every confirmed hit loses its face crop.
 T4_EVIDENCE_API_KEY="${T4_EVIDENCE_API_KEY:-}"
-T4_PRELOAD_INSIGHTFACE="${T4_PRELOAD_INSIGHTFACE:-0}"
 # conservative keeps the calibrated far-face bar; responsive trades false-accept
 # headroom for a faster verdict and should wait for a calibrated threshold.
 # transit additionally shortens the far-face window and the gap between samples,
@@ -125,16 +125,12 @@ sanitize_remote() {
     -e 's#^[^/@[:space:]]+@#<redacted>@#'
 }
 
-# Normalize all boolean switches before any conditional uses them.  In
-# particular, ``true``/``false`` should behave the same as ``1``/``0`` for the
-# prefetch and preload paths; silently skipping an explicitly enabled check is a
-# deployment footgun.
+# Normalize all boolean switches before any conditional uses them.
 T4_ALLOW_DIRTY="$(normalize_bool "${T4_ALLOW_DIRTY}" T4_ALLOW_DIRTY)"
 T4_TINY_FACE_ENABLED="$(normalize_bool "${T4_TINY_FACE_ENABLED}" T4_TINY_FACE_ENABLED)"
 T4_TINY_FACE_SHADOW_MODE="$(normalize_bool "${T4_TINY_FACE_SHADOW_MODE}" T4_TINY_FACE_SHADOW_MODE)"
 T4_ALLOW_PHYSICAL_ACTIONS="$(normalize_bool "${T4_ALLOW_PHYSICAL_ACTIONS}" T4_ALLOW_PHYSICAL_ACTIONS)"
 T4_PREFETCH_YOLOX="$(normalize_bool "${T4_PREFETCH_YOLOX}" T4_PREFETCH_YOLOX)"
-T4_PRELOAD_INSIGHTFACE="$(normalize_bool "${T4_PRELOAD_INSIGHTFACE}" T4_PRELOAD_INSIGHTFACE)"
 T4_DEPARTURE_ADJUDICATION="$(normalize_bool "${T4_DEPARTURE_ADJUDICATION}" T4_DEPARTURE_ADJUDICATION)"
 
 require_command docker
@@ -181,6 +177,7 @@ require_port T4_CANARY_PORT "${T4_CANARY_PORT}"
 require_positive_integer T4_STOP_TIMEOUT_SECONDS "${T4_STOP_TIMEOUT_SECONDS}"
 require_positive_integer T4_HEALTH_ATTEMPTS "${T4_HEALTH_ATTEMPTS}"
 require_positive_integer T4_HEALTH_INTERVAL_SECONDS "${T4_HEALTH_INTERVAL_SECONDS}"
+require_positive_integer T4_READY_TIMEOUT_SECONDS "${T4_READY_TIMEOUT_SECONDS}"
 [[ "${T4_PORT}" != "${T4_CANARY_PORT}" ]] || fail "T4_CANARY_PORT must differ from T4_PORT"
 [[ -n "${T4_BIND_HOST}" && "${T4_BIND_HOST}" != *[[:space:]]* ]] || fail \
   "T4_BIND_HOST must be a non-empty host without whitespace"
@@ -410,18 +407,37 @@ wait_for_health() {
   fi
 }
 
-verify_provider() {
-  local name="$1"
-  log "Verifying CUDAExecutionProvider with the YOLOX model (${name})"
-  docker exec "${name}" python -c \
-    'from person_search.config import Settings; from person_search.detector import YoloXOnnxDetector; detector = YoloXOnnxDetector(Settings()); detector.ensure_ready(); print(detector.provider_name); assert detector.provider_name == "CUDAExecutionProvider"'
-}
+verify_readiness() {
+  local name="$1" port="$2" label="$3"
+  log "Loading models and verifying ${label} readiness contract"
+  if ! docker exec --interactive "${name}" python - \
+    "${port}" "${SOURCE_COMMIT}" "${T4_READY_TIMEOUT_SECONDS}" <<'PY'
+import json
+import sys
+import urllib.request
 
-verify_provider_best_effort() {
-  local name="$1"
-  docker exec "${name}" python -c \
-    'from person_search.config import Settings; from person_search.detector import YoloXOnnxDetector; detector = YoloXOnnxDetector(Settings()); detector.ensure_ready(); assert detector.provider_name == "CUDAExecutionProvider"' \
-    >/dev/null 2>&1
+port, expected_revision, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with urllib.request.urlopen(
+    f"http://127.0.0.1:{port}/readyz", timeout=timeout
+) as response:
+    payload = json.load(response)
+
+assert payload.get("status") == "ready", payload
+assert payload.get("package_version") == "0.1.0", payload
+assert payload.get("api_version") == "0.2.0", payload
+assert payload.get("build_revision") == expected_revision, payload
+contract = payload.get("embedding_contract")
+assert isinstance(contract, dict) and contract.get("contract_id"), payload
+providers = payload.get("providers")
+required = {"person_detection", "face_detection", "face_recognition"}
+assert isinstance(providers, dict) and required <= providers.keys(), payload
+assert all(providers[name] == "CUDAExecutionProvider" for name in required), payload
+print(json.dumps(payload, sort_keys=True))
+PY
+  then
+    docker logs --tail 100 "${name}" >&2 || true
+    fail "${label} failed the model, version, revision, or CUDA readiness gate"
+  fi
 }
 
 wait_for_rollback() {
@@ -442,19 +458,7 @@ wait_for_rollback() {
   if [[ "${ready}" != "1" ]]; then
     return 1
   fi
-  verify_provider_best_effort "${name}"
 }
-
-if [[ "${T4_PRELOAD_INSIGHTFACE}" == "true" ]]; then
-  verify_insightface() {
-    local name="$1"
-    log "Downloading and preloading the InsightFace model (${name})"
-    docker exec "${name}" python -c \
-      'from person_search.backends import InsightFaceBackend; from person_search.config import Settings; backend = InsightFaceBackend(Settings()); backend.ensure_ready(); print(backend.provider_name); assert backend.provider_name == "CUDAExecutionProvider"'
-  }
-else
-  verify_insightface() { :; }
-fi
 
 # A candidate is loaded on an alternate host port while the old service remains
 # untouched. Any failure before the switch removes only the candidate.
@@ -528,8 +532,7 @@ log "Starting candidate ${candidate_name} on host port ${T4_CANARY_PORT}"
 candidate_started=1
 start_container "${candidate_name}" "${T4_CANARY_PORT}" no 127.0.0.1
 wait_for_health "${candidate_name}" "${T4_CANARY_PORT}" candidate
-verify_provider "${candidate_name}"
-verify_insightface "${candidate_name}"
+verify_readiness "${candidate_name}" "${T4_CANARY_PORT}" candidate
 
 # The candidate has completed all checks; stop it before starting the production
 # replacement so two model copies do not compete for T4 VRAM during the switch.
@@ -559,7 +562,7 @@ log "Starting replacement ${T4_CONTAINER_NAME} on host port ${T4_PORT}"
 replacement_started=1
 start_container "${T4_CONTAINER_NAME}" "${T4_PORT}" unless-stopped
 wait_for_health "${T4_CONTAINER_NAME}" "${T4_PORT}" replacement
-verify_provider "${T4_CONTAINER_NAME}"
+verify_readiness "${T4_CONTAINER_NAME}" "${T4_PORT}" replacement
 
 deployment_ok=1
 

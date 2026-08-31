@@ -19,6 +19,18 @@ def test_rejects_invalid_embedding(value: list[float]) -> None:
         normalize_embedding(np.asarray(value))
 
 
+def test_normalize_embedding_uses_finite_float64_norm_for_float32_extremes() -> None:
+    result = normalize_embedding(np.asarray([3e38, 3e38], dtype=np.float32))
+
+    assert np.isfinite(result).all()
+    assert np.linalg.norm(result) == pytest.approx(1.0)
+
+
+def test_normalize_embedding_rejects_complex_values() -> None:
+    with pytest.raises(ValueError, match="real-valued"):
+        normalize_embedding(np.asarray([1.0 + 1.0j, 0.0]))
+
+
 def test_face_quality_accepts_clear_centered_face() -> None:
     checker = np.indices((200, 200)).sum(axis=0) % 2
     frame = np.repeat((checker * 255).astype(np.uint8)[:, :, None], 3, axis=2)

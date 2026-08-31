@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import threading
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Protocol
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
@@ -18,84 +20,112 @@ class PersonDetector(Protocol):
     def detect(self, frame: np.ndarray) -> list[Detection]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _DetectorRuntime:
+    session: Any
+    input_name: str
+    provider_name: str
+
+
 class YoloXOnnxDetector:
     def __init__(self, settings: Settings, confidence: float = 0.25, nms: float = 0.45):
         self.settings = settings
         self.confidence = confidence
         self.nms = nms
-        self.provider_name = "uninitialized"
-        self._session = None
-        self._input_name = ""
+        self._runtime: _DetectorRuntime | None = None
+        self._initialization_lock = threading.Lock()
+
+    @property
+    def provider_name(self) -> str:
+        runtime = self._runtime
+        return "uninitialized" if runtime is None else runtime.provider_name
 
     def ensure_ready(self) -> None:
-        if self._session is not None:
+        if self._runtime is not None:
             return
-        if not self.settings.yolox_model.is_file():
-            raise ModelUnavailableError(
-                f"YOLOX model not found at {self.settings.yolox_model}; "
-                "set PERSON_SEARCH_YOLOX_MODEL to an exported YOLOX-Tiny ONNX file."
-            )
-        try:
-            import onnxruntime as ort
-        except ImportError as exc:
-            raise ModelUnavailableError(
-                "ONNX Runtime is missing; run `uv sync --extra inference-cpu --extra test`."
-            ) from exc
-        available = ort.get_available_providers()
-        providers: list[str | tuple[str, dict[str, int]]] = []
-        if self.settings.prefer_cuda and "CUDAExecutionProvider" in available:
-            cuda_device_id = _runtime_int(
+        with self._initialization_lock:
+            if self._runtime is not None:
+                return
+            if not self.settings.yolox_model.is_file():
+                raise ModelUnavailableError(
+                    f"YOLOX model not found at {self.settings.yolox_model}; "
+                    "set PERSON_SEARCH_YOLOX_MODEL to an exported YOLOX-Tiny ONNX file."
+                )
+            try:
+                import onnxruntime as ort
+            except ImportError as exc:
+                raise ModelUnavailableError(
+                    "ONNX Runtime is missing; run `uv sync --extra inference-cpu --extra test`."
+                ) from exc
+            available = ort.get_available_providers()
+            providers: list[str | tuple[str, dict[str, int]]] = []
+            if self.settings.prefer_cuda and "CUDAExecutionProvider" in available:
+                cuda_device_id = _runtime_int(
+                    self.settings,
+                    ("ort_cuda_device_id", "cuda_device_id"),
+                    "PERSON_SEARCH_ORT_CUDA_DEVICE_ID",
+                    minimum=0,
+                )
+                if cuda_device_id is None:
+                    providers.append("CUDAExecutionProvider")
+                else:
+                    providers.append(
+                        ("CUDAExecutionProvider", {"device_id": cuda_device_id})
+                    )
+            providers.append("CPUExecutionProvider")
+            # Resolve these before constructing the session so malformed deployment
+            # configuration fails with an actionable error even with a lightweight
+            # ONNX Runtime shim (or an older runtime without SessionOptions).
+            intra_threads = _runtime_int(
                 self.settings,
-                ("ort_cuda_device_id", "cuda_device_id"),
-                "PERSON_SEARCH_ORT_CUDA_DEVICE_ID",
+                ("ort_intra_op_num_threads", "ort_intra_op_threads"),
+                "PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS",
                 minimum=0,
             )
-            if cuda_device_id is None:
-                providers.append("CUDAExecutionProvider")
-            else:
-                providers.append(
-                    ("CUDAExecutionProvider", {"device_id": cuda_device_id})
-                )
-        providers.append("CPUExecutionProvider")
-        # Resolve these before constructing the session so malformed deployment
-        # configuration fails with an actionable error even with a lightweight
-        # ONNX Runtime shim (or an older runtime without SessionOptions).
-        intra_threads = _runtime_int(
-            self.settings,
-            ("ort_intra_op_num_threads", "ort_intra_op_threads"),
-            "PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS",
-            minimum=0,
-        )
-        inter_threads = _runtime_int(
-            self.settings,
-            ("ort_inter_op_num_threads", "ort_inter_op_threads"),
-            "PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS",
-            minimum=0,
-        )
-        try:
-            session_kwargs: dict[str, object] = {"providers": providers}
-            session_options_factory = getattr(ort, "SessionOptions", None)
-            if session_options_factory is not None:
-                session_options = session_options_factory()
-                if intra_threads is not None:
-                    session_options.intra_op_num_threads = intra_threads
-                if inter_threads is not None:
-                    session_options.inter_op_num_threads = inter_threads
-                session_kwargs["sess_options"] = session_options
-            self._session = ort.InferenceSession(
-                str(self.settings.yolox_model), **session_kwargs
+            inter_threads = _runtime_int(
+                self.settings,
+                ("ort_inter_op_num_threads", "ort_inter_op_threads"),
+                "PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS",
+                minimum=0,
             )
-            self._input_name = self._session.get_inputs()[0].name
-        except Exception as exc:
-            raise ModelUnavailableError(f"failed to load YOLOX model: {exc}") from exc
-        self.provider_name = self._session.get_providers()[0]
+            try:
+                session_kwargs: dict[str, object] = {"providers": providers}
+                session_options_factory = getattr(ort, "SessionOptions", None)
+                if session_options_factory is not None:
+                    session_options = session_options_factory()
+                    if intra_threads is not None:
+                        session_options.intra_op_num_threads = intra_threads
+                    if inter_threads is not None:
+                        session_options.inter_op_num_threads = inter_threads
+                    session_kwargs["sess_options"] = session_options
+                session = ort.InferenceSession(
+                    str(self.settings.yolox_model), **session_kwargs
+                )
+                inputs = session.get_inputs()
+                if not inputs or not isinstance(getattr(inputs[0], "name", None), str):
+                    raise ValueError("model has no named input")
+                input_name = inputs[0].name
+                runtime_providers = session.get_providers()
+                if not runtime_providers or not isinstance(runtime_providers[0], str):
+                    raise ValueError("model session has no execution provider")
+                provider_name = runtime_providers[0]
+            except Exception as exc:
+                raise ModelUnavailableError(f"failed to load YOLOX model: {exc}") from exc
+            self._runtime = _DetectorRuntime(
+                session=session,
+                input_name=input_name,
+                provider_name=provider_name,
+            )
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
         self.ensure_ready()
+        runtime = self._runtime
+        if runtime is None:  # Defensive guard for alternate ensure_ready implementations.
+            raise ModelUnavailableError("YOLOX detector initialization did not complete")
         image, ratio = _preprocess(
             frame, (self.settings.person_input_height, self.settings.person_input_width)
         )
-        output = self._session.run(None, {self._input_name: image[None]})[0]
+        output = runtime.session.run(None, {runtime.input_name: image[None]})[0]
         predictions = _decode_yolox(
             output[0], (self.settings.person_input_height, self.settings.person_input_width)
         )

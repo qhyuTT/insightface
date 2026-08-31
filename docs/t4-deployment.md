@@ -124,10 +124,13 @@ T4_BIND_HOST=0.0.0.0 ./scripts/deploy_t4.sh
 2. 构建新的 `person-search:t4` 镜像，此时旧容器继续运行。
 3. 用新镜像执行 `nvidia-smi`，验证 NVIDIA Container Toolkit。
 4. 在独立的 loopback canary 端口（默认 `18000`）启动候选容器；旧容器仍继续提供服务。
-5. 等待候选容器 `/healthz` 成功，并创建真实 YOLOX ONNX session 验证 CUDA provider（可选预加载 InsightFace）。
+5. 等待候选容器 `/healthz` 成功，再通过 `/readyz` 强制加载 YOLOX、SCRFD 和 ArcFace，校验 package/API/build revision、embedding contract 与全部 CUDA provider。
 6. 候选通过后先停止并删除候选以释放 GPU，再以 `--stop-timeout` 停止旧容器，并将旧容器改名为带时间戳的 rollback point。
-7. 使用 host 网络、`--gpus all`、`restart=unless-stopped` 和 `person-search-models` 模型卷启动新容器；再次执行 `/healthz` 和 YOLOX provider 检查。
-8. 新容器任一检查失败时，脚本删除失败容器、恢复 rollback point，并重新执行健康和 provider 检查。
+7. 使用 host 网络、`--gpus all`、`restart=unless-stopped` 和 `person-search-models` 模型卷启动新容器；再次执行 `/healthz` 和完整 `/readyz` 门禁。
+8. 新容器任一检查失败时，脚本删除失败容器、恢复 rollback point，并重新执行健康检查。
+
+`/readyz` 会把 `buffalo_l/w600k_r50.onnx` 校验到固定的 512 维 embedding contract；
+仅目录名相同但 SHA-256 不同的持久卷模型会被拒绝，不能进入容器切换阶段。
 
 替换容器会清空进程内的登记目标和搜索任务，但不会删除 `person-search-models` 模型卷。通过 `T4_STOP_TIMEOUT_SECONDS`（默认 30 秒）可调整优雅停止时间；`T4_CANARY_PORT` 可调整候选端口。成功部署后旧容器会以 `person-search.previous.<timestamp>` 名称保留，确认新版本稳定后可手动删除。
 

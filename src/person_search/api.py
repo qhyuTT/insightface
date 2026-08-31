@@ -27,7 +27,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from . import API_VERSION
+from . import API_VERSION, __version__
 from .config import Settings, get_settings
 from .domain import SearchCreate, SearchView, SourceConfig, SourceType, TargetView
 from .errors import ModelUnavailableError, PersonSearchError
@@ -98,9 +98,22 @@ def create_app(
             capabilities.append("confirmed_evidence_v1")
         return {
             "status": "ok",
+            "package_version": __version__,
             "api_version": API_VERSION,
+            "build_revision": settings.build_revision,
             "capabilities": capabilities,
             "active_search": active is not None,
+        }
+
+    @app.get("/readyz")
+    async def readiness() -> dict[str, Any]:
+        readiness_result = await asyncio.to_thread(manager.ensure_ready)
+        return {
+            "status": "ready",
+            "package_version": __version__,
+            "api_version": API_VERSION,
+            "build_revision": settings.build_revision,
+            **readiness_result,
         }
 
     @app.get("/", include_in_schema=False)

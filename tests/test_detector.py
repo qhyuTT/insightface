@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from types import ModuleType, SimpleNamespace
 from typing import ClassVar
 
@@ -116,3 +118,87 @@ def test_detector_rejects_invalid_runtime_thread_setting(
     detector = YoloXOnnxDetector(Settings(yolox_model=model, prefer_cuda=False))
     with pytest.raises(ModelUnavailableError, match="PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS"):
         detector.ensure_ready()
+
+
+def test_detector_failed_initialization_does_not_publish_and_can_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    model = tmp_path / "yolox.onnx"
+    model.write_bytes(b"placeholder")
+
+    class FakeSession:
+        attempts: ClassVar[int] = 0
+
+        def __init__(self, _path: str, **_kwargs: object) -> None:
+            type(self).attempts += 1
+
+        def get_inputs(self):
+            if self.attempts == 1:
+                raise RuntimeError("invalid input metadata")
+            return [SimpleNamespace(name="images")]
+
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    ort_module = ModuleType("onnxruntime")
+    ort_module.InferenceSession = FakeSession  # type: ignore[attr-defined]
+    ort_module.get_available_providers = lambda: ["CPUExecutionProvider"]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_module)
+
+    detector = YoloXOnnxDetector(Settings(yolox_model=model, prefer_cuda=False))
+    with pytest.raises(ModelUnavailableError, match="invalid input metadata"):
+        detector.ensure_ready()
+    assert detector.provider_name == "uninitialized"
+    assert detector._runtime is None
+
+    detector.ensure_ready()
+
+    assert detector.provider_name == "CPUExecutionProvider"
+    assert detector._runtime is not None
+    assert FakeSession.attempts == 2
+
+
+def test_detector_concurrent_initialization_publishes_one_complete_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    model = tmp_path / "yolox.onnx"
+    model.write_bytes(b"placeholder")
+    construction_started = threading.Event()
+    allow_construction = threading.Event()
+
+    class FakeSession:
+        attempts: ClassVar[int] = 0
+
+        def __init__(self, _path: str, **_kwargs: object) -> None:
+            type(self).attempts += 1
+            construction_started.set()
+            assert allow_construction.wait(timeout=1.0)
+
+        def get_inputs(self):
+            return [SimpleNamespace(name="images")]
+
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    ort_module = ModuleType("onnxruntime")
+    ort_module.InferenceSession = FakeSession  # type: ignore[attr-defined]
+    ort_module.get_available_providers = lambda: ["CPUExecutionProvider"]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_module)
+
+    detector = YoloXOnnxDetector(Settings(yolox_model=model, prefer_cuda=False))
+    workers = [threading.Thread(target=detector.ensure_ready) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    assert construction_started.wait(timeout=1.0)
+    time.sleep(0.05)
+    assert detector.provider_name == "uninitialized"
+    assert detector._runtime is None
+
+    allow_construction.set()
+    for worker in workers:
+        worker.join(timeout=1.0)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert FakeSession.attempts == 1
+    assert detector.provider_name == "CPUExecutionProvider"
+    assert detector._runtime is not None

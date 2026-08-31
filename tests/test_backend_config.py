@@ -7,10 +7,20 @@ from typing import ClassVar
 import numpy as np
 import pytest
 
-from person_search.backends import InsightFaceBackend, _resolve_input_size
+from person_search.backends import InsightFaceBackend, _embedding_contract, _resolve_input_size
 from person_search.config import Settings
-from person_search.domain import FaceObservation
+from person_search.domain import EmbeddingContract, FaceObservation
 from person_search.errors import ModelUnavailableError
+from person_search.model_assets import BUFFALO_L_EMBEDDING_MANIFEST
+
+FAKE_CONTRACT = EmbeddingContract(
+    schema_version="arcface-v1",
+    model_name="buffalo_l",
+    model_sha256="0" * 64,
+    embedding_dimension=512,
+    input_size=(112, 112),
+    flip_tta=False,
+)
 
 
 def test_face_detection_uses_insightface_auto_mode_by_default() -> None:
@@ -18,6 +28,7 @@ def test_face_detection_uses_insightface_auto_mode_by_default() -> None:
 
 
 def test_insightface_reports_actual_model_session_providers(monkeypatch) -> None:
+    monkeypatch.setattr("person_search.backends._embedding_contract", lambda *args, **kwargs: FAKE_CONTRACT)
     class FakeSession:
         def __init__(self, provider: str):
             self.provider = provider
@@ -64,6 +75,7 @@ def test_insightface_reports_actual_model_session_providers(monkeypatch) -> None
 
 
 def test_insightface_summarizes_mixed_actual_providers(monkeypatch) -> None:
+    monkeypatch.setattr("person_search.backends._embedding_contract", lambda *args, **kwargs: FAKE_CONTRACT)
     class FakeSession:
         def __init__(self, provider: str):
             self.provider = provider
@@ -99,6 +111,81 @@ def test_insightface_summarizes_mixed_actual_providers(monkeypatch) -> None:
     assert backend.provider_name == (
         "detection=CUDAExecutionProvider,recognition=CPUExecutionProvider"
     )
+
+
+def test_insightface_failed_contract_validation_does_not_publish_and_can_retry(
+    monkeypatch,
+) -> None:
+    class FakeSession:
+        def get_providers(self):
+            return ["CPUExecutionProvider"]
+
+    class FakeFaceAnalysis:
+        def __init__(self, **kwargs):
+            self.models = {
+                "detection": SimpleNamespace(session=FakeSession()),
+                "recognition": SimpleNamespace(session=FakeSession()),
+            }
+
+        def prepare(self, **kwargs):
+            pass
+
+    attempts = 0
+
+    def contract_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("contract metadata unavailable")
+        return FAKE_CONTRACT
+
+    ort_module = ModuleType("onnxruntime")
+    ort_module.get_available_providers = lambda: ["CPUExecutionProvider"]  # type: ignore[attr-defined]
+    insightface_module = ModuleType("insightface")
+    app_module = ModuleType("insightface.app")
+    app_module.FaceAnalysis = FakeFaceAnalysis  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_module)
+    monkeypatch.setitem(sys.modules, "insightface", insightface_module)
+    monkeypatch.setitem(sys.modules, "insightface.app", app_module)
+    monkeypatch.setattr("person_search.backends._embedding_contract", contract_once)
+    backend = InsightFaceBackend(Settings(prefer_cuda=False))
+
+    with pytest.raises(ModelUnavailableError, match="contract metadata unavailable"):
+        backend.ensure_ready()
+    assert backend._app is None
+    assert backend.embedding_contract is None
+    assert backend.provider_name == "uninitialized"
+
+    backend.ensure_ready()
+
+    assert backend.embedding_contract == FAKE_CONTRACT
+    assert backend.provider_name == "CPUExecutionProvider"
+
+
+def test_embedding_contract_validates_fixed_hash_and_shapes(monkeypatch, tmp_path) -> None:
+    model_file = tmp_path / BUFFALO_L_EMBEDDING_MANIFEST.recognition_filename
+    model_file.write_bytes(b"recognition-model")
+    recogniser = SimpleNamespace(
+        model_file=str(model_file),
+        input_size=BUFFALO_L_EMBEDDING_MANIFEST.input_size,
+        output_shape=(1, BUFFALO_L_EMBEDDING_MANIFEST.embedding_dimension),
+    )
+    app = SimpleNamespace(models={"recognition": recogniser})
+    monkeypatch.setattr(
+        "person_search.backends.sha256",
+        lambda path: BUFFALO_L_EMBEDDING_MANIFEST.recognition_sha256,
+    )
+
+    contract = _embedding_contract(app, model_name="buffalo_l", flip_tta=True)
+
+    assert contract.model_sha256 == BUFFALO_L_EMBEDDING_MANIFEST.recognition_sha256
+    assert contract.embedding_dimension == 512
+    assert contract.input_size == (112, 112)
+    assert contract.flip_tta is True
+
+    monkeypatch.setattr("person_search.backends.sha256", lambda path: "f" * 64)
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        _embedding_contract(app, model_name="buffalo_l", flip_tta=True)
 
 
 def test_resolve_input_size_maps_one_scale_or_many_onto_scrfd() -> None:
@@ -138,6 +225,7 @@ def _detect_scales(settings: Settings, *, enrollment: bool, detection_size=None)
     backend = InsightFaceBackend(settings)
     detector = _RecordingDetector()
     backend._app = SimpleNamespace(det_model=detector)
+    backend.embedding_contract = FAKE_CONTRACT
     backend.detect_faces(
         np.zeros((1280, 960, 3), dtype=np.uint8),
         enrollment=enrollment,
@@ -207,6 +295,7 @@ def test_flip_tta_sends_one_batch_and_averages_the_mirror() -> None:
     recogniser = _StubRecogniser()
     backend = InsightFaceBackend(Settings(embedding_flip_tta=True))
     backend._app = SimpleNamespace(models={"recognition": recogniser})
+    backend.embedding_contract = FAKE_CONTRACT
     frame = np.zeros((400, 400, 3), dtype=np.uint8)
 
     embedded = backend.embed_faces(frame, [_landmarked_face()])
@@ -221,6 +310,7 @@ def test_flip_tta_can_be_switched_off() -> None:
     recogniser = _StubRecogniser()
     backend = InsightFaceBackend(Settings(embedding_flip_tta=False))
     backend._app = SimpleNamespace(models={"recognition": recogniser})
+    backend.embedding_contract = FAKE_CONTRACT
     frame = np.zeros((400, 400, 3), dtype=np.uint8)
 
     embedded = backend.embed_faces(frame, [_landmarked_face()])
@@ -233,6 +323,7 @@ def test_detect_faces_batch_preserves_one_result_list_per_crop() -> None:
     backend = InsightFaceBackend(Settings())
     detector = _RecordingDetector()
     backend._app = SimpleNamespace(det_model=detector)
+    backend.embedding_contract = FAKE_CONTRACT
     frames = [
         np.zeros((120, 160, 3), dtype=np.uint8),
         np.zeros((90, 140, 3), dtype=np.uint8),
@@ -248,6 +339,7 @@ def test_detect_faces_batch_falls_back_when_optional_native_hook_fails() -> None
     backend = InsightFaceBackend(Settings())
     detector = _NativeBatchFailureDetector()
     backend._app = SimpleNamespace(det_model=detector)
+    backend.embedding_contract = FAKE_CONTRACT
     frames = [
         np.zeros((120, 160, 3), dtype=np.uint8),
         np.zeros((90, 140, 3), dtype=np.uint8),
@@ -270,6 +362,7 @@ def test_detect_faces_rejects_malformed_detector_result() -> None:
             return np.asarray(0.0, dtype=np.float32), None
 
     backend._app = SimpleNamespace(det_model=MalformedDetector())
+    backend.embedding_contract = FAKE_CONTRACT
 
     with pytest.raises(ModelUnavailableError, match="malformed output"):
         backend.detect_faces(np.zeros((120, 160, 3), dtype=np.uint8))
@@ -283,6 +376,7 @@ def test_detect_faces_rejects_landmarks_with_wrong_rank() -> None:
             return np.zeros((1, 5), dtype=np.float32), np.zeros((1,), dtype=np.float32)
 
     backend._app = SimpleNamespace(det_model=MalformedDetector())
+    backend.embedding_contract = FAKE_CONTRACT
 
     with pytest.raises(ModelUnavailableError, match="malformed output"):
         backend.detect_faces(np.zeros((120, 160, 3), dtype=np.uint8))
@@ -295,6 +389,7 @@ def test_arcface_micro_batch_bounds_recogniser_rows() -> None:
         Settings(embedding_flip_tta=False, arcface_micro_batch_size=2)
     )
     backend._app = SimpleNamespace(models={"recognition": recogniser})
+    backend.embedding_contract = FAKE_CONTRACT
     frame = np.zeros((600, 600, 3), dtype=np.uint8)
     faces = []
     for index in range(5):
@@ -321,6 +416,27 @@ def test_embed_faces_discards_scalar_provider_response() -> None:
     recogniser = ScalarRecogniser()
     backend = InsightFaceBackend(Settings(embedding_flip_tta=False))
     backend._app = SimpleNamespace(models={"recognition": recogniser})
+    backend.embedding_contract = FAKE_CONTRACT
+
+    embedded = backend.embed_faces(
+        np.zeros((400, 400, 3), dtype=np.uint8), [_landmarked_face()]
+    )
+
+    assert embedded == []
+
+
+def test_embed_faces_discards_three_dimensional_provider_response() -> None:
+    pytest.importorskip("insightface", reason="malformed output test needs face_align")
+
+    class ThreeDimensionalRecogniser(_StubRecogniser):
+        def get_feat(self, crops):
+            self.batch_sizes.append(len(crops))
+            return np.ones((1, 1, 2), dtype=np.float32)
+
+    recogniser = ThreeDimensionalRecogniser()
+    backend = InsightFaceBackend(Settings(embedding_flip_tta=False))
+    backend._app = SimpleNamespace(models={"recognition": recogniser})
+    backend.embedding_contract = FAKE_CONTRACT
 
     embedded = backend.embed_faces(
         np.zeros((400, 400, 3), dtype=np.uint8), [_landmarked_face()]

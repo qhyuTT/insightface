@@ -7,10 +7,11 @@ import numpy as np
 from conftest import FakeFaceBackend, FakePersonDetector, make_face
 from fastapi.testclient import TestClient
 
-from person_search import API_VERSION
+from person_search import API_VERSION, __version__
 from person_search.api import create_app
 from person_search.config import Settings
 from person_search.domain import SearchStatus, SourceConfig
+from person_search.errors import ModelUnavailableError
 from person_search.service import PreviewHub, SearchManager, SearchSession
 
 
@@ -23,7 +24,9 @@ def test_health_does_not_load_models() -> None:
     with client_with_face() as client:
         assert client.get("/healthz").json() == {
             "status": "ok",
+            "package_version": __version__,
             "api_version": API_VERSION,
+            "build_revision": "unknown",
             "capabilities": [
                 "replace_active",
                 "active_search",
@@ -33,6 +36,57 @@ def test_health_does_not_load_models() -> None:
             ],
             "active_search": False,
         }
+
+
+def test_readiness_loads_models_and_exposes_contract_and_versions() -> None:
+    class ReadyManager:
+        def ensure_ready(self):
+            return {
+                "providers": {
+                    "person_detection": "CUDAExecutionProvider",
+                    "face_detection": "CUDAExecutionProvider",
+                    "face_recognition": "CUDAExecutionProvider",
+                },
+                "embedding_contract": {"contract_id": "arcface-contract"},
+            }
+
+        def shutdown(self) -> None:
+            pass
+
+    settings = Settings(build_revision="0123456789abcdef")
+    with TestClient(create_app(settings, ReadyManager())) as client:  # type: ignore[arg-type]
+        response = client.get("/readyz")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "package_version": __version__,
+        "api_version": API_VERSION,
+        "build_revision": "0123456789abcdef",
+        "providers": {
+            "person_detection": "CUDAExecutionProvider",
+            "face_detection": "CUDAExecutionProvider",
+            "face_recognition": "CUDAExecutionProvider",
+        },
+        "embedding_contract": {"contract_id": "arcface-contract"},
+    }
+
+
+def test_readiness_redacts_model_failure_details() -> None:
+    class BrokenManager:
+        def ensure_ready(self):
+            raise ModelUnavailableError("failed to load /secret/models/model.onnx?token=secret")
+
+        def shutdown(self) -> None:
+            pass
+
+    with TestClient(create_app(Settings(), BrokenManager())) as client:  # type: ignore[arg-type]
+        response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "model_unavailable", "message": "model unavailable"}
+    }
 
 
 def test_monitor_page_is_available() -> None:

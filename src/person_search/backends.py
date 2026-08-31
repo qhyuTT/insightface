@@ -4,14 +4,16 @@ import logging
 import threading
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import Protocol
 
 import cv2
 import numpy as np
 
 from .config import Settings
-from .domain import FaceObservation
+from .domain import EmbeddingContract, FaceObservation
 from .errors import ModelUnavailableError
+from .model_assets import EMBEDDING_MODEL_MANIFESTS, sha256
 from .quality import assess_face, normalize_embedding
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ class FaceBackend(Protocol):
     provider_name: str
     detection_provider_name: str
     recognition_provider_name: str
+    embedding_contract: EmbeddingContract | None
 
     def detect_faces(
         self,
@@ -53,14 +56,15 @@ class InsightFaceBackend:
         self.provider_name = "uninitialized"
         self.detection_provider_name = "uninitialized"
         self.recognition_provider_name = "uninitialized"
+        self.embedding_contract: EmbeddingContract | None = None
         self._app = None
         self._lock = threading.Lock()
 
     def ensure_ready(self) -> None:
-        if self._app is not None:
+        if self._app is not None and self.embedding_contract is not None:
             return
         with self._lock:
-            if self._app is not None:
+            if self._app is not None and self.embedding_contract is not None:
                 return
             try:
                 import onnxruntime as ort
@@ -89,11 +93,22 @@ class InsightFaceBackend:
                     det_thresh=self.settings.face_detection_threshold,
                     det_size=None if detection_size <= 0 else (detection_size, detection_size),
                 )
+                detection_provider = _model_provider_name(app, "detection")
+                recognition_provider = _model_provider_name(app, "recognition")
+                contract = _embedding_contract(
+                    app,
+                    model_name=self.settings.insightface_model,
+                    flip_tta=self.settings.embedding_flip_tta,
+                )
             except Exception as exc:
                 raise ModelUnavailableError(f"failed to load InsightFace model: {exc}") from exc
+            # Publish only after model, provider, hash, shape, and preprocessing
+            # metadata have all been validated. A failed initialization remains
+            # retryable and no concurrent caller can observe a half-ready backend.
             self._app = app
-            self.detection_provider_name = _model_provider_name(app, "detection")
-            self.recognition_provider_name = _model_provider_name(app, "recognition")
+            self.detection_provider_name = detection_provider
+            self.recognition_provider_name = recognition_provider
+            self.embedding_contract = contract
             if self.detection_provider_name == self.recognition_provider_name:
                 self.provider_name = self.detection_provider_name
             else:
@@ -323,10 +338,8 @@ class InsightFaceBackend:
             # ``np.asarray(None)`` and scalar provider responses are 0-D.  They
             # have no row dimension and must be rejected before ``shape[0]``
             # below; otherwise one bad inference aborts the whole search.
-            if features.ndim == 0:
+            if features.ndim != 2:
                 continue
-            if features.ndim == 1:
-                features = features.reshape(1, -1)
             if flip_tta:
                 if features.shape[0] != 2 * len(face_chunk):
                     # A malformed provider result must not silently pair one
@@ -417,3 +430,35 @@ def _model_provider_name(app: object, task_name: str) -> str:
         return "unknown"
     actual_providers = get_providers()
     return str(actual_providers[0]) if actual_providers else "unknown"
+
+
+def _embedding_contract(
+    app: object, *, model_name: str, flip_tta: bool
+) -> EmbeddingContract:
+    manifest = EMBEDDING_MODEL_MANIFESTS.get(model_name)
+    if manifest is None:
+        raise ValueError(f"unsupported InsightFace embedding model: {model_name}")
+    models = getattr(app, "models", {})
+    recogniser = models.get("recognition") if isinstance(models, dict) else None
+    if recogniser is None:
+        raise ValueError("InsightFace recognition model is unavailable")
+    model_file = Path(str(getattr(recogniser, "model_file", "")))
+    if not model_file.is_file() or model_file.name != manifest.recognition_filename:
+        raise ValueError("InsightFace recognition model file does not match the manifest")
+    actual_sha256 = sha256(model_file)
+    if actual_sha256 != manifest.recognition_sha256:
+        raise ValueError("InsightFace recognition model checksum mismatch")
+    input_size = tuple(int(value) for value in getattr(recogniser, "input_size", ()))
+    if input_size != manifest.input_size:
+        raise ValueError("InsightFace recognition input shape does not match the manifest")
+    output_shape = tuple(getattr(recogniser, "output_shape", ()) or ())
+    if not output_shape or int(output_shape[-1]) != manifest.embedding_dimension:
+        raise ValueError("InsightFace embedding dimension does not match the manifest")
+    return EmbeddingContract(
+        schema_version="arcface-v1",
+        model_name=model_name,
+        model_sha256=actual_sha256,
+        embedding_dimension=manifest.embedding_dimension,
+        input_size=manifest.input_size,
+        flip_tta=flip_tta,
+    )

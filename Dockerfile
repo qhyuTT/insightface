@@ -97,6 +97,7 @@ RUN mkdir -p /models/.insightface
 # deployment script passes VCS_REF for traceability; placing this label here
 # prevents every commit from invalidating the apt/uv cache.
 ARG VCS_REF=unknown
+ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}
 LABEL org.opencontainers.image.title="robot-person-search-poc" \
       org.opencontainers.image.revision="${VCS_REF}"
 

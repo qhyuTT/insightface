@@ -27,6 +27,8 @@ from .confirmation import (
 )
 from .detector import PersonDetector, YoloXOnnxDetector
 from .domain import (
+    EmbeddingContract,
+    EmbeddingContractView,
     FaceObservation,
     MatchState,
     SearchEvent,
@@ -61,6 +63,7 @@ MOTION_ESTIMATE_WIDTH = 320
 # not a translation of each other (a cut, a reconnect, a fast rotation), and a
 # fabricated shift is worse for association than no shift at all.
 MOTION_MIN_RESPONSE = 0.05
+SENSITIVE_CLEANUP_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 logger = logging.getLogger(__name__)
 
 
@@ -185,12 +188,36 @@ class SearchSession:
             incoming_targets = list(self.targets)
         if not incoming_targets:
             raise ValueError("at least one target is required")
-        # A session owns its gallery.  SearchManager may still have the same
-        # Target objects in its enrollment store while the worker is running;
-        # copying here means terminal cleanup can release biometric arrays
-        # without zeroing a manager/external reference that is about to be used
-        # for another request.
-        self.targets = [_clone_target(target) for target in incoming_targets]
+        backend_contract = getattr(self.face_backend, "embedding_contract", None)
+        if backend_contract is None:
+            raise ValueError("face backend has no embedding contract")
+        # A session owns its gallery. Copy before worker use, but wipe every
+        # partial clone if contract validation rejects the batch.
+        self.targets = []
+        try:
+            for target in incoming_targets:
+                self.targets.append(_clone_target(target))
+            contracts: set[EmbeddingContract] = set()
+            for target in self.targets:
+                if target.embedding_contract is None:
+                    target.embedding_contract = backend_contract
+                contracts.add(target.embedding_contract)
+                original_embedding = target.embedding
+                embedding = _safe_normalize_embedding(original_embedding)
+                if (
+                    embedding is None
+                    or embedding.size != target.embedding_contract.embedding_dimension
+                ):
+                    raise ValueError("target embedding does not match its embedding contract")
+                _wipe_array(original_embedding)
+                target.embedding = embedding
+            if len(contracts) != 1 or next(iter(contracts)) != backend_contract:
+                raise ValueError("target and backend embedding contracts do not match")
+        except Exception:
+            for target in self.targets:
+                _wipe_array(target.embedding)
+            raise
+        self.embedding_contract = backend_contract
         primary_id = self.target.target_id if self.target is not None else self.targets[0].target_id
         self.target = next(
             (target for target in self.targets if target.target_id == primary_id),
@@ -299,6 +326,7 @@ class SearchSession:
         # the worker finally exits (and so a transient cleanup failure does not
         # become a permanent biometric-buffer leak).
         self._sensitive_cleanup_watcher: threading.Thread | None = None
+        self._sensitive_cleanup_failed = False
         self._finished_at: float | None = None
 
     def start(self) -> None:
@@ -792,10 +820,7 @@ class SearchSession:
             else:
                 watcher = None
         if watcher is None:
-            try:
-                self.clear_sensitive_state()
-            except Exception as exc:  # noqa: BLE001 - caller must retain original error
-                logger.warning("sensitive cleanup retry failed: %s", type(exc).__name__)
+            self._retry_sensitive_cleanup()
             return
         try:
             watcher.start()
@@ -819,10 +844,24 @@ class SearchSession:
                 worker = self._worker
                 if not _worker_is_alive(worker):
                     break
-        try:
-            self.clear_sensitive_state()
-        except Exception as exc:  # noqa: BLE001 - final cleanup is best effort
-            logger.warning("deferred sensitive cleanup failed: %s", type(exc).__name__)
+        self._retry_sensitive_cleanup()
+
+    def _retry_sensitive_cleanup(self) -> None:
+        """Retry transient teardown failures without spinning forever."""
+        for delay in SENSITIVE_CLEANUP_RETRY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            try:
+                self.clear_sensitive_state()
+            except Exception as exc:  # noqa: BLE001 - teardown remains best effort
+                logger.warning("deferred sensitive cleanup failed: %s", type(exc).__name__)
+            with self._lock:
+                if self._sensitive_cleared:
+                    self._sensitive_cleanup_failed = False
+                    return
+        with self._lock:
+            self._sensitive_cleanup_failed = True
+        logger.error("sensitive cleanup exhausted retries for search %s", self.search_id)
 
     def cleanup_expired_evidence(self) -> int:
         """Drop expired JPEGs and return the number removed.
@@ -954,6 +993,7 @@ class SearchSession:
                 status=self.status,
                 source=_sanitize_source(self.source),
                 provider=f"face={self.face_backend.provider_name},person={self.person_detector.provider_name}",
+                embedding_contract_id=self.embedding_contract.contract_id,
                 error=self.error,
                 targets=target_views,
                 found_count=found_count,
@@ -1663,6 +1703,7 @@ class SearchSession:
                 quality=decision.quality,
                 evidence_count=decision.evidence_count,
                 model=self.face_backend.model_name,
+                embedding_contract_id=self.embedding_contract.contract_id,
                 association=decision.association,
             )
             payload = event.model_dump(mode="json", exclude_none=True)
@@ -1949,11 +1990,16 @@ class SearchSession:
                 with self._lock:
                     if hasattr(self.metrics, "embedding_failures"):
                         self.metrics.embedding_failures += 1
+                    if hasattr(self.metrics, "embedding_output_failures"):
+                        self.metrics.embedding_output_failures += len(faces)
                 return []
             # Retry at most four levels deep.  This bounds the number of expensive
             # retries while still allowing a 16-row batch to fall back to singles
             # on a very small GPU.  Faces that still cannot be embedded are dropped
             # for this frame; the next frame gets a fresh chance.
+            with self._lock:
+                if hasattr(self.metrics, "embedding_failures"):
+                    self.metrics.embedding_failures += 1
             if len(faces) > 1 and split_depth < 4:
                 midpoint = max(1, len(faces) // 2)
                 return self._embed_face_chunk(
@@ -1964,11 +2010,15 @@ class SearchSession:
             with self._lock:
                 if hasattr(self.metrics, "faces_dropped_by_budget"):
                     self.metrics.faces_dropped_by_budget += len(faces)
+                if hasattr(self.metrics, "embedding_output_failures"):
+                    self.metrics.embedding_output_failures += len(faces)
             return []
         if embedded is None:
             with self._lock:
                 if hasattr(self.metrics, "embedding_failures"):
                     self.metrics.embedding_failures += 1
+                if hasattr(self.metrics, "embedding_output_failures"):
+                    self.metrics.embedding_output_failures += len(faces)
             return []
         try:
             embedded_list = list(embedded)
@@ -1980,6 +2030,8 @@ class SearchSession:
             with self._lock:
                 if hasattr(self.metrics, "embedding_failures"):
                     self.metrics.embedding_failures += 1
+                if hasattr(self.metrics, "embedding_output_failures"):
+                    self.metrics.embedding_output_failures += len(faces)
             return []
         # Most backends return ``dataclasses.replace(face, embedding=...)``.  A
         # provider can nevertheless return a scalar, a foreign object, a NaN
@@ -1988,49 +2040,73 @@ class SearchSession:
         # mapped unambiguously is dropped for this frame.  This keeps malformed
         # output out of association/ranking while preserving object identity for
         # the normal path (and therefore reusing the association cache).
-        expected_dimensions: set[int] = set()
-        try:
-            gallery = getattr(self, "_identity_targets", {})
-            gallery_values = gallery.values() if isinstance(gallery, dict) else ()
-            for target in gallery_values:
-                normalized = _safe_normalize_embedding(getattr(target, "embedding", None))
-                if normalized is not None:
-                    expected_dimensions.add(normalized.size)
-        except Exception:  # noqa: BLE001 - a malformed legacy gallery must not break a frame
-            expected_dimensions.clear()
-        expected_dimension = (
-            next(iter(expected_dimensions)) if len(expected_dimensions) == 1 else None
-        )
+        contract = getattr(self, "embedding_contract", None)
+        expected_dimension = getattr(contract, "embedding_dimension", None)
+        if not isinstance(expected_dimension, int) or expected_dimension <= 0:
+            with self._lock:
+                if hasattr(self.metrics, "embedding_failures"):
+                    self.metrics.embedding_failures += 1
+                if hasattr(self.metrics, "embedding_output_failures"):
+                    self.metrics.embedding_output_failures += len(faces)
+            return []
 
         source_boxes = [_coerce_face_bbox(getattr(face, "bbox", None)) for face in faces]
         source_by_identity = {id(face): index for index, face in enumerate(faces)}
         unused_sources = set(range(len(faces)))
         assignments: dict[int, tuple[FaceObservation, np.ndarray]] = {}
-        malformed = False
-
-        for output_index, result in enumerate(embedded_list):
+        parsed: list[tuple[FaceObservation, np.ndarray, np.ndarray] | None] = []
+        malformed = len(embedded_list) != len(faces)
+        for result in embedded_list:
             if not isinstance(result, FaceObservation):
+                parsed.append(None)
                 malformed = True
                 continue
             result_bbox = _coerce_face_bbox(getattr(result, "bbox", None))
             embedding = _safe_normalize_embedding(getattr(result, "embedding", None))
-            if result_bbox is None or embedding is None:
+            if (
+                result_bbox is None
+                or embedding is None
+                or embedding.size != expected_dimension
+            ):
+                parsed.append(None)
                 malformed = True
                 continue
-            if expected_dimension is not None and embedding.size != expected_dimension:
-                malformed = True
+            parsed.append((result, result_bbox, embedding))
+
+        positional_response = (
+            len(parsed) == len(faces)
+            and all(item is not None for item in parsed)
+            and all(
+                source_boxes[index] is not None
+                and np.allclose(
+                    source_boxes[index],
+                    parsed[index][1],  # type: ignore[index]
+                    rtol=0.0,
+                    atol=1e-3,
+                )
+                for index in range(len(faces))
+            )
+        )
+
+        for output_index, item in enumerate(parsed):
+            if item is None:
                 continue
+            result, result_bbox, embedding = item
 
             # Identity is the strongest mapping signal for backends that mutate
             # the supplied observation in place.
             source_index = source_by_identity.get(id(result))
-            if source_index is not None and source_index in unused_sources:
-                if source_boxes[source_index] is not None and np.allclose(
+            if (
+                source_index is not None
+                and source_index in unused_sources
+                and source_boxes[source_index] is not None
+                and np.allclose(
                     source_boxes[source_index], result_bbox, rtol=0.0, atol=1e-3
-                ):
-                    unused_sources.remove(source_index)
-                    assignments[source_index] = (result, embedding)
-                    continue
+                )
+            ):
+                unused_sources.remove(source_index)
+                assignments[source_index] = (result, embedding)
+                continue
 
             candidates = [
                 index
@@ -2047,7 +2123,8 @@ class SearchSession:
             if len(candidates) != 1:
                 positional = (
                     output_index
-                    if output_index in unused_sources
+                    if positional_response
+                    and output_index in unused_sources
                     and output_index in candidates
                     else None
                 )
@@ -2076,10 +2153,13 @@ class SearchSession:
                 except Exception:  # noqa: BLE001 - a malformed observation is a local miss
                     malformed = True
 
-        if malformed:
+        missing = len(faces) - len(assignments)
+        if malformed or missing:
             with self._lock:
                 if hasattr(self.metrics, "embedding_failures"):
                     self.metrics.embedding_failures += 1
+                if hasattr(self.metrics, "embedding_output_failures"):
+                    self.metrics.embedding_output_failures += missing
         return accepted
 
     def _cached_associations(
@@ -2602,6 +2682,36 @@ class SearchManager:
         self._prune_generation = 0
         self._shutdown = False
 
+    def ensure_ready(self) -> dict[str, object]:
+        """Load and validate every production model before traffic is switched."""
+        self._ensure_open()
+        face_ready = getattr(self.face_backend, "ensure_ready", None)
+        if callable(face_ready):
+            face_ready()
+        person_ready = getattr(self.person_detector, "ensure_ready", None)
+        if callable(person_ready):
+            person_ready()
+        contract = getattr(self.face_backend, "embedding_contract", None)
+        if not isinstance(contract, EmbeddingContract):
+            raise ModelUnavailableError("face backend did not publish an embedding contract")
+        providers = {
+            "person_detection": str(getattr(self.person_detector, "provider_name", "unknown")),
+            "face_detection": str(
+                getattr(self.face_backend, "detection_provider_name", "unknown")
+            ),
+            "face_recognition": str(
+                getattr(self.face_backend, "recognition_provider_name", "unknown")
+            ),
+        }
+        if any(value in {"", "unknown", "uninitialized"} for value in providers.values()):
+            raise ModelUnavailableError("model provider metadata is incomplete")
+        return {
+            "providers": providers,
+            "embedding_contract": EmbeddingContractView.from_contract(contract).model_dump(
+                mode="json"
+            ),
+        }
+
     def enroll(self, image: np.ndarray, name: str = "目标") -> TargetView:
         self._ensure_open()
         target_name = _normalize_target_name(name)
@@ -2627,8 +2737,15 @@ class SearchManager:
             raise EnrollmentError(f"face quality is too low: {reasons}", code="face_quality_low")
         try:
             embedding = normalize_embedding(face.embedding)
-        except ValueError as exc:
+        except (TypeError, ValueError, OverflowError, FloatingPointError) as exc:
             raise EnrollmentError(str(exc), code="invalid_embedding") from exc
+        contract = getattr(self.face_backend, "embedding_contract", None)
+        if contract is None or embedding.size != contract.embedding_dimension:
+            _wipe_array(embedding)
+            raise EnrollmentError(
+                "embedding does not match the loaded model contract",
+                code="embedding_contract_mismatch",
+            )
         target_id = str(uuid.uuid4())
         width = int(face.bbox[2] - face.bbox[0])
         height = int(face.bbox[3] - face.bbox[1])
@@ -2640,6 +2757,7 @@ class SearchManager:
             detection_score=face.detection_score,
             quality_score=face.quality,
             model=self.face_backend.model_name,
+            embedding_contract_id=contract.contract_id,
         )
         # Shutdown can race the model inference above.  Re-check while holding
         # the lifecycle gate immediately before publishing the new target so a
@@ -2655,7 +2773,11 @@ class SearchManager:
                             status_code=429,
                         )
                     self._targets[target_id] = Target(
-                        target_id=target_id, embedding=embedding, view=view, name=target_name
+                        target_id=target_id,
+                        embedding=embedding,
+                        view=view,
+                        name=target_name,
+                        embedding_contract=contract,
                     )
         except Exception:
             # The embedding is a local sensitive buffer until the insertion is
@@ -2733,75 +2855,94 @@ class SearchManager:
                     active_session.request_id == normalized_request_id
                 ):
                     return active_session.view()
-                targets: list[Target] = []
+                target_refs: list[Target] = []
                 for target_id in target_ids:
                     target = self._targets.get(target_id)
                     if target is None:
                         raise PersonSearchError(
                             "target not found", code="target_not_found", status_code=404
                         )
-                    targets.append(target)
-            # The worker callback does not take ``_lifecycle_lock`` and may
-            # release the active slot while target validation above is running.
-            # Re-read under ``_lock`` so a session that just became terminal
-            # cannot produce a stale capacity error.
-            with self._lock:
-                active_id, active_session = self._active_session_locked()
-            if active_id is not None:
-                if not replace_active:
-                    raise PersonSearchError(
-                        "only one search may run at a time",
-                        code="search_capacity_exceeded",
-                        status_code=409,
-                    )
-                if active_session is not None:
-                    if active_session.finished.is_set():
-                        active_session.clear_evidence()
-                    else:
-                        active_session.stop()
-            ensure_ready = getattr(self.person_detector, "ensure_ready", None)
-            if ensure_ready:
-                ensure_ready()
-            # Model warm-up may take seconds and shutdown is allowed to happen
-            # while it runs.  Never publish a session after the manager closed.
-            self._ensure_open()
-            search_id = str(uuid.uuid4())
-            session = SearchSession(
-                search_id=search_id,
-                target=targets[0],
-                source=source,
-                settings=self.settings,
-                face_backend=self.face_backend,
-                person_detector=self.person_detector,
-                on_finished=self._on_finished,
-                targets=targets,
-                timeout_seconds=timeout_seconds,
-                request_id=normalized_request_id,
-            )
-            with self._lock:
-                self._sessions[search_id] = session
-                if normalized_request_id:
-                    self._request_index[normalized_request_id] = search_id
-                self._active_search_id = search_id
+                    target_refs.append(target)
+                # Stage owned snapshots before stopping a replaced session. Its
+                # completion callback may wipe these same manager-owned targets.
+                targets: list[Target] = []
+                try:
+                    for target in target_refs:
+                        targets.append(_clone_target(target))
+                except Exception:
+                    for staged_target in targets:
+                        _wipe_array(staged_target.embedding)
+                    raise
             try:
-                session.start()
-            except Exception:
+                # The worker callback does not take ``_lifecycle_lock`` and may
+                # release the active slot while target validation above is running.
                 with self._lock:
-                    self._sessions.pop(search_id, None)
-                    if normalized_request_id and self._request_index.get(normalized_request_id) == search_id:
-                        self._request_index.pop(normalized_request_id, None)
-                    if self._active_search_id == search_id:
-                        self._active_search_id = None
+                    active_id, active_session = self._active_session_locked()
+                if active_id is not None:
+                    if not replace_active:
+                        raise PersonSearchError(
+                            "only one search may run at a time",
+                            code="search_capacity_exceeded",
+                            status_code=409,
+                        )
+                    if active_session is not None:
+                        if active_session.finished.is_set():
+                            active_session.clear_evidence()
+                        else:
+                            active_session.stop()
+                ensure_ready = getattr(self.person_detector, "ensure_ready", None)
+                if ensure_ready:
+                    ensure_ready()
+                # Model warm-up may take seconds and shutdown is allowed to happen
+                # while it runs. Never publish a session after the manager closed.
+                self._ensure_open()
+                search_id = str(uuid.uuid4())
+                session = SearchSession(
+                    search_id=search_id,
+                    target=targets[0],
+                    source=source,
+                    settings=self.settings,
+                    face_backend=self.face_backend,
+                    person_detector=self.person_detector,
+                    on_finished=self._on_finished,
+                    targets=targets,
+                    timeout_seconds=timeout_seconds,
+                    request_id=normalized_request_id,
+                )
+                with self._lock:
+                    self._sessions[search_id] = session
+                    if normalized_request_id:
+                        self._request_index[normalized_request_id] = search_id
+                    self._active_search_id = search_id
                 try:
-                    session.clear_evidence()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("failed-start evidence cleanup failed: %s", type(exc).__name__)
-                try:
-                    session.defer_sensitive_cleanup()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("failed-start sensitive cleanup failed: %s", type(exc).__name__)
-                raise
-            return session.view()
+                    session.start()
+                except Exception:
+                    with self._lock:
+                        self._sessions.pop(search_id, None)
+                        if (
+                            normalized_request_id
+                            and self._request_index.get(normalized_request_id) == search_id
+                        ):
+                            self._request_index.pop(normalized_request_id, None)
+                        if self._active_search_id == search_id:
+                            self._active_search_id = None
+                    try:
+                        session.clear_evidence()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "failed-start evidence cleanup failed: %s", type(exc).__name__
+                        )
+                    try:
+                        session.defer_sensitive_cleanup()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "failed-start sensitive cleanup failed: %s", type(exc).__name__
+                        )
+                    raise
+                return session.view()
+            finally:
+                for staged_target in targets:
+                    _wipe_array(staged_target.embedding)
 
     def get_search(self, search_id: str) -> SearchView:
         self._prune_sessions()
@@ -3274,6 +3415,41 @@ def _safe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: processing failed"
 
 
+def _safe_normalize_embedding(value: object) -> np.ndarray | None:
+    """Return one owned unit vector, or None for any malformed provider value."""
+    if value is None:
+        return None
+    try:
+        raw = np.asarray(value)
+        if raw.ndim != 1 or raw.size == 0 or np.iscomplexobj(raw):
+            return None
+        embedding = np.asarray(raw, dtype=np.float32).copy()
+    except (TypeError, ValueError, OverflowError, FloatingPointError):
+        return None
+    if not np.isfinite(embedding).all():
+        return None
+    magnitude = float(np.linalg.norm(embedding.astype(np.float64, copy=False)))
+    if not np.isfinite(magnitude) or magnitude <= 1e-12:
+        return None
+    normalized = embedding / magnitude
+    if not np.isfinite(normalized).all() or not np.any(normalized):
+        return None
+    return np.ascontiguousarray(normalized, dtype=np.float32)
+
+
+def _coerce_face_bbox(value: object) -> np.ndarray | None:
+    """Return a finite xyxy box without guessing at malformed provider output."""
+    try:
+        bbox = np.asarray(value, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError, FloatingPointError):
+        return None
+    if bbox.shape != (4,) or not np.isfinite(bbox).all():
+        return None
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return None
+    return bbox.copy()
+
+
 def _is_embedding_capacity_error(exc: Exception) -> bool:
     """Recognise provider allocation failures that are safe to retry smaller."""
     if isinstance(exc, (MemoryError, OverflowError)):
@@ -3358,6 +3534,7 @@ def _clone_target(target: Target, *, include_embedding: bool = True) -> Target:
         embedding=embedding,
         view=target.view,
         name=target.name,
+        embedding_contract=target.embedding_contract,
     )
 
 

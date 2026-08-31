@@ -1,3 +1,35 @@
+# 线上 embedding、版本与生命周期收尾（2026-08-31）
+
+## 基线
+
+- 工作树干净，`main` 与 `origin/main` 同步；待收尾改动位于 `b97eb9b` / `ca1c6b7`。
+- `uv run pytest`：14 failed, 264 passed；合法 embedding 路径因 helper 缺失进入 `FAILED`。
+- `uv run ruff check .`：6 个 F821、1 个 SIM102。
+
+## 任务
+
+- [x] 1. 补齐 embedding 数值校验、provider 输出对账与失败指标。
+- [x] 2. 固定 ArcFace embedding 契约并贯通登记、搜索、事件和 readiness。
+- [x] 3. 修复同目标 `replace_active` 的 embedding 生命周期竞态。
+- [x] 4. 修复 reader 假停止、模型半初始化与敏感清理重试边界。
+- [x] 5. 对齐 package/API/build revision，并将强 readiness 接入 T4 canary。
+- [x] 6. 补齐单测、全量测试、ruff、bash 语法和 diff 检查。
+
+## 验证
+
+- `uv run pytest`：314 passed；原始 14 个失败全部消除。
+- reader / detector / service 并发与生命周期测试并行重复 5 次，全绿。
+- `uv run ruff check .`、`bash -n scripts/deploy_t4.sh`、`git diff --check` 全绿。
+- 本机真实 YOLOX + `buffalo_l` readiness 通过：CPU provider、固定 SHA-256、112×112、
+  512 维和 flip-TTA contract 均与 manifest 一致。
+
+## 后续边界
+
+- 未执行真实 T4 容器切换或现场 RTSP 验收。
+- 后端显式 `close()` / in-flight lease、离线 CLI 全路径资源托管、VLC `kill` 兜底留后续。
+
+---
+
 # 提升 SearchSession 处理帧率
 
 ## 命中证据内存交接

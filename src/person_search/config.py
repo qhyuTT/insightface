@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", min_length=1, max_length=255, pattern=r"^\S+$")
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "info"
+    build_revision: str = Field(default="unknown", min_length=1, max_length=128, pattern=r"^\S+$")
     # Evidence is intentionally an opt-in, short-lived in-memory hand-off. The
     # executor does not expose a face image unless its caller configured a
     # separate shared credential.

@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from person_search.domain import Detection, FaceObservation
+from person_search.domain import Detection, EmbeddingContract, FaceObservation
 
 
 class FakeFaceBackend:
@@ -13,6 +13,14 @@ class FakeFaceBackend:
     provider_name = "CPUExecutionProvider"
     detection_provider_name = "CPUExecutionProvider"
     recognition_provider_name = "CPUExecutionProvider"
+    embedding_contract = EmbeddingContract(
+        schema_version="arcface-v1",
+        model_name="fake-arcface",
+        model_sha256="0" * 64,
+        embedding_dimension=2,
+        input_size=(112, 112),
+        flip_tta=False,
+    )
 
     def __init__(self, observations: list[FaceObservation] | None = None):
         self.observations = observations or []

@@ -23,13 +23,19 @@ class QualityResult:
 
 
 def normalize_embedding(value: np.ndarray) -> np.ndarray:
-    embedding = np.asarray(value, dtype=np.float32).reshape(-1)
+    raw = np.asarray(value)
+    if np.iscomplexobj(raw):
+        raise ValueError("embedding must be real-valued")
+    embedding = np.asarray(raw, dtype=np.float32).reshape(-1)
     if embedding.size == 0 or not np.isfinite(embedding).all():
         raise ValueError("embedding must contain only finite values")
-    magnitude = float(np.linalg.norm(embedding))
-    if magnitude <= 1e-12:
+    magnitude = float(np.linalg.norm(embedding.astype(np.float64, copy=False)))
+    if not np.isfinite(magnitude) or magnitude <= 1e-12:
         raise ValueError("embedding magnitude is zero")
-    return embedding / magnitude
+    normalized = embedding / magnitude
+    if not np.isfinite(normalized).all() or not np.any(normalized):
+        raise ValueError("embedding normalization failed")
+    return np.ascontiguousarray(normalized, dtype=np.float32)
 
 
 def assess_face(

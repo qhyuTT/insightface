@@ -331,6 +331,7 @@ class ConfirmedSearchResult(BaseModel):
     quality: float
     evidence_count: int
     model: str
+    embedding_contract_id: str | None = None
     association: str = "person_strict"
     evidence_id: str | None = None
     evidence_expires_at_ms: int | None = None
@@ -344,6 +345,7 @@ class SearchView(BaseModel):
     status: SearchStatus
     source: SourceConfig
     provider: str | None = None
+    embedding_contract_id: str | None = None
     processed_fps: float = 0.0
     p95_latency_ms: float = 0.0
     dropped_frames: int = 0
@@ -374,6 +376,7 @@ class SearchView(BaseModel):
     embedding_batch_count: int = Field(default=0, ge=0)
     faces_dropped_by_budget: int = Field(default=0, ge=0)
     embedding_failures: int = Field(default=0, ge=0)
+    embedding_output_failures: int = Field(default=0, ge=0)
     budget_skips: dict[str, int] = Field(default_factory=dict)
     effective_config: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
@@ -396,6 +399,7 @@ class TargetView(BaseModel):
     detection_score: float
     quality_score: float
     model: str
+    embedding_contract_id: str | None = None
 
 
 class SearchEvent(BaseModel):
@@ -413,6 +417,7 @@ class SearchEvent(BaseModel):
     quality: float
     evidence_count: int
     model: str
+    embedding_contract_id: str | None = None
     association: str = "person_strict"
     # Opaque, short-lived reference to evidence held only by this executor. It
     # is intentionally not an image URL and has no meaning after the task ends.
@@ -465,6 +470,48 @@ class Target:
     embedding: np.ndarray | None
     view: TargetView
     name: str = "目标"
+    embedding_contract: EmbeddingContract | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingContract:
+    schema_version: str
+    model_name: str
+    model_sha256: str
+    embedding_dimension: int
+    input_size: tuple[int, int]
+    flip_tta: bool
+
+    @property
+    def contract_id(self) -> str:
+        flip = 1 if self.flip_tta else 0
+        width, height = self.input_size
+        return (
+            f"{self.schema_version}:{self.model_name}:{self.model_sha256[:16]}:"
+            f"d{self.embedding_dimension}:{width}x{height}:flip{flip}"
+        )
+
+
+class EmbeddingContractView(BaseModel):
+    schema_version: str
+    model_name: str
+    model_sha256: str
+    embedding_dimension: int
+    input_size: tuple[int, int]
+    flip_tta: bool
+    contract_id: str
+
+    @classmethod
+    def from_contract(cls, contract: EmbeddingContract) -> EmbeddingContractView:
+        return cls(
+            schema_version=contract.schema_version,
+            model_name=contract.model_name,
+            model_sha256=contract.model_sha256,
+            embedding_dimension=contract.embedding_dimension,
+            input_size=contract.input_size,
+            flip_tta=contract.flip_tta,
+            contract_id=contract.contract_id,
+        )
 
 
 @dataclass(slots=True)
@@ -502,6 +549,7 @@ class SearchMetrics:
     embedding_batch_count: int = 0
     faces_dropped_by_budget: int = 0
     embedding_failures: int = 0
+    embedding_output_failures: int = 0
 
     def __post_init__(self) -> None:
         """Wrap constructor-provided lists while preserving the old dataclass API."""
@@ -577,6 +625,7 @@ class SearchMetrics:
             "embedding_batch_count": self.embedding_batch_count,
             "faces_dropped_by_budget": self.faces_dropped_by_budget,
             "embedding_failures": self.embedding_failures,
+            "embedding_output_failures": self.embedding_output_failures,
             "time_to_confirm_p50_seconds": _percentile(self.time_to_confirm_seconds, 50),
             "time_to_confirm_p95_seconds": _percentile(self.time_to_confirm_seconds, 95),
             "track_dwell_p50_seconds": _percentile(self.track_dwell_seconds, 50),

@@ -91,3 +91,17 @@
   这类静默失败不能靠「命令有没有报错」判断，必须核对**结果**：
   `git rev-parse --short HEAD` 等于目标 commit 才算数。同理 `current` 符号链接上一次
   忘了更新（停在 6ceb350），照 README 的 `cp -a current` 会从错误的基线分叉。
+- Dockerfile 的变量替换**只**作用于 ADD/COPY/ENV/EXPOSE/FROM/LABEL/STOPSIGNAL/USER/
+  VOLUME/WORKDIR，不作用于 RUN/CMD/ENTRYPOINT/HEALTHCHECK。所以 shell 形式的
+  `HEALTHCHECK CMD ... ${PERSON_SEARCH_PORT:-8000} ...` 里的 `${}` 本来就原样存进镜像、
+  由运行时的 sh 展开，**不需要任何转义**。写成 compose 的 `$$` 或想当然的 `\$` 都会坏：
+  `\$` 的反斜杠会留在存储的命令串里，sh 在双引号内把 `\$` 读成字面 `$`，curl 拿到未展开
+  的 URL 退出 3。T4 实测：plain 形式 rc=0，`\$` 形式 rc=3，容器被标 unhealthy 而 API
+  本身完全正常——健康检查失败和服务失败在这里是两回事。
+- 而 `CMD-SHELL` 是 compose 的健康检查写法，Dockerfile 解析器直接拒绝
+  （`Unknown type "CMD-SHELL" in HEALTHCHECK`）。它连镜像都构建不出来。
+- 这两处都被一条「原样钉住目标字符串」的测试放过了：
+  `assert 'CMD-SHELL curl ... $${...}' in source` 对着一个**永远构建不出来的**
+  Dockerfile 长期为绿。文本断言只能证明字符串没变，不能证明它可用；给这类断言配上
+  反向守卫（`assert "CMD-SHELL" not in source`、`assert r"\${PERSON_SEARCH_PORT"
+  not in source`），并且逐个把已知坏形式代回去确认测试真的会红。

@@ -60,16 +60,22 @@ def test_docker_revision_label_preserves_cache_and_health_uses_runtime_port() ->
     model_setup = source.index("RUN mkdir -p /models/.insightface")
     assert dependency_install < model_setup < label
     assert "ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}" in source
-    # Two compose-isms a Dockerfile HEALTHCHECK invites, both fatal and neither
-    # caught by asserting the intended string alone. ``CMD-SHELL`` is Compose's
-    # spelling and the Dockerfile parser rejects it, failing the build. ``$$`` is
-    # Compose's escape for a literal dollar; a Dockerfile expands it at *build*
-    # time, baking in the build-stage port and pointing the canary's probe at the
-    # production port. Deferring to the runtime shell needs a backslash escape.
+    # The port reference must reach the runtime shell verbatim, and all three
+    # ways of "protecting" it break it. Docker expands variables only in ADD /
+    # COPY / ENV / EXPOSE / FROM / LABEL / STOPSIGNAL / USER / VOLUME / WORKDIR
+    # -- never in HEALTHCHECK -- so a plain ${...} is already stored unexpanded
+    # and needs no escape at all. Compose's ``$$`` reaches curl as a literal
+    # dollar, and ``\$`` keeps its backslash in the stored command, which sh
+    # reads as a literal dollar too: measured in the container, the plain form
+    # exits 0 while the escaped form exits 3 on a malformed URL, leaving Docker
+    # reporting the container unhealthy while the API itself serves fine.
+    # ``CMD-SHELL`` is Compose's spelling of the shell form, which the Dockerfile
+    # parser rejects outright -- that one fails the build, not the deployment.
     assert "CMD-SHELL" not in source
     assert "$$" not in source
+    assert r"\${PERSON_SEARCH_PORT" not in source
     assert (
-        r'CMD curl --fail --silent "http://127.0.0.1:\${PERSON_SEARCH_PORT:-8000}/healthz"'
+        'CMD curl --fail --silent "http://127.0.0.1:${PERSON_SEARCH_PORT:-8000}/healthz"'
     ) in source
 
 

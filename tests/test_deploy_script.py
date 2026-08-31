@@ -60,7 +60,17 @@ def test_docker_revision_label_preserves_cache_and_health_uses_runtime_port() ->
     model_setup = source.index("RUN mkdir -p /models/.insightface")
     assert dependency_install < model_setup < label
     assert "ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}" in source
-    assert 'CMD-SHELL curl --fail --silent "http://127.0.0.1:$${PERSON_SEARCH_PORT:-8000}/healthz"' in source
+    # Two compose-isms a Dockerfile HEALTHCHECK invites, both fatal and neither
+    # caught by asserting the intended string alone. ``CMD-SHELL`` is Compose's
+    # spelling and the Dockerfile parser rejects it, failing the build. ``$$`` is
+    # Compose's escape for a literal dollar; a Dockerfile expands it at *build*
+    # time, baking in the build-stage port and pointing the canary's probe at the
+    # production port. Deferring to the runtime shell needs a backslash escape.
+    assert "CMD-SHELL" not in source
+    assert "$$" not in source
+    assert (
+        r'CMD curl --fail --silent "http://127.0.0.1:\${PERSON_SEARCH_PORT:-8000}/healthz"'
+    ) in source
 
 
 def test_t4_deploy_script_defaults_tiny_face_to_shadow_mode() -> None:
@@ -136,3 +146,4 @@ def test_t4_deploy_script_redacts_remote_credentials_in_logs() -> None:
     assert sanitize("https://example.test/org/repo.git") == (
         "https://example.test/org/repo.git"
     )
+

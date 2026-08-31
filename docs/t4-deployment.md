@@ -2,11 +2,47 @@
 
 本文说明如何将已验证的 `main` 分支更新到 NVIDIA T4 服务器，并区分“服务器有 GPU”“容器能访问 GPU”和“推理模型实际使用 CUDA”三个层次。
 
+## 安全边界（上线前必读）
+
+服务默认只监听 `127.0.0.1`。当前没有全局 API 认证：目标登记、搜索创建/停止、MJPEG
+预览、WebSocket 事件、`/monitor` 与文档接口均可匿名访问；只有配置
+`PERSON_SEARCH_EVIDENCE_API_KEY` 后，证据下载/释放接口才要求 `X-API-Key`。因此设置
+`PERSON_SEARCH_HOST=0.0.0.0` 时，必须把服务放在反向代理/API gateway 或 mTLS 后，并用
+防火墙/网络 ACL 限制来源；证据 key 不能当作全局认证。
+
+RTSP 输入允许 loopback、私网和任意 DNS 主机名，以兼容本地隧道与摄像头网段。未受信请求
+可借此诱导服务访问内网地址（SSRF/端口探测），所以除 API 鉴权外还应在防火墙/网络层配置
+RTSP 主机 allowlist 或出站 ACL，只让受信控制面提交 source。URI 凭据不会出现在 API
+响应，但仍不要写入仓库、命令历史或日志。
+
 ## 机场场景运行基线
 
 机场中的旅客常见坐姿、行走和局部遮挡，部署时建议给识别服务提供未经降采样的 `1920x1080` 输入。人脸框短边按推理原始帧计量：`>=80 px` 使用 `0.55 / 3 帧 / 1.5 s`，`64-79 px` 使用更严格的 `0.60 / 4 帧 / 2 s` 且不发布 `candidate`，`<64 px` 直接拒绝。将 1080P 转成 720P 会把同一张脸线性缩小约三分之一，可能跨过这两个边界。
 
-T4/CUDA 默认全帧人脸检测频率为 `10 Hz`。当全帧没有合格人脸或只有小人脸时，额外以 `4 Hz` 检查最多 `8` 个高置信人体 ROI。上线前应在实际 RTSP 链路确认响应中的 provider、P95 延迟、`dropped_frames` 及人脸诊断计数；不要只根据浏览器预览是否流畅判断推理负载。
+T4/CUDA 默认全帧人脸检测频率为 `10 Hz`。当全帧没有合格人脸或只有小人脸时，额外以 `4 Hz` 检查最多 `3` 条高置信人体轨迹的 ROI（`roi_max_tracks_per_pass=3`）。`roi_batch_size` 默认 `8` 只是同一检测尺度下的批处理分组大小，不是每轮的轨迹上限。上线前应在实际 RTSP 链路确认响应中的 provider、P95 延迟、`dropped_frames` 及人脸诊断计数；不要只根据浏览器预览是否流畅判断推理负载。
+
+运行时容量保护的默认值为：`roi_max_tracks_per_pass=3`、`roi_batch_size=8`、
+`arcface_micro_batch_size=16`、`max_faces_per_frame=64`。前者限制一次 ROI pass
+尝试的轨迹数，第二项限制同尺度检测批次的裁剪数，第三项限制一次 ArcFace 调用的
+人脸数，最后一项限制一帧进入 ArcFace 的人脸数。它们都可以用同名
+`PERSON_SEARCH_...` 环境变量覆盖，并在搜索响应的 `effective_config` 中回显；超出
+预算时会优先保留有明确人体关联、尺寸较大且质量较高的脸，并记录降级计数。
+
+上线后建议持续记录以下字段，而不是只看预览：`source_fps`、`processed_fps`、
+`dropped_frames`、`drop_rate`、`roi_batch_count`、`embedding_batch_count`、
+`faces_dropped_by_budget`、`embedding_failures`、`stage_p95_latency_ms`、`effective_hz`
+和 `budget_skips`。其中 `budget_skips` 的 `face_roi_floor` 表示处理帧率触及
+`min_processed_fps`，`face_roi_credit` 表示 ROI 信用桶余额不足；两者处置方式不同。
+`end_to_end_p95_latency_ms` 统计从帧采集到本轮处理完成的 P95，可作为 frame age
+（帧龄）的聚合代理。将它与 `source_fps`、`processed_fps` 一起看，才能区分网络抖动、
+队列积压和模型推理过慢。
+
+离线 schema v2 报告的 `quality_diagnostics` 会进一步拆分嵌入异常：
+`embedding_failures` 统计没有拿到有效向量的人脸输入数，
+`embedding_provider_failures` 统计可恢复的 provider 调用失败数；OOM 拆分或重试会
+让一次调用对应多张脸，因此两者不能直接相加。`embedding_batch_count` 与
+`faces_dropped_by_budget` 用于确认微批次和单帧预算是否实际生效。遇到坏的 provider
+响应时，离线回放和在线帧都会按脸丢弃并继续运行，相关计数应纳入验收记录。
 
 当前摄像头已放正，服务直接使用 RTSP 原始帧进行检测和特征提取。部署前应从 T4 服务器确认 RTSP 画面方向、`1920x1080` 分辨率和实际帧率；排障时可临时设置 `debug_preview=true`，预览会显示人脸短边、拒绝原因、关联路径和相似度；搜索状态还会返回累计的接受、小脸、未关联、拒绝原因和关联方式计数。
 
@@ -87,11 +123,15 @@ T4_BIND_HOST=0.0.0.0 ./scripts/deploy_t4.sh
 1. 校验或下载 `models/yolox_tiny.onnx`。
 2. 构建新的 `person-search:t4` 镜像，此时旧容器继续运行。
 3. 用新镜像执行 `nvidia-smi`，验证 NVIDIA Container Toolkit。
-4. 强制删除名称精确为 `person-search` 的旧容器。
-5. 使用 host 网络、`--gpus all`、`restart=unless-stopped` 和 `person-search-models` 模型卷启动新容器。
-6. 等待 `/healthz` 成功，并创建真实 YOLOX ONNX session 验证 CUDA provider。
+4. 在独立的 loopback canary 端口（默认 `18000`）启动候选容器；旧容器仍继续提供服务。
+5. 等待候选容器 `/healthz` 成功，并创建真实 YOLOX ONNX session 验证 CUDA provider（可选预加载 InsightFace）。
+6. 候选通过后先停止并删除候选以释放 GPU，再以 `--stop-timeout` 停止旧容器，并将旧容器改名为带时间戳的 rollback point。
+7. 使用 host 网络、`--gpus all`、`restart=unless-stopped` 和 `person-search-models` 模型卷启动新容器；再次执行 `/healthz` 和 YOLOX provider 检查。
+8. 新容器任一检查失败时，脚本删除失败容器、恢复 rollback point，并重新执行健康和 provider 检查。
 
-替换容器会清空进程内的登记目标和搜索任务，但不会删除 `person-search-models` 模型卷。脚本不会清理其他容器、共享 Docker build cache 或模型卷。
+替换容器会清空进程内的登记目标和搜索任务，但不会删除 `person-search-models` 模型卷。通过 `T4_STOP_TIMEOUT_SECONDS`（默认 30 秒）可调整优雅停止时间；`T4_CANARY_PORT` 可调整候选端口。成功部署后旧容器会以 `person-search.previous.<timestamp>` 名称保留，确认新版本稳定后可手动删除。
+
+部署前脚本会打印并校验 Git commit、分支、origin 和工作树状态。生产建议设置 `T4_EXPECTED_COMMIT=<完整或短 SHA>` 与 `T4_EXPECTED_REMOTE_URL=<可信 origin>`；默认拒绝 dirty checkout，临时实验才使用 `T4_ALLOW_DIRTY=1`。
 
 ## 部署后检查
 
@@ -183,12 +223,20 @@ curl http://127.0.0.1:8000/v1/searches/SEARCH_ID
 
 响应中的 `provider` 应同时表明 face 和 person detector 使用 `CUDAExecutionProvider`。
 
+YOLOX 的 ONNX Runtime 线程与设备可选通过 `PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS`、
+`PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS` 和 `PERSON_SEARCH_ORT_CUDA_DEVICE_ID` 设置；
+留空表示采用 ORT 原生默认，值必须是非负整数，CUDA 编号以 `nvidia-smi -L` 为准。
+部署脚本提供对应的 `T4_ORT_*` 变量，并且只在显式设置时传入。它们目前只作用于
+YOLOX detector session；InsightFace 的 provider 仍要按上面的独立命令核验。
+
 ### 6. 超小脸验证
 
-`48-63px` 超小脸策略在库默认值里仍为关闭，由部署侧开启：`scripts/deploy_t4.sh` 现在下发
-`PERSON_SEARCH_TINY_FACE_ENABLED=true` 与 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false`。
-这是一个**已知先于标定的运营决定**——实拍显示该距离下全部人脸短边 <64px，不开该档则零召回。
-关掉 shadow 意味着一次 48-63px 确认会直接把目标标记为已找到并触发 `target_found`。
+`48-63px` 超小脸策略在库默认值里仍为关闭，由部署侧开启：`scripts/deploy_t4.sh` 默认下发
+`PERSON_SEARCH_TINY_FACE_ENABLED=true` 与 `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true`。
+这是一个**先观察再标定的运营默认**——实拍显示该距离下全部人脸短边 <64px，不开该档则零召回。
+Shadow 命中只发布诊断事件，不会把目标标记为已找到。只有同时显式设置
+`T4_TINY_FACE_SHADOW_MODE=false` 与 `T4_ALLOW_PHYSICAL_ACTIONS=true`，部署脚本才允许
+超小脸正式确认触发 `target_found`；未完成按尺寸召回率和负样本验收前不要打开该开关。
 
 需要先只观察、不置 `found` 时，用 shadow 模式单独起容器：
 

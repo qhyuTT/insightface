@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 from pydantic import ValidationError
 
@@ -136,3 +138,28 @@ def test_scene_profiles_never_override_an_explicit_setting() -> None:
 def test_conservative_profile_changes_nothing() -> None:
     """The default path must stay a no-op now that the profiles are a registry."""
     assert Settings(match_profile="conservative").model_dump() == Settings().model_dump()
+
+
+def test_host_is_trimmed_but_internal_whitespace_is_rejected() -> None:
+    assert Settings(host=" 127.0.0.1 ").host == "127.0.0.1"
+    with pytest.raises(ValidationError):
+        Settings(host="127.0.0.1 bad")
+
+
+def test_runtime_float_settings_reject_non_finite_values() -> None:
+    with pytest.raises(ValidationError):
+        Settings(target_loop_hz=math.inf)
+    with pytest.raises(ValidationError):
+        Settings(min_processed_fps=math.nan)
+
+
+def test_evidence_api_key_rejects_header_control_characters() -> None:
+    # Empty remains the backwards-compatible "disabled" sentinel.
+    assert Settings(evidence_api_key="").evidence_api_key == ""
+    assert Settings(evidence_api_key="  key  ").evidence_api_key == "key"
+    with pytest.raises(ValidationError):
+        Settings(evidence_api_key="key\nvalue")
+    with pytest.raises(ValidationError):
+        Settings(evidence_api_key="x" * 257)
+
+    assert "top-secret-key" not in repr(Settings(evidence_api_key="top-secret-key"))

@@ -23,6 +23,11 @@ class FaceTracker:
         self._tracks: dict[int, _FaceTrackMemory] = {}
         self._next_id = -1
 
+    def reset(self) -> None:
+        """Drop all face tracks at a camera/source epoch boundary."""
+        self._tracks.clear()
+        self._next_id = -1
+
     def update(self, faces: list[FaceObservation], timestamp: float) -> list[Track | None]:
         self._expire(timestamp)
         remaining = set(range(len(faces)))

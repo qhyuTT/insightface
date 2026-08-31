@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,9 +27,10 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from . import API_VERSION
 from .config import Settings, get_settings
 from .domain import SearchCreate, SearchView, SourceConfig, SourceType, TargetView
-from .errors import PersonSearchError
+from .errors import ModelUnavailableError, PersonSearchError
 from .privacy import install_evidence_access_log_filter
 from .service import SearchManager
 
@@ -51,7 +55,7 @@ def create_app(
 
     app = FastAPI(
         title="Robot Person Search PoC",
-        version="0.1.0",
+        version=API_VERSION,
         description="Session-scoped photo-to-live-video person search API.",
         lifespan=lifespan,
     )
@@ -59,15 +63,30 @@ def create_app(
 
     @app.exception_handler(PersonSearchError)
     async def handle_person_search_error(_: Request, exc: PersonSearchError) -> JSONResponse:
-        return _problem(exc.status_code, exc.code, exc.message)
+        # Provider/model exceptions can contain local filesystem paths, model
+        # URLs, or credentials echoed by a downloader.  Keep those details in
+        # server-side logs only; the public error contract needs a stable,
+        # non-sensitive message.
+        message = (
+            "model unavailable"
+            if isinstance(exc, ModelUnavailableError)
+            else _redact_validation_text(exc.message)
+        )
+        return _problem(exc.status_code, exc.code, message)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        return _problem(422, "validation_error", "request validation failed", exc.errors())
+        fields = _safe_validation_fields(exc)
+        # SourceConfig performs strict URI validation before the route handler is
+        # entered.  Preserve the route's longstanding ``invalid_source`` error
+        # code for those failures while keeping unrelated malformed requests under
+        # the generic validation code.
+        code = "invalid_source" if _contains_source_validation_error(fields) else "validation_error"
+        return _problem(422, code, "request validation failed", fields)
 
     @app.get("/healthz")
     async def health() -> dict[str, Any]:
-        active = manager.active_search()
+        active = await asyncio.to_thread(manager.active_search)
         capabilities = [
             "replace_active",
             "active_search",
@@ -79,7 +98,7 @@ def create_app(
             capabilities.append("confirmed_evidence_v1")
         return {
             "status": "ok",
-            "api_version": "0.2.0",
+            "api_version": API_VERSION,
             "capabilities": capabilities,
             "active_search": active is not None,
         }
@@ -215,27 +234,48 @@ def create_app(
                     code="invalid_targets",
                     status_code=422,
                 )
-            filename = spec.get("image_filename")
-            if (
-                not isinstance(filename, str)
-                or not filename.strip()
-                or filename in specs_by_filename
-            ):
+            filename = _batch_filename(spec.get("image_filename"))
+            if filename is None or filename in specs_by_filename:
                 raise PersonSearchError(
-                    "image_filename values must be non-empty and unique",
+                    "image_filename values must be plain, non-empty, and unique",
                     code="invalid_targets",
                     status_code=422,
                 )
             specs_by_filename[filename] = spec
 
+        # Validate the complete filename set before decoding or enrolling any
+        # image.  A count-only check lets a duplicated upload stand in for a
+        # missing target (and can leave a partially enrolled batch behind).
+        uploaded_filenames: list[str] = []
+        for image in images:
+            filename = _batch_filename(image.filename)
+            if filename is None:
+                raise PersonSearchError(
+                    "uploaded image filenames must be plain and non-empty",
+                    code="image_target_mismatch",
+                    status_code=422,
+                )
+            uploaded_filenames.append(filename)
+        if len(set(uploaded_filenames)) != len(uploaded_filenames) or set(uploaded_filenames) != set(
+            specs_by_filename
+        ):
+            raise PersonSearchError(
+                "uploaded image filenames must exactly match targets",
+                code="image_target_mismatch",
+                status_code=422,
+            )
+
         enrolled_ids: list[str] = []
         try:
             for image in images:
-                filename = Path(image.filename or "").name
+                # The set was validated above, so this lookup cannot silently
+                # reuse one target for two uploads.
+                filename = _batch_filename(image.filename)
+                assert filename is not None
                 spec = specs_by_filename.get(filename)
                 if spec is None:
                     raise PersonSearchError(
-                        f"uploaded image {filename!r} is not declared in targets",
+                        "uploaded image filenames must exactly match targets",
                         code="image_target_mismatch",
                         status_code=422,
                     )
@@ -260,15 +300,15 @@ def create_app(
 
     @app.get("/v1/searches/active", response_model=SearchView | None)
     async def active_search() -> SearchView | None:
-        return manager.active_search()
+        return await asyncio.to_thread(manager.active_search)
 
     @app.get("/v1/searches/by-request/{request_id}", response_model=SearchView | None)
     async def search_by_request(request_id: str) -> SearchView | None:
-        return manager.search_by_request_id(request_id)
+        return await asyncio.to_thread(manager.search_by_request_id, request_id)
 
     @app.get("/v1/searches/{search_id}", response_model=SearchView)
     async def get_search(search_id: str) -> SearchView:
-        return manager.get_search(search_id)
+        return await asyncio.to_thread(manager.get_search, search_id)
 
     @app.get("/v1/searches/{search_id}/evidence/{evidence_id}")
     async def get_evidence(
@@ -288,7 +328,7 @@ def create_app(
                 code="evidence_access_not_configured",
                 status_code=503,
             )
-        if x_api_key is None or not hmac.compare_digest(x_api_key, settings.evidence_api_key):
+        if not _api_key_matches(x_api_key, settings.evidence_api_key):
             raise PersonSearchError(
                 "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
             )
@@ -314,7 +354,7 @@ def create_app(
                 code="evidence_access_not_configured",
                 status_code=503,
             )
-        if x_api_key is None or not hmac.compare_digest(x_api_key, settings.evidence_api_key):
+        if not _api_key_matches(x_api_key, settings.evidence_api_key):
             raise PersonSearchError(
                 "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
             )
@@ -355,7 +395,7 @@ def create_app(
 
     @app.delete("/v1/searches/active", status_code=204)
     async def delete_active_search() -> Response:
-        active = manager.active_search()
+        active = await asyncio.to_thread(manager.active_search)
         if active is not None:
             await asyncio.to_thread(manager.stop_search, active.search_id)
         return Response(status_code=204)
@@ -376,7 +416,28 @@ def create_app(
         seq = max(0, after_seq)
         try:
             while True:
-                events = await asyncio.to_thread(session.events.after, seq, 1.0)
+                replay = getattr(session.events, "after_with_meta", None)
+                if replay is not None:
+                    events, gap, oldest_seq = await asyncio.to_thread(replay, seq, 1.0)
+                    if gap:
+                        gap_seq = max(0, int(oldest_seq or 1) - 1)
+                        await websocket.send_json(
+                            {
+                                "schema_version": "1",
+                                "seq": gap_seq,
+                                "event_id": str(uuid.uuid4()),
+                                "type": "replay_gap",
+                                "occurred_at": int(time.time() * 1000),
+                                "data": {
+                                    "oldest_seq": int(oldest_seq or 0),
+                                    "requested_after_seq": seq,
+                                },
+                            }
+                        )
+                        seq = gap_seq
+                        continue
+                else:
+                    events = await asyncio.to_thread(session.events.after, seq, 1.0)
                 for event in events:
                     event["search_id"] = search_id
                     await websocket.send_json(event)
@@ -395,6 +456,127 @@ def _problem(status: int, code: str, message: str, fields: Any = None) -> JSONRe
     if fields is not None:
         detail["fields"] = fields
     return JSONResponse(status_code=status, content={"detail": detail})
+
+
+def _api_key_matches(provided: str | None, expected: str | None) -> bool:
+    """Compare header credentials without leaking timing or raising on Unicode.
+
+    ``hmac.compare_digest`` only accepts ASCII ``str`` values.  Configuration is
+    intentionally allowed to contain Unicode (headers are decoded as text by
+    Starlette), so compare canonical UTF-8 bytes instead and fail closed for
+    absent credentials.
+    """
+    if not isinstance(provided, str) or not isinstance(expected, str) or not provided or not expected:
+        return False
+    try:
+        return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+    except (UnicodeError, TypeError):
+        return False
+
+
+# Validation messages are generated from third-party/Pydantic errors.  Never
+# reflect a submitted URI (which may contain RTSP credentials) back to a client.
+# Match from a URI scheme through the end of the message.  A malformed URI can
+# contain raw spaces or control characters in credentials; stopping at one of
+# those characters would redact only the prefix and leave the remainder of a
+# secret visible.  Validation messages are short diagnostics, so consuming the
+# suffix is preferable to attempting to parse untrusted URI syntax in an error
+# handler.
+_VALIDATION_URI_RE = re.compile(r"(?is)(?:rtsps?|https?|file)://.*")
+_FILENAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_VALIDATION_LOC_MAX_LENGTH = 128
+
+
+def _redact_validation_text(value: Any) -> str:
+    """Return a JSON-safe validation message with URI credentials removed."""
+    text = str(value)
+    # Pydantic's normal messages do not echo input values, but custom validators
+    # and future dependencies may.  Never let an RTSP credential reach a client.
+    text = _VALIDATION_URI_RE.sub("<redacted-uri>", text)
+    return _FILENAME_CONTROL_RE.sub(" ", text)
+
+
+def _safe_validation_fields(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """Project FastAPI/Pydantic errors onto the small public error contract.
+
+    ``exc.errors()`` includes ``input`` and, for ``ValueError`` validators, a
+    ``ctx.error`` object that the JSON encoder cannot serialize.  Both are
+    intentionally omitted; locations, stable error types and human-readable
+    messages are sufficient for clients to correct a request and do not expose
+    submitted images, credentials or arbitrary Python objects.
+    """
+    safe: list[dict[str, Any]] = []
+    for error in exc.errors():
+        raw_loc = error.get("loc", ())
+        if isinstance(raw_loc, (tuple, list)):
+            loc: list[Any] = []
+            for part in raw_loc:
+                if isinstance(part, int):
+                    loc.append(part)
+                    continue
+                # Field names normally come from our schema, but an ``extra``
+                # key is attacker-controlled.  Apply the same URI/control
+                # redaction and length cap as messages before reflecting it.
+                rendered = _redact_validation_text(part if isinstance(part, str) else str(part))
+                loc.append(rendered[:_VALIDATION_LOC_MAX_LENGTH])
+        else:
+            if isinstance(raw_loc, int):
+                loc = [raw_loc]
+            else:
+                rendered = _redact_validation_text(
+                    raw_loc if isinstance(raw_loc, str) else str(raw_loc)
+                )
+                loc = [rendered[:_VALIDATION_LOC_MAX_LENGTH]]
+        safe.append(
+            {
+                "loc": loc,
+                "type": str(error.get("type", "validation_error")),
+                "msg": _redact_validation_text(error.get("msg", "request validation failed")),
+            }
+        )
+    return safe
+
+
+def _contains_source_validation_error(fields: list[dict[str, Any]]) -> bool:
+    """Identify SourceConfig errors without looking at unsafe raw inputs."""
+    source_tokens = {"uri", "device_index", "hostname", "port"}
+    for field in fields:
+        raw_loc = [str(part) for part in field.get("loc", [])]
+        loc = set(raw_loc)
+        message = str(field.get("msg", "")).lower()
+        # A missing top-level ``source`` is an ordinary request-shape error, not
+        # a malformed source URI. Keep the longstanding generic validation code
+        # for that one case.
+        if loc.intersection(source_tokens):
+            return True
+        if "source" in loc and len(raw_loc) == 2 and field.get("type") == "missing":
+            continue
+        if "source" in loc and (len(raw_loc) > 2 or field.get("type") != "missing"):
+            # ``body.source`` + ``missing`` is the one shape error that remains
+            # generic. Nested fields, enum/type errors, and model-level URI
+            # validators all describe an actual source value and use the stable
+            # invalid_source code.
+            return True
+        if re.search(r"\b(?:rtsp|rtsps|uri|device_index|hostname|port)\b", message):
+            return True
+    return False
+
+
+def _batch_filename(value: Any) -> str | None:
+    """Return a safe multipart filename token, or ``None`` when ambiguous.
+
+    Matching by basename alone permits ``dir/a.jpg`` and ``a.jpg`` to alias one
+    target and lets duplicate uploads pass a count-only check.  Batch requests use
+    plain filename tokens; path components, control characters and surrounding
+    whitespace are rejected before any expensive enrollment starts.
+    """
+    if not isinstance(value, str):
+        return None
+    if not value or value != value.strip() or len(value) > 255:
+        return None
+    if "/" in value or "\\" in value or _FILENAME_CONTROL_RE.search(value):
+        return None
+    return value
 
 
 async def _decode_upload(image: UploadFile) -> np.ndarray:

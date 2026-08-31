@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -22,12 +23,15 @@ from person_search.domain import (
     TargetView,
     Track,
 )
-from person_search.errors import EnrollmentError, PersonSearchError
+from person_search.errors import EnrollmentError, ModelUnavailableError, PersonSearchError
 from person_search.service import (
     PreviewHub,
     SearchManager,
     SearchSession,
+    _clone_target,
     _merge_faces,
+    _normalize_request_id,
+    _safe_error,
     _sanitize_source,
 )
 
@@ -191,6 +195,102 @@ def test_person_roi_pass_uses_top_n_valid_tracks_by_score() -> None:
     SearchSession._analyze_person_rois(session, frame, tracks)
 
     assert backend.detect_calls == 8
+
+
+def test_person_roi_pass_batches_crops_by_fixed_scale() -> None:
+    class BatchBackend(FakeFaceBackend):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.batch_sizes: list[int] = []
+            self.batch_scales: list[int | Sequence[int] | None] = []
+
+        def detect_faces_batch(
+            self, frames, *, enrollment=False, detection_size=None
+        ):
+            self.batch_sizes.append(len(frames))
+            self.batch_scales.append(detection_size)
+            return [[] for _ in frames]
+
+    backend = BatchBackend()
+    settings = Settings(
+        roi_max_tracks_per_pass=5,
+        roi_min_person_height_px=120,
+        roi_batch_enabled=True,
+        roi_batch_size=2,
+    )
+    session = _roi_stub(settings, backend)
+    frame = np.zeros((600, 800, 3), dtype=np.uint8)
+    tracks = [
+        Track(
+            index,
+            np.asarray([index * 20, 0, index * 20 + 100, 240], dtype=np.float32),
+            0.9,
+        )
+        for index in range(5)
+    ]
+
+    SearchSession._analyze_person_rois(session, frame, tracks)
+
+    assert backend.batch_sizes == [2, 2, 1]
+    assert backend.batch_scales == [320, 320, 320]
+    assert session.metrics.roi_batch_count == 3
+
+
+def test_roi_scheduler_rotates_tracks_after_each_attempt() -> None:
+    session = _roi_stub(
+        Settings(roi_max_tracks_per_pass=1, roi_min_person_height_px=120),
+        FakeFaceBackend([]),
+    )
+    frame = np.zeros((500, 500, 3), dtype=np.uint8)
+    tracks = [
+        Track(1, np.asarray([0, 0, 120, 240], dtype=np.float32), 0.99),
+        Track(2, np.asarray([200, 0, 320, 240], dtype=np.float32), 0.50),
+    ]
+
+    first = SearchSession._tracks_needing_roi_face_pass(session, [], tracks)
+    SearchSession._analyze_person_rois(session, frame, first)
+    second = SearchSession._tracks_needing_roi_face_pass(session, [], tracks)
+
+    assert [track.track_id for track in first] == [1, 2]
+    assert [track.track_id for track in second] == [2, 1]
+
+
+def test_matchable_face_budget_prefers_tracked_faces_and_counts_drops() -> None:
+    session = _roi_stub(Settings(max_faces_per_frame=2), FakeFaceBackend([]))
+    faces = [
+        make_face(bbox=(0, 0, 40, 40)),
+        make_face(bbox=(50, 0, 130, 80)),
+        make_face(bbox=(150, 0, 220, 70)),
+    ]
+    tracks = [Track(7, np.asarray([40, 0, 140, 160], dtype=np.float32), 0.8)]
+
+    selected = SearchSession._limit_matchable_faces(session, faces, tracks)
+
+    assert [face.short_side for face in selected] == [80, 70]
+    assert session.metrics.faces_dropped_by_budget == 1
+
+
+@pytest.mark.parametrize(
+    "provider_result",
+    [
+        None,
+        0.0,
+        [None],
+        [SimpleNamespace(embedding=np.asarray([np.nan], dtype=np.float32))],
+        ["not-a-face"],
+    ],
+)
+def test_live_embedding_chunk_drops_malformed_provider_results(provider_result) -> None:
+    session = _evidence_session("search-malformed-embedding")[0]
+    session.face_backend.embed_faces = lambda frame, faces: provider_result  # type: ignore[method-assign]
+    face = make_face()
+
+    embedded = session._embed_face_chunk(
+        np.zeros((160, 160, 3), dtype=np.uint8), [face]
+    )
+
+    assert embedded == []
+    assert session.metrics.embedding_failures == 1
 
 
 def test_roi_selection_is_per_track_and_not_suppressed_by_an_unrelated_near_face() -> None:
@@ -1223,6 +1323,30 @@ def test_search_lookup_by_request_id_survives_terminal_transition(monkeypatch) -
     assert manager.search_by_request_id("missing") is None
 
 
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "\nrequest-id",
+        "request-id\r",
+        "\u0085request-id",
+        "request\u200b-id",
+        "request\u2028id",
+    ],
+)
+def test_request_id_rejects_control_and_format_characters_before_trimming(
+    request_id: str,
+) -> None:
+    with pytest.raises(PersonSearchError) as exc_info:
+        _normalize_request_id(request_id)
+
+    assert exc_info.value.code == "invalid_request_id"
+    assert exc_info.value.status_code == 422
+
+
+def test_request_id_still_trims_printable_outer_spaces() -> None:
+    assert _normalize_request_id("  request-id  ") == "request-id"
+
+
 def test_terminal_target_found_event_can_immediately_start_next_search(monkeypatch) -> None:
     frame = np.zeros((120, 120, 3), dtype=np.uint8)
 
@@ -1806,3 +1930,546 @@ def test_deferred_target_found_keeps_evidence_live_through_normal_completion() -
     crop, media_type = session.get_evidence(evidence_id, "face_crop")
     assert media_type == "image/jpeg"
     assert crop
+
+
+def test_sensitive_cleanup_retries_after_one_component_fails() -> None:
+    """A partial cleanup must not set the terminal idempotence flag."""
+    session, _ = _evidence_session("search-retry-sensitive-cleanup")
+    confirmation = next(iter(session._confirmations.values()))
+    calls = 0
+
+    def flaky_cleanup() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated cleanup failure")
+
+    confirmation.clear_sensitive = flaky_cleanup  # type: ignore[method-assign]
+
+    session.clear_sensitive_state()
+    assert calls == 1
+    assert session._sensitive_cleared is False
+
+    session.clear_sensitive_state()
+    assert calls == 2
+    assert session._sensitive_cleared is True
+    assert all(target.embedding is None for target in session.targets)
+
+
+def test_sensitive_cleanup_continues_after_debug_reader_and_tracker_failures(monkeypatch) -> None:
+    session, _ = _evidence_session("search-fault-safe-cleanup")
+    face = make_face()
+    session._debug_faces = [(face, "person_strict", 0.9)]
+
+    class FlakyDebugFaces(list):
+        def __init__(self, values):
+            super().__init__(values)
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            if self.clear_calls == 1:
+                raise RuntimeError("debug storage failure")
+            super().clear()
+
+    session._debug_faces = FlakyDebugFaces(session._debug_faces)
+
+    class FlakyReader:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+            self.clear_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            if self.clear_calls == 1:
+                raise RuntimeError("reader storage failure")
+
+    reader = FlakyReader()
+    session._reader = reader  # type: ignore[assignment]
+
+    class FlakyPreview:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            if self.clear_calls == 1:
+                raise RuntimeError("preview storage failure")
+
+    preview = FlakyPreview()
+    session.preview = preview  # type: ignore[assignment]
+
+    class FlakyTracker:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+            if self.reset_calls == 1:
+                raise RuntimeError("tracker storage failure")
+
+    session._tracker = FlakyTracker()  # type: ignore[assignment]
+    session._face_tracker = FlakyTracker()  # type: ignore[assignment]
+
+    original_clone = _clone_target
+    clone_calls = 0
+
+    def flaky_clone(target, *, include_embedding=True):
+        nonlocal clone_calls
+        clone_calls += 1
+        if clone_calls == 1:
+            raise RuntimeError("target snapshot failure")
+        return original_clone(target, include_embedding=include_embedding)
+
+    monkeypatch.setattr("person_search.service._clone_target", flaky_clone)
+
+    original_sanitize = _sanitize_source
+    sanitize_calls = 0
+
+    def flaky_sanitize(source):
+        nonlocal sanitize_calls
+        sanitize_calls += 1
+        if sanitize_calls == 1:
+            raise RuntimeError("source sanitizer failure")
+        return original_sanitize(source)
+
+    monkeypatch.setattr("person_search.service._sanitize_source", flaky_sanitize)
+    session.source = SourceConfig(
+        type="rtsp", uri="rtsp://user:secret@example.test:8554/live"
+    )
+
+    session.clear_sensitive_state()
+
+    # Every component was attempted even though several independent operations
+    # failed. The reader remains retained for a retry, and the source fallback
+    # cannot leak the original RTSP credentials.
+    assert reader.stop_calls == 1
+    assert reader.clear_calls == 1
+    assert preview.clear_calls == 1
+    assert session._sensitive_cleared is False
+    assert session._reader_cleanup_pending is reader
+    assert "secret" not in str(session.source.model_dump())
+    assert np.all(face.embedding == 0)
+
+    session.clear_sensitive_state()
+
+    # The stop call succeeded on the first pass and is intentionally
+    # de-duplicated across retries; only the failed queue flush is repeated.
+    assert reader.stop_calls == 1
+    assert reader.clear_calls == 2
+    assert preview.clear_calls == 2
+    assert session._sensitive_cleared is True
+    assert session._reader_cleanup_pending is None
+
+
+def test_worker_finished_event_survives_reader_and_preview_cleanup_errors(monkeypatch) -> None:
+    session, _ = _evidence_session("search-finished-after-cleanup-errors")
+
+    class BrokenReader:
+        def __init__(self, source, settings, on_status, on_drop):
+            self.ended = threading.Event()
+            self.ended.set()
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.clear_calls = 0
+
+        def start(self) -> None:
+            self.start_calls += 1
+
+        def get(self, timeout=0.5):
+            return None
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+            raise RuntimeError("reader stop failure")
+
+        def clear(self) -> None:
+            self.clear_calls += 1
+            raise RuntimeError("reader clear failure")
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", BrokenReader)
+
+    class BrokenPreview:
+        def clear(self) -> None:
+            raise RuntimeError("preview clear failure")
+
+    session.preview = BrokenPreview()  # type: ignore[assignment]
+    session._run()
+
+    assert session.finished.is_set()
+    assert session.status == SearchStatus.FAILED
+
+
+def test_reader_constructor_failure_still_finishes_and_releases_slot(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+
+    def fail_reader(*args, **kwargs):
+        raise RuntimeError("reader constructor failure")
+
+    monkeypatch.setattr("person_search.service.LatestFrameReader", fail_reader)
+    search = manager.start_search(
+        target_view.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    session = manager.get_session(search.search_id)
+
+    assert session.finished.wait(timeout=2.0)
+    assert session.status == SearchStatus.FAILED
+    assert manager.active_search() is None
+    assert session._sensitive_cleared is True
+
+
+def test_manager_completion_callback_is_fail_safe_and_next_search_can_start(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    first_target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    second_target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "李四")
+    monkeypatch.setattr(SearchSession, "start", lambda session: None)
+
+    first = manager.start_search(
+        first_target.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    session = manager.get_session(first.search_id)
+    session._transition(SearchStatus.COMPLETED, None, publish=False)
+
+    original_prune = manager._prune_sessions
+    prune_calls = 0
+
+    def fail_once() -> None:
+        nonlocal prune_calls
+        prune_calls += 1
+        if prune_calls == 1:
+            raise RuntimeError("simulated janitor failure")
+        original_prune()
+
+    monkeypatch.setattr(manager, "_prune_sessions", fail_once)
+    # The completion callback itself must not leak the janitor exception.
+    manager._on_finished(first.search_id, [first_target.target_id])
+
+    assert manager.active_search() is None
+    assert first_target.target_id not in manager._targets
+
+    # Restore the normal janitor before exercising the next request.
+    monkeypatch.setattr(manager, "_prune_sessions", original_prune)
+    second = manager.start_search(
+        second_target.target_id, SourceConfig(type="camera", device_index=1)
+    )
+    assert second.search_id != first.search_id
+
+
+def test_delete_target_ignores_a_stale_active_search_id() -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    manager._active_search_id = "missing-session"
+
+    assert manager.delete_target(target.target_id) is True
+    assert manager._active_search_id is None
+
+
+def test_active_search_clears_a_stale_slot_pointer() -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    manager._active_search_id = "missing-session"
+
+    assert manager.active_search() is None
+    assert manager._active_search_id is None
+
+
+def test_start_search_ignores_terminal_session_left_in_active_slot(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    first_target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    second_target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "李四")
+    monkeypatch.setattr(SearchSession, "start", lambda session: None)
+
+    first = manager.start_search(
+        first_target.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    first_session = manager.get_session(first.search_id)
+    first_session._transition(SearchStatus.COMPLETED, None, publish=False)
+    first_session._finished_at = time.monotonic()
+    first_session._finished.set()
+    # Deliberately leave ``_active_search_id`` untouched as a failed callback or
+    # an older integration could do. The next request must not see a capacity
+    # conflict from this terminal session.
+    replacement = manager.start_search(
+        second_target.target_id, SourceConfig(type="camera", device_index=1)
+    )
+
+    assert replacement.search_id != first.search_id
+    assert manager._active_search_id == replacement.search_id
+    manager.shutdown()
+
+
+def test_terminal_session_ttl_prunes_without_a_followup_request() -> None:
+    settings = Settings(terminal_session_ttl_seconds=0.05)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    target = manager.get_target(target_view.target_id)
+    terminal_session = SearchSession(
+        search_id="terminal-only-timer",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings,
+        face_backend=manager.face_backend,
+        person_detector=manager.person_detector,
+        on_finished=lambda search_id, target_ids: None,
+        request_id="terminal-only-request",
+    )
+    terminal_session._finished_at = time.monotonic()
+    terminal_session._finished.set()
+    with manager._lock:
+        manager._sessions[terminal_session.search_id] = terminal_session
+        manager._request_index[terminal_session.request_id] = terminal_session.search_id  # type: ignore[index]
+    manager._schedule_prune_timer()
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with manager._lock:
+            removed = terminal_session.search_id not in manager._sessions
+        if removed:
+            break
+        time.sleep(0.01)
+
+    with manager._lock:
+        assert terminal_session.search_id not in manager._sessions
+        assert "terminal-only-request" not in manager._request_index
+    assert terminal_session._sensitive_cleared is True
+    manager.shutdown()
+
+
+def test_prune_sessions_is_best_effort_and_keeps_janitor_alive() -> None:
+    settings = Settings(terminal_session_ttl_seconds=60.0)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    targets = [
+        manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), name)
+        for name in ("过期一", "过期二", "保留")
+    ]
+    sessions: list[SearchSession] = []
+    for index, target_view in enumerate(targets):
+        target = manager.get_target(target_view.target_id)
+        session = SearchSession(
+            search_id=f"prune-{index}",
+            target=target,
+            source=SourceConfig(type="camera", device_index=0),
+            settings=settings,
+            face_backend=manager.face_backend,
+            person_detector=manager.person_detector,
+            on_finished=lambda search_id, target_ids: None,
+        )
+        session._finished.set()
+        session._finished_at = (
+            time.monotonic() - 61.0 if index < 2 else time.monotonic()
+        )
+        sessions.append(session)
+    first, second, retained = sessions
+    first.clear_evidence = lambda: (_ for _ in ()).throw(RuntimeError("evidence boom"))  # type: ignore[method-assign]
+    first.clear_sensitive_state = lambda: (_ for _ in ()).throw(RuntimeError("sensitive boom"))  # type: ignore[method-assign]
+    second_calls: list[str] = []
+    second.clear_evidence = lambda: second_calls.append("evidence")  # type: ignore[method-assign]
+
+    def clear_second_sensitive() -> None:
+        second_calls.append("sensitive")
+        second._sensitive_cleared = True
+
+    second.clear_sensitive_state = clear_second_sensitive  # type: ignore[method-assign]
+    with manager._lock:
+        manager._sessions.update({session.search_id: session for session in sessions})
+
+    manager._prune_sessions()
+
+    assert first.search_id not in manager._sessions
+    assert second.search_id not in manager._sessions
+    assert retained.search_id in manager._sessions
+    assert second_calls == ["evidence", "sensitive"]
+    assert manager._prune_timer is not None
+    manager.shutdown()
+
+
+def test_status_reads_reuse_the_existing_prune_timer() -> None:
+    settings = Settings(terminal_session_ttl_seconds=60.0)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    target = manager.get_target(target_view.target_id)
+    session = SearchSession(
+        search_id="timer-reuse",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings,
+        face_backend=manager.face_backend,
+        person_detector=manager.person_detector,
+        on_finished=lambda search_id, target_ids: None,
+    )
+    session._finished_at = time.monotonic()
+    session._finished.set()
+    with manager._lock:
+        manager._sessions[session.search_id] = session
+    manager._schedule_prune_timer()
+    timer = manager._prune_timer
+    assert timer is not None
+
+    assert manager.active_search() is None
+    assert manager.get_search(session.search_id).search_id == session.search_id
+
+    assert manager._prune_timer is timer
+    manager.shutdown()
+
+
+def test_shutdown_cancels_prune_timer_and_closes_manager_without_active_search() -> None:
+    settings = Settings(terminal_session_ttl_seconds=60.0)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    target = manager.get_target(target_view.target_id)
+    session = SearchSession(
+        search_id="shutdown-terminal",
+        target=target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings,
+        face_backend=manager.face_backend,
+        person_detector=manager.person_detector,
+        on_finished=lambda search_id, target_ids: None,
+    )
+    session._finished_at = time.monotonic()
+    session._finished.set()
+    with manager._lock:
+        manager._sessions[session.search_id] = session
+    manager._schedule_prune_timer()
+    timer = manager._prune_timer
+    assert timer is not None
+
+    manager.shutdown()
+
+    assert manager._prune_timer is None
+    assert manager._prune_timer_deadline is None
+    assert manager._active_search_id is None
+    timer.join(timeout=0.5)
+    assert not timer.is_alive()
+    with pytest.raises(PersonSearchError) as enroll_error:
+        manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "拒绝")
+    assert enroll_error.value.code == "manager_shutdown"
+    with pytest.raises(PersonSearchError) as start_error:
+        manager.start_search(target_view.target_id, SourceConfig(type="camera", device_index=0))
+    assert start_error.value.code == "manager_shutdown"
+
+
+def test_shutdown_stops_active_search_and_cancels_timer(monkeypatch) -> None:
+    settings = Settings(terminal_session_ttl_seconds=60.0)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    target_view = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    monkeypatch.setattr(SearchSession, "start", lambda session: None)
+    search = manager.start_search(
+        target_view.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    active_session = manager.get_session(search.search_id)
+
+    # Add a retained terminal session solely to exercise cancellation while an
+    # active worker occupies the singleton slot.
+    terminal_target_view = TargetView(
+        target_id="shutdown-retained-target",
+        name="保留",
+        face_width=100,
+        face_height=100,
+        detection_score=0.99,
+        quality_score=0.9,
+        model="fake-arcface",
+    )
+    terminal_target = Target(
+        terminal_target_view.target_id,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        terminal_target_view,
+        terminal_target_view.name,
+    )
+    terminal_session = SearchSession(
+        search_id="shutdown-retained",
+        target=terminal_target,
+        source=SourceConfig(type="camera", device_index=0),
+        settings=settings,
+        face_backend=manager.face_backend,
+        person_detector=manager.person_detector,
+        on_finished=lambda search_id, target_ids: None,
+    )
+    terminal_session._finished_at = time.monotonic()
+    terminal_session._finished.set()
+    with manager._lock:
+        manager._sessions[terminal_session.search_id] = terminal_session
+    manager._schedule_prune_timer()
+    timer = manager._prune_timer
+    assert timer is not None
+
+    manager.shutdown()
+
+    assert manager._active_search_id is None
+    assert active_session.status == SearchStatus.STOPPING
+    assert manager._prune_timer is None
+    timer.join(timeout=0.5)
+    assert not timer.is_alive()
+
+
+def test_shutdown_defers_sensitive_cleanup_until_a_timed_out_worker_exits(monkeypatch) -> None:
+    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    release_worker = threading.Event()
+
+    def start_blocked(session: SearchSession) -> None:
+        def worker() -> None:
+            release_worker.wait(timeout=2.0)
+            session._finished.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        session._worker = thread
+        thread.start()
+
+    monkeypatch.setattr(SearchSession, "start", start_blocked)
+    original_stop = SearchSession.stop
+    monkeypatch.setattr(
+        SearchSession,
+        "stop",
+        lambda session: original_stop(session, timeout=0),
+    )
+    search = manager.start_search(
+        target.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    session = manager.get_session(search.search_id)
+
+    manager.shutdown()
+    # The worker is still using its private gallery copy; shutdown must not race
+    # and zero it underneath the provider.  The deferred watcher handles it once
+    # the worker publishes its terminal event.
+    assert session._sensitive_cleared is False
+    assert session.targets[0].embedding is not None
+
+    release_worker.set()
+    deadline = time.monotonic() + 2.0
+    while not session._sensitive_cleared and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session._sensitive_cleared is True
+    assert all(target.embedding is None for target in session.targets)
+
+
+def test_safe_model_error_does_not_expose_loader_path() -> None:
+    message = _safe_error(ModelUnavailableError("failed to load /srv/secrets/models/arcface.onnx"))
+
+    assert "/srv/secrets" not in message
+    assert message == "model unavailable; verify model files and runtime configuration"
+
+
+def test_source_epoch_reset_wipes_old_debug_face_and_confirmation_state() -> None:
+    session, _ = _evidence_session("search-source-epoch-reset")
+    face = make_face()
+    session._debug_faces = [(face, "person_strict", 0.9)]
+    confirmation = next(iter(session._confirmations.values()))
+    calls = 0
+
+    def record_reset() -> None:
+        nonlocal calls
+        calls += 1
+
+    confirmation.clear_sensitive = record_reset  # type: ignore[method-assign]
+    embedding = face.embedding
+
+    session._reset_temporal_state()
+
+    assert calls == 1
+    assert session._debug_faces == []
+    assert embedding is not None
+    assert np.all(embedding == 0)

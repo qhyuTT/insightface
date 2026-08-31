@@ -1,8 +1,21 @@
 from __future__ import annotations
 
-import numpy as np
+import sys
+from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
-from person_search.detector import _decode_yolox, _nms, _preprocess
+import numpy as np
+import pytest
+
+from person_search.config import Settings
+from person_search.detector import (
+    YoloXOnnxDetector,
+    _decode_yolox,
+    _nms,
+    _preprocess,
+    _yolox_grid,
+)
+from person_search.errors import ModelUnavailableError
 
 
 def test_preprocess_letterboxes_to_model_size() -> None:
@@ -10,6 +23,11 @@ def test_preprocess_letterboxes_to_model_size() -> None:
     result, ratio = _preprocess(image, (416, 416))
     assert result.shape == (3, 416, 416)
     assert ratio == 2.08
+    assert result.dtype == np.float32
+    assert result.flags.c_contiguous
+    # The image is wider than the target aspect ratio, so the bottom rows are
+    # letterbox padding in the final CHW model layout.
+    assert np.all(result[:, 208:, :] == 114.0)
 
 
 def test_decode_yolox_builds_all_three_feature_grids() -> None:
@@ -20,7 +38,81 @@ def test_decode_yolox_builds_all_three_feature_grids() -> None:
     np.testing.assert_allclose(decoded[0, :4], [0, 0, 8, 8])
 
 
+def test_decode_yolox_reuses_cached_grid_for_same_input_size() -> None:
+    _yolox_grid.cache_clear()
+    prediction_count = 52 * 52 + 26 * 26 + 13 * 13
+    raw = np.zeros((prediction_count, 85), dtype=np.float32)
+    _decode_yolox(raw, (416, 416))
+    first = _yolox_grid.cache_info()
+    _decode_yolox(raw, (416, 416))
+    second = _yolox_grid.cache_info()
+    assert first.misses == 1
+    assert second.hits == first.hits + 1
+
+
 def test_nms_suppresses_overlapping_lower_score_box() -> None:
     boxes = np.asarray([[0, 0, 100, 100], [5, 5, 95, 95], [200, 200, 250, 250]])
     scores = np.asarray([0.9, 0.8, 0.7])
     assert _nms(boxes, scores, 0.5) == [0, 2]
+
+
+def test_detector_passes_runtime_threads_and_cuda_device_to_onnxruntime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    model = tmp_path / "yolox.onnx"
+    model.write_bytes(b"placeholder")
+
+    class FakeSessionOptions:
+        intra_op_num_threads = 0
+        inter_op_num_threads = 0
+
+    class FakeSession:
+        requested: ClassVar[dict[str, object]] = {}
+
+        def __init__(self, path: str, **kwargs: object) -> None:
+            type(self).requested = {"path": path, **kwargs}
+
+        def get_inputs(self):
+            return [SimpleNamespace(name="images")]
+
+        def get_providers(self):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    ort_module = ModuleType("onnxruntime")
+    ort_module.SessionOptions = FakeSessionOptions  # type: ignore[attr-defined]
+    ort_module.InferenceSession = FakeSession  # type: ignore[attr-defined]
+    ort_module.get_available_providers = lambda: [  # type: ignore[attr-defined]
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_module)
+    monkeypatch.setenv("PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS", "2")
+    monkeypatch.setenv("PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS", "1")
+    monkeypatch.setenv("PERSON_SEARCH_ORT_CUDA_DEVICE_ID", "3")
+
+    detector = YoloXOnnxDetector(Settings(yolox_model=model, prefer_cuda=True))
+    detector.ensure_ready()
+
+    options = FakeSession.requested["sess_options"]
+    assert isinstance(options, FakeSessionOptions)
+    assert options.intra_op_num_threads == 2
+    assert options.inter_op_num_threads == 1
+    assert FakeSession.requested["providers"] == [
+        ("CUDAExecutionProvider", {"device_id": 3}),
+        "CPUExecutionProvider",
+    ]
+
+
+def test_detector_rejects_invalid_runtime_thread_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    model = tmp_path / "yolox.onnx"
+    model.write_bytes(b"placeholder")
+    ort_module = ModuleType("onnxruntime")
+    ort_module.get_available_providers = lambda: ["CPUExecutionProvider"]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort_module)
+    monkeypatch.setenv("PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS", "many")
+
+    detector = YoloXOnnxDetector(Settings(yolox_model=model, prefer_cuda=False))
+    with pytest.raises(ModelUnavailableError, match="PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS"):
+        detector.ensure_ready()

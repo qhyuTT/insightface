@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from typing import Protocol
 
 import cv2
@@ -40,12 +42,49 @@ class YoloXOnnxDetector:
                 "ONNX Runtime is missing; run `uv sync --extra inference-cpu --extra test`."
             ) from exc
         available = ort.get_available_providers()
-        providers: list[str] = []
+        providers: list[str | tuple[str, dict[str, int]]] = []
         if self.settings.prefer_cuda and "CUDAExecutionProvider" in available:
-            providers.append("CUDAExecutionProvider")
+            cuda_device_id = _runtime_int(
+                self.settings,
+                ("ort_cuda_device_id", "cuda_device_id"),
+                "PERSON_SEARCH_ORT_CUDA_DEVICE_ID",
+                minimum=0,
+            )
+            if cuda_device_id is None:
+                providers.append("CUDAExecutionProvider")
+            else:
+                providers.append(
+                    ("CUDAExecutionProvider", {"device_id": cuda_device_id})
+                )
         providers.append("CPUExecutionProvider")
+        # Resolve these before constructing the session so malformed deployment
+        # configuration fails with an actionable error even with a lightweight
+        # ONNX Runtime shim (or an older runtime without SessionOptions).
+        intra_threads = _runtime_int(
+            self.settings,
+            ("ort_intra_op_num_threads", "ort_intra_op_threads"),
+            "PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS",
+            minimum=0,
+        )
+        inter_threads = _runtime_int(
+            self.settings,
+            ("ort_inter_op_num_threads", "ort_inter_op_threads"),
+            "PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS",
+            minimum=0,
+        )
         try:
-            self._session = ort.InferenceSession(str(self.settings.yolox_model), providers=providers)
+            session_kwargs: dict[str, object] = {"providers": providers}
+            session_options_factory = getattr(ort, "SessionOptions", None)
+            if session_options_factory is not None:
+                session_options = session_options_factory()
+                if intra_threads is not None:
+                    session_options.intra_op_num_threads = intra_threads
+                if inter_threads is not None:
+                    session_options.inter_op_num_threads = inter_threads
+                session_kwargs["sess_options"] = session_options
+            self._session = ort.InferenceSession(
+                str(self.settings.yolox_model), **session_kwargs
+            )
             self._input_name = self._session.get_inputs()[0].name
         except Exception as exc:
             raise ModelUnavailableError(f"failed to load YOLOX model: {exc}") from exc
@@ -56,7 +95,7 @@ class YoloXOnnxDetector:
         image, ratio = _preprocess(
             frame, (self.settings.person_input_height, self.settings.person_input_width)
         )
-        output = self._session.run(None, {self._input_name: image[None].astype(np.float32)})[0]
+        output = self._session.run(None, {self._input_name: image[None]})[0]
         predictions = _decode_yolox(
             output[0], (self.settings.person_input_height, self.settings.person_input_width)
         )
@@ -88,22 +127,21 @@ def _preprocess(frame: np.ndarray, input_size: tuple[int, int]) -> tuple[np.ndar
         (int(frame.shape[1] * ratio), int(frame.shape[0] * ratio)),
         interpolation=cv2.INTER_LINEAR,
     )
-    padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
-    padded[: resized.shape[0], : resized.shape[1]] = resized
-    return np.ascontiguousarray(padded.transpose(2, 0, 1), dtype=np.float32), ratio
+    # Write directly into the model's final CHW float32 layout. The previous
+    # implementation allocated a uint8 HWC canvas, transposed it, and then copied
+    # the whole frame again while converting to float32. The resized crop is still
+    # uint8 (matching OpenCV's existing interpolation semantics), but the padded
+    # full-size canvas is now allocated only once.
+    padded = np.full((3, target_h, target_w), 114.0, dtype=np.float32)
+    padded[:, : resized.shape[0], : resized.shape[1]] = resized.transpose(2, 0, 1)
+    return padded, ratio
 
 
 def _decode_yolox(output: np.ndarray, input_size: tuple[int, int]) -> np.ndarray:
-    grids: list[np.ndarray] = []
-    expanded_strides: list[np.ndarray] = []
-    for stride in (8, 16, 32):
-        hsize, wsize = input_size[0] // stride, input_size[1] // stride
-        yv, xv = np.meshgrid(np.arange(hsize), np.arange(wsize), indexing="ij")
-        grid = np.stack((xv, yv), axis=2).reshape(1, -1, 2)
-        grids.append(grid)
-        expanded_strides.append(np.full((*grid.shape[:2], 1), stride))
-    grid = np.concatenate(grids, axis=1).reshape(-1, 2)
-    strides = np.concatenate(expanded_strides, axis=1).reshape(-1, 1)
+    # Accept list-like sizes as the old implementation did, while keeping the
+    # cache key hashable and canonical.
+    input_size = (int(input_size[0]), int(input_size[1]))
+    grid, strides = _yolox_grid(input_size)
     if output.shape[0] != grid.shape[0]:
         raise ModelUnavailableError(
             f"unexpected YOLOX output shape {output.shape}; expected {grid.shape[0]} predictions"
@@ -114,9 +152,41 @@ def _decode_yolox(output: np.ndarray, input_size: tuple[int, int]) -> np.ndarray
     return decoded
 
 
+@lru_cache(maxsize=8)
+def _yolox_grid(input_size: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Build immutable YOLOX decode tensors once for each configured input size."""
+
+    grids: list[np.ndarray] = []
+    expanded_strides: list[np.ndarray] = []
+    for stride in (8, 16, 32):
+        hsize, wsize = input_size[0] // stride, input_size[1] // stride
+        yv, xv = np.meshgrid(
+            np.arange(hsize, dtype=np.float32),
+            np.arange(wsize, dtype=np.float32),
+            indexing="ij",
+        )
+        grid = np.stack((xv, yv), axis=2).reshape(1, -1, 2)
+        grids.append(grid)
+        expanded_strides.append(np.full((*grid.shape[:2], 1), stride, dtype=np.float32))
+    grid = np.concatenate(grids, axis=1).reshape(-1, 2)
+    strides = np.concatenate(expanded_strides, axis=1).reshape(-1, 1)
+    grid.setflags(write=False)
+    strides.setflags(write=False)
+    return grid, strides
+
+
 def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
     order = scores.argsort()[::-1]
     keep: list[int] = []
+    if order.size == 0:
+        return keep
+
+    # Areas are invariant across suppression rounds. Precomputing them removes two
+    # allocations and four vector operations from every iteration while retaining
+    # exactly the previous greedy, descending-score semantics.
+    widths = np.maximum(0.0, boxes[:, 2] - boxes[:, 0])
+    heights = np.maximum(0.0, boxes[:, 3] - boxes[:, 1])
+    areas = widths * heights
     while order.size:
         current = int(order[0])
         keep.append(current)
@@ -128,12 +198,40 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> list[int]:
         xx2 = np.minimum(boxes[current, 2], boxes[rest, 2])
         yy2 = np.minimum(boxes[current, 3], boxes[rest, 3])
         intersection = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
-        area_current = max(0.0, boxes[current, 2] - boxes[current, 0]) * max(
-            0.0, boxes[current, 3] - boxes[current, 1]
-        )
-        area_rest = np.maximum(0.0, boxes[rest, 2] - boxes[rest, 0]) * np.maximum(
-            0.0, boxes[rest, 3] - boxes[rest, 1]
-        )
-        iou = intersection / np.maximum(area_current + area_rest - intersection, 1e-6)
+        iou = intersection / np.maximum(areas[current] + areas[rest] - intersection, 1e-6)
         order = rest[iou <= threshold]
     return keep
+
+
+def _runtime_int(
+    settings: Settings,
+    attributes: tuple[str, ...],
+    environment: str,
+    *,
+    minimum: int,
+) -> int | None:
+    """Resolve an optional runtime integer without requiring a Settings migration.
+
+    Newer Settings versions can expose the named attributes directly. Until then,
+    deployments can tune ONNX Runtime through the matching environment variables.
+    An explicit Settings value wins, mirroring the rest of the configuration model.
+    """
+
+    value: object | None = None
+    for attribute in attributes:
+        candidate = getattr(settings, attribute, None)
+        if candidate is not None:
+            value = candidate
+            break
+    if value is None:
+        raw = os.getenv(environment)
+        if raw is None or not raw.strip():
+            return None
+        value = raw.strip()
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ModelUnavailableError(f"{environment} must be an integer") from exc
+    if parsed < minimum:
+        raise ModelUnavailableError(f"{environment} must be >= {minimum}")
+    return parsed

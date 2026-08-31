@@ -13,6 +13,29 @@ T4_PIP_INDEX_URL="${T4_PIP_INDEX_URL:-}"
 T4_PIP_INDEX_CANDIDATES="${T4_PIP_INDEX_CANDIDATES-https://mirrors.aliyun.com/pypi/simple https://mirrors.ustc.edu.cn/pypi/simple https://pypi.org/simple}"
 T4_ORT_VERSION="${T4_ORT_VERSION:-1.23.2}"
 T4_BIND_HOST="${T4_BIND_HOST:-127.0.0.1}"
+T4_PORT="${T4_PORT:-8000}"
+# A candidate uses a separate host-network port so the currently serving
+# container can stay up while the new image is loaded and checked.
+T4_CANARY_PORT="${T4_CANARY_PORT:-18000}"
+T4_STOP_TIMEOUT_SECONDS="${T4_STOP_TIMEOUT_SECONDS:-30}"
+# Deployments are expected to come from a reproducible, committed checkout.
+# Set T4_ALLOW_DIRTY=1 only for an explicitly marked local experiment.
+T4_ALLOW_DIRTY="${T4_ALLOW_DIRTY:-0}"
+T4_EXPECTED_BRANCH="${T4_EXPECTED_BRANCH:-main}"
+T4_EXPECTED_COMMIT="${T4_EXPECTED_COMMIT:-}"
+T4_EXPECTED_REMOTE_URL="${T4_EXPECTED_REMOTE_URL:-}"
+# Tiny-face confirmation is diagnostic-only until its calibration has been
+# accepted. Two explicit switches are required before it can drive actions.
+T4_TINY_FACE_ENABLED="${T4_TINY_FACE_ENABLED:-true}"
+T4_TINY_FACE_SHADOW_MODE="${T4_TINY_FACE_SHADOW_MODE:-true}"
+T4_ALLOW_PHYSICAL_ACTIONS="${T4_ALLOW_PHYSICAL_ACTIONS:-false}"
+# Optional ORT controls are passed through when set; leaving them empty keeps
+# ONNX Runtime's native defaults.
+T4_ORT_INTRA_OP_NUM_THREADS="${T4_ORT_INTRA_OP_NUM_THREADS:-}"
+T4_ORT_INTER_OP_NUM_THREADS="${T4_ORT_INTER_OP_NUM_THREADS:-}"
+T4_ORT_CUDA_DEVICE_ID="${T4_ORT_CUDA_DEVICE_ID:-}"
+T4_HEALTH_ATTEMPTS="${T4_HEALTH_ATTEMPTS:-30}"
+T4_HEALTH_INTERVAL_SECONDS="${T4_HEALTH_INTERVAL_SECONDS:-2}"
 # Enables GET /v1/searches/{id}/evidence/{id}. Must match the dispatch platform's
 # DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY, or every confirmed hit loses its face crop.
 T4_EVIDENCE_API_KEY="${T4_EVIDENCE_API_KEY:-}"
@@ -48,17 +71,140 @@ fail() {
   exit 1
 }
 
+normalize_bool() {
+  local normalized
+  normalized="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${normalized}" in
+    1|true|yes) printf 'true' ;;
+    0|false|no) printf 'false' ;;
+    *) fail "${2}: expected true/false (or 1/0), got '${1}'" ;;
+  esac
+}
+
+require_positive_integer() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || fail "${name} must be a positive integer"
+  (( 10#${value} > 0 )) || fail "${name} must be a positive integer"
+}
+
+require_port() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || fail "${name} must be an integer from 1 to 65535"
+  (( 10#${value} >= 1 && 10#${value} <= 65535 )) || fail \
+    "${name} must be an integer from 1 to 65535"
+}
+
+require_grid_size() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || fail "${name} must be a non-negative multiple of 32"
+  (( 10#${value} == 0 || 10#${value} % 32 == 0 )) || fail \
+    "${name} must be a non-negative multiple of 32"
+}
+
+require_version() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z]+)*$ ]] || fail \
+    "${name} must be a semantic version such as 1.23.2"
+}
+
+require_nonnegative_integer() {
+  local name="$1" value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || fail "${name} must be a non-negative integer"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
+sanitize_remote() {
+  # Git remotes are normally credential-free, but an operator may have used a
+  # temporary HTTPS token or an ``user@host:path`` SSH form.  Keep the raw value
+  # for exact comparisons while redacting the user-info portion in logs/errors.
+  printf '%s' "$1" | sed -E \
+    -e 's#(://)[^/]*@#\1<redacted>@#g' \
+    -e 's#^[^/@[:space:]]+@#<redacted>@#'
+}
+
+# Normalize all boolean switches before any conditional uses them.  In
+# particular, ``true``/``false`` should behave the same as ``1``/``0`` for the
+# prefetch and preload paths; silently skipping an explicitly enabled check is a
+# deployment footgun.
+T4_ALLOW_DIRTY="$(normalize_bool "${T4_ALLOW_DIRTY}" T4_ALLOW_DIRTY)"
+T4_TINY_FACE_ENABLED="$(normalize_bool "${T4_TINY_FACE_ENABLED}" T4_TINY_FACE_ENABLED)"
+T4_TINY_FACE_SHADOW_MODE="$(normalize_bool "${T4_TINY_FACE_SHADOW_MODE}" T4_TINY_FACE_SHADOW_MODE)"
+T4_ALLOW_PHYSICAL_ACTIONS="$(normalize_bool "${T4_ALLOW_PHYSICAL_ACTIONS}" T4_ALLOW_PHYSICAL_ACTIONS)"
+T4_PREFETCH_YOLOX="$(normalize_bool "${T4_PREFETCH_YOLOX}" T4_PREFETCH_YOLOX)"
+T4_PRELOAD_INSIGHTFACE="$(normalize_bool "${T4_PRELOAD_INSIGHTFACE}" T4_PRELOAD_INSIGHTFACE)"
+T4_DEPARTURE_ADJUDICATION="$(normalize_bool "${T4_DEPARTURE_ADJUDICATION}" T4_DEPARTURE_ADJUDICATION)"
+
 require_command docker
 require_command nvidia-smi
+require_command git
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable for the current user"
 nvidia-smi -L >/dev/null 2>&1 || fail "NVIDIA driver cannot see the T4 GPU"
 
 cd "${PROJECT_ROOT}"
+
+# Print and verify the exact source that is about to be built. This catches a
+# copied release directory whose .git remote still points at an older checkout.
+SOURCE_COMMIT="$(git rev-parse --verify HEAD 2>/dev/null)" || fail "not a git checkout"
+SOURCE_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
+SOURCE_REMOTE="$(git remote get-url origin 2>/dev/null || true)"
+SOURCE_REMOTE_DISPLAY="$(sanitize_remote "${SOURCE_REMOTE}")"
+SOURCE_DIRTY="$(git status --porcelain --untracked-files=all)"
+log "Source commit: ${SOURCE_COMMIT}"
+log "Source branch: ${SOURCE_BRANCH}"
+if [[ -n "${SOURCE_REMOTE}" ]]; then
+  log "Source origin: ${SOURCE_REMOTE_DISPLAY}"
+else
+  log "Source origin: <none>"
+fi
+if [[ -n "${T4_EXPECTED_COMMIT}" ]]; then
+  [[ "${SOURCE_COMMIT}" == "${T4_EXPECTED_COMMIT}"* ]] || fail \
+    "HEAD ${SOURCE_COMMIT} does not match T4_EXPECTED_COMMIT=${T4_EXPECTED_COMMIT}"
+fi
+if [[ -n "${T4_EXPECTED_BRANCH}" ]]; then
+  [[ "${SOURCE_BRANCH}" == "${T4_EXPECTED_BRANCH}" ]] || fail \
+    "branch ${SOURCE_BRANCH} does not match T4_EXPECTED_BRANCH=${T4_EXPECTED_BRANCH}"
+fi
+if [[ -n "${T4_EXPECTED_REMOTE_URL}" ]]; then
+  [[ "${SOURCE_REMOTE}" == "${T4_EXPECTED_REMOTE_URL}" ]] || fail \
+    "origin ${SOURCE_REMOTE_DISPLAY:-<none>} does not match T4_EXPECTED_REMOTE_URL=$(sanitize_remote "${T4_EXPECTED_REMOTE_URL}")"
+fi
+if [[ -n "${SOURCE_DIRTY}" && "$(normalize_bool "${T4_ALLOW_DIRTY}" T4_ALLOW_DIRTY)" != "true" ]]; then
+  fail "working tree is dirty; commit/stash changes or set T4_ALLOW_DIRTY=1 for an explicit experiment"
+fi
+
+require_port T4_PORT "${T4_PORT}"
+require_port T4_CANARY_PORT "${T4_CANARY_PORT}"
+require_positive_integer T4_STOP_TIMEOUT_SECONDS "${T4_STOP_TIMEOUT_SECONDS}"
+require_positive_integer T4_HEALTH_ATTEMPTS "${T4_HEALTH_ATTEMPTS}"
+require_positive_integer T4_HEALTH_INTERVAL_SECONDS "${T4_HEALTH_INTERVAL_SECONDS}"
+[[ "${T4_PORT}" != "${T4_CANARY_PORT}" ]] || fail "T4_CANARY_PORT must differ from T4_PORT"
+[[ -n "${T4_BIND_HOST}" && "${T4_BIND_HOST}" != *[[:space:]]* ]] || fail \
+  "T4_BIND_HOST must be a non-empty host without whitespace"
+require_version T4_ORT_VERSION "${T4_ORT_VERSION}"
+require_grid_size T4_FACE_DETECTION_SIZE "${T4_FACE_DETECTION_SIZE}"
+require_grid_size T4_FACE_DETECTION_EXTRA_SCALE "${T4_FACE_DETECTION_EXTRA_SCALE}"
+case "${T4_MATCH_PROFILE}" in
+  conservative|responsive|transit) ;;
+  *) fail "T4_MATCH_PROFILE must be conservative, responsive, or transit" ;;
+esac
+if [[ "${T4_TINY_FACE_ENABLED}" == "true" \
+  && "${T4_TINY_FACE_SHADOW_MODE}" != "true" \
+  && "${T4_ALLOW_PHYSICAL_ACTIONS}" != "true" ]]; then
+  fail "tiny-face production confirmation requires T4_ALLOW_PHYSICAL_ACTIONS=true"
+fi
+if [[ -n "${T4_ORT_INTRA_OP_NUM_THREADS}" ]]; then
+  require_nonnegative_integer T4_ORT_INTRA_OP_NUM_THREADS "${T4_ORT_INTRA_OP_NUM_THREADS}"
+fi
+if [[ -n "${T4_ORT_INTER_OP_NUM_THREADS}" ]]; then
+  require_nonnegative_integer T4_ORT_INTER_OP_NUM_THREADS "${T4_ORT_INTER_OP_NUM_THREADS}"
+fi
+if [[ -n "${T4_ORT_CUDA_DEVICE_ID}" ]]; then
+  require_nonnegative_integer T4_ORT_CUDA_DEVICE_ID "${T4_ORT_CUDA_DEVICE_ID}"
+fi
 
 # Keep this in sync with YOLOX_MODEL_SHA256 in the Dockerfile.
 YOLOX_SHA256="427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
@@ -138,7 +284,7 @@ prefetch_yolox() {
   return 1
 }
 
-if [[ "${T4_PREFETCH_YOLOX}" == "1" ]]; then
+if [[ "${T4_PREFETCH_YOLOX}" == "true" ]]; then
   require_command curl
   require_command sha256sum
   prefetch_yolox || true
@@ -174,6 +320,7 @@ build_args=(
   --build-arg "CUDA_IMAGE=${T4_CUDA_IMAGE}"
   --build-arg "PIP_INDEX_URL=${T4_PIP_INDEX_URL}"
   --build-arg "ONNXRUNTIME_GPU_VERSION=${T4_ORT_VERSION}"
+  --build-arg "VCS_REF=${SOURCE_COMMIT}"
 )
 if [[ -n "${T4_YOLOX_MODEL_URL}" ]]; then
   build_args+=(--build-arg "YOLOX_MODEL_URL=${T4_YOLOX_MODEL_URL}")
@@ -182,71 +329,246 @@ fi
 log "Building ${T4_IMAGE_NAME}"
 docker build "${build_args[@]}" --tag "${T4_IMAGE_NAME}" .
 
+image_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+  "${T4_IMAGE_NAME}" 2>/dev/null || true)"
+[[ "${image_revision}" == "${SOURCE_COMMIT}" ]] || fail \
+  "image revision ${image_revision:-<missing>} does not match source ${SOURCE_COMMIT}"
+
 log "Checking NVIDIA Container Toolkit"
 docker run --rm --gpus all --entrypoint nvidia-smi "${T4_IMAGE_NAME}" >/dev/null
 
-existing_container_id="$(
-  docker ps --all --quiet --filter "name=^/${T4_CONTAINER_NAME}$"
-)"
-if [[ -n "${existing_container_id}" ]]; then
-  log "Replacing existing container ${T4_CONTAINER_NAME}"
-  docker rm --force "${existing_container_id}" >/dev/null
-fi
-
 docker volume create "${T4_MODEL_VOLUME}" >/dev/null
 
-log "Starting ${T4_CONTAINER_NAME} with host networking"
 if [[ -z "${T4_EVIDENCE_API_KEY}" ]]; then
   log "WARNING: T4_EVIDENCE_API_KEY is empty; the confirmed-hit evidence endpoint will return 503"
 fi
-docker run --detach \
-  --gpus all \
-  --restart unless-stopped \
-  --network host \
-  --name "${T4_CONTAINER_NAME}" \
-  --volume "${T4_MODEL_VOLUME}:/models" \
-  --env "PERSON_SEARCH_HOST=${T4_BIND_HOST}" \
-  --env "PERSON_SEARCH_PORT=8000" \
-  --env "PERSON_SEARCH_PREFER_CUDA=true" \
-  --env "PERSON_SEARCH_TINY_FACE_ENABLED=true" \
-  --env "PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false" \
-  --env "PERSON_SEARCH_FACE_DETECTION_SIZE=${T4_FACE_DETECTION_SIZE}" \
-  --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}" \
-  --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}" \
-  --env "PERSON_SEARCH_DEPARTURE_ADJUDICATION_ENABLED=${T4_DEPARTURE_ADJUDICATION}" \
-  --env "PERSON_SEARCH_EVIDENCE_API_KEY=${T4_EVIDENCE_API_KEY}" \
-  "${T4_IMAGE_NAME}" >/dev/null
 
-log "Waiting for API health check"
-ready=0
-for _ in $(seq 1 30); do
-  if docker exec "${T4_CONTAINER_NAME}" python -c \
-    'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=2).read()' \
-    >/dev/null 2>&1; then
-    ready=1
-    break
+# Keep environment construction in one place. The candidate deliberately binds
+# loopback only; production uses T4_BIND_HOST after the candidate passes checks.
+container_env_args() {
+  local port="$1" bind_host="${2:-${T4_BIND_HOST}}"
+  CONTAINER_ENV_ARGS=(
+    --env "PERSON_SEARCH_HOST=${bind_host}"
+    --env "PERSON_SEARCH_PORT=${port}"
+    --env "PERSON_SEARCH_PREFER_CUDA=true"
+    --env "PERSON_SEARCH_TINY_FACE_ENABLED=${T4_TINY_FACE_ENABLED}"
+    --env "PERSON_SEARCH_TINY_FACE_SHADOW_MODE=${T4_TINY_FACE_SHADOW_MODE}"
+    --env "PERSON_SEARCH_FACE_DETECTION_SIZE=${T4_FACE_DETECTION_SIZE}"
+    --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}"
+    --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}"
+    --env "PERSON_SEARCH_DEPARTURE_ADJUDICATION_ENABLED=${T4_DEPARTURE_ADJUDICATION}"
+    --env "PERSON_SEARCH_EVIDENCE_API_KEY=${T4_EVIDENCE_API_KEY}"
+  )
+  if [[ -n "${T4_ORT_INTRA_OP_NUM_THREADS}" ]]; then
+    CONTAINER_ENV_ARGS+=(--env "PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS=${T4_ORT_INTRA_OP_NUM_THREADS}")
   fi
-  sleep 2
-done
+  if [[ -n "${T4_ORT_INTER_OP_NUM_THREADS}" ]]; then
+    CONTAINER_ENV_ARGS+=(--env "PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS=${T4_ORT_INTER_OP_NUM_THREADS}")
+  fi
+  if [[ -n "${T4_ORT_CUDA_DEVICE_ID}" ]]; then
+    CONTAINER_ENV_ARGS+=(--env "PERSON_SEARCH_ORT_CUDA_DEVICE_ID=${T4_ORT_CUDA_DEVICE_ID}")
+  fi
+}
 
-if [[ "${ready}" != "1" ]]; then
-  docker logs --tail 100 "${T4_CONTAINER_NAME}" >&2 || true
-  fail "API did not become healthy within 60 seconds"
+start_container() {
+  local name="$1" port="$2" restart_policy="$3" bind_host="${4:-${T4_BIND_HOST}}"
+  container_env_args "${port}" "${bind_host}"
+  docker run --detach \
+    --gpus all \
+    --restart "${restart_policy}" \
+    --stop-timeout "${T4_STOP_TIMEOUT_SECONDS}" \
+    --network host \
+    --name "${name}" \
+    --volume "${T4_MODEL_VOLUME}:/models" \
+    "${CONTAINER_ENV_ARGS[@]}" \
+    "${T4_IMAGE_NAME}" >/dev/null
+}
+
+container_exists() {
+  docker container inspect "$1" >/dev/null 2>&1
+}
+
+wait_for_health() {
+  local name="$1" port="$2" label="$3" ready=0 running
+  log "Waiting for ${label} API health check"
+  for _ in $(seq 1 "${T4_HEALTH_ATTEMPTS}"); do
+    running="$(docker inspect --format '{{.State.Running}}' "${name}" 2>/dev/null || true)"
+    if [[ "${running}" != "true" ]]; then
+      break
+    fi
+    if docker exec "${name}" python -c \
+      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/healthz', timeout=2).read()" \
+      >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep "${T4_HEALTH_INTERVAL_SECONDS}"
+  done
+  if [[ "${ready}" != "1" ]]; then
+    docker logs --tail 100 "${name}" >&2 || true
+    fail "${label} API did not become healthy within $((10#${T4_HEALTH_ATTEMPTS} * 10#${T4_HEALTH_INTERVAL_SECONDS})) seconds"
+  fi
+}
+
+verify_provider() {
+  local name="$1"
+  log "Verifying CUDAExecutionProvider with the YOLOX model (${name})"
+  docker exec "${name}" python -c \
+    'from person_search.config import Settings; from person_search.detector import YoloXOnnxDetector; detector = YoloXOnnxDetector(Settings()); detector.ensure_ready(); print(detector.provider_name); assert detector.provider_name == "CUDAExecutionProvider"'
+}
+
+verify_provider_best_effort() {
+  local name="$1"
+  docker exec "${name}" python -c \
+    'from person_search.config import Settings; from person_search.detector import YoloXOnnxDetector; detector = YoloXOnnxDetector(Settings()); detector.ensure_ready(); assert detector.provider_name == "CUDAExecutionProvider"' \
+    >/dev/null 2>&1
+}
+
+wait_for_rollback() {
+  local name="$1" port="$2" ready=0 running
+  for _ in $(seq 1 "${T4_HEALTH_ATTEMPTS}"); do
+    running="$(docker inspect --format '{{.State.Running}}' "${name}" 2>/dev/null || true)"
+    if [[ "${running}" != "true" ]]; then
+      break
+    fi
+    if docker exec "${name}" python -c \
+      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/healthz', timeout=2).read()" \
+      >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep "${T4_HEALTH_INTERVAL_SECONDS}"
+  done
+  if [[ "${ready}" != "1" ]]; then
+    return 1
+  fi
+  verify_provider_best_effort "${name}"
+}
+
+if [[ "${T4_PRELOAD_INSIGHTFACE}" == "true" ]]; then
+  verify_insightface() {
+    local name="$1"
+    log "Downloading and preloading the InsightFace model (${name})"
+    docker exec "${name}" python -c \
+      'from person_search.backends import InsightFaceBackend; from person_search.config import Settings; backend = InsightFaceBackend(Settings()); backend.ensure_ready(); print(backend.provider_name); assert backend.provider_name == "CUDAExecutionProvider"'
+  }
+else
+  verify_insightface() { :; }
 fi
 
-log "Verifying CUDAExecutionProvider with the YOLOX model"
-docker exec "${T4_CONTAINER_NAME}" python -c \
-  'from person_search.config import Settings; from person_search.detector import YoloXOnnxDetector; detector = YoloXOnnxDetector(Settings()); detector.ensure_ready(); print(detector.provider_name); assert detector.provider_name == "CUDAExecutionProvider"'
+# A candidate is loaded on an alternate host port while the old service remains
+# untouched. Any failure before the switch removes only the candidate.
+candidate_name="${T4_CONTAINER_NAME}.candidate.$$"
+previous_name="${T4_CONTAINER_NAME}.previous.$(date +%Y%m%d%H%M%S).$$"
+existing_container_id="$(docker ps --all --quiet --filter "name=^/${T4_CONTAINER_NAME}$")"
+previous_port="${T4_PORT}"
+existing_state=""
+if [[ -n "${existing_container_id}" ]]; then
+  existing_state="$(docker inspect --format '{{.State.Running}}' "${T4_CONTAINER_NAME}" 2>/dev/null || true)"
+  previous_port="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "${T4_CONTAINER_NAME}" 2>/dev/null | awk -F= '$1 == "PERSON_SEARCH_PORT" { print $2; exit }' || true)"
+  [[ -n "${previous_port}" ]] || previous_port="${T4_PORT}"
+  # The value is later interpolated into the in-container health probe.  Refuse
+  # malformed/oversized values before any stop/rename operation so a stale
+  # container cannot turn rollback into a broken or ambiguous check.
+  require_port PERSON_SEARCH_PORT "${previous_port}"
+  [[ "${existing_state}" != "true" || "${previous_port}" != "${T4_CANARY_PORT}" ]] || fail \
+    "T4_CANARY_PORT conflicts with the existing container's PERSON_SEARCH_PORT"
+fi
+old_was_running=0
+old_stopped=0
+old_renamed=0
+candidate_started=0
+replacement_started=0
+deployment_ok=0
 
-if [[ "${T4_PRELOAD_INSIGHTFACE}" == "1" ]]; then
-  log "Downloading and preloading the InsightFace model"
-  docker exec "${T4_CONTAINER_NAME}" python -c \
-    'from person_search.backends import InsightFaceBackend; from person_search.config import Settings; backend = InsightFaceBackend(Settings()); backend.ensure_ready(); print(backend.provider_name); assert backend.provider_name == "CUDAExecutionProvider"'
+rollback_on_exit() {
+  local status=$?
+  set +e
+  if [[ "${deployment_ok}" != "1" ]]; then
+    if [[ "${replacement_started}" == "1" ]] && container_exists "${T4_CONTAINER_NAME}"; then
+      log "Removing failed replacement ${T4_CONTAINER_NAME}"
+      docker rm --force "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
+    fi
+    if [[ "${old_renamed}" == "1" ]] && container_exists "${previous_name}"; then
+      log "Restoring previous container ${previous_name} -> ${T4_CONTAINER_NAME}"
+      docker rename "${previous_name}" "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
+      if [[ "${old_was_running}" == "1" ]]; then
+        docker start "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
+        if wait_for_rollback "${T4_CONTAINER_NAME}" "${previous_port}"; then
+          log "Previous container passed rollback health/provider checks"
+        else
+          log "ERROR: previous container was restored but failed rollback health/provider checks" >&2
+          [[ "${status}" -eq 0 ]] && status=1
+        fi
+      fi
+    elif [[ "${old_stopped}" == "1" ]] && container_exists "${T4_CONTAINER_NAME}"; then
+      docker start "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
+      if [[ "${old_was_running}" == "1" ]]; then
+        if wait_for_rollback "${T4_CONTAINER_NAME}" "${previous_port}"; then
+          log "Previous container passed rollback health/provider checks"
+        else
+          log "ERROR: previous container was restored but failed rollback health/provider checks" >&2
+          [[ "${status}" -eq 0 ]] && status=1
+        fi
+      fi
+    fi
+  fi
+  if [[ "${candidate_started}" == "1" ]] && container_exists "${candidate_name}"; then
+    docker rm --force "${candidate_name}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${status}" -ne 0 && "${old_renamed}" == "1" ]]; then
+    log "Deployment failed; previous container was restored when possible"
+  fi
+  exit "${status}"
+}
+trap rollback_on_exit EXIT
+
+log "Starting candidate ${candidate_name} on host port ${T4_CANARY_PORT}"
+candidate_started=1
+start_container "${candidate_name}" "${T4_CANARY_PORT}" no 127.0.0.1
+wait_for_health "${candidate_name}" "${T4_CANARY_PORT}" candidate
+verify_provider "${candidate_name}"
+verify_insightface "${candidate_name}"
+
+# The candidate has completed all checks; stop it before starting the production
+# replacement so two model copies do not compete for T4 VRAM during the switch.
+log "Stopping validated candidate ${candidate_name}"
+docker stop --time "${T4_STOP_TIMEOUT_SECONDS}" "${candidate_name}" >/dev/null
+docker rm "${candidate_name}" >/dev/null
+candidate_started=0
+
+# Switch only after every candidate check passes. Keep the old container under a
+# timestamped name so a failed final start/health check can be rolled back.
+if [[ -n "${existing_container_id}" ]]; then
+  old_state="${existing_state}"
+  [[ "${old_state}" == "true" ]] && old_was_running=1
+  if [[ "${old_was_running}" == "1" ]]; then
+    log "Stopping current container ${T4_CONTAINER_NAME} (timeout ${T4_STOP_TIMEOUT_SECONDS}s)"
+    # Mark this before the command: if Docker returns an error after stopping the
+    # process, the EXIT trap can still attempt an idempotent restart.
+    old_stopped=1
+    docker stop --time "${T4_STOP_TIMEOUT_SECONDS}" "${T4_CONTAINER_NAME}" >/dev/null
+  fi
+  log "Keeping previous container as ${previous_name}"
+  docker rename "${T4_CONTAINER_NAME}" "${previous_name}" >/dev/null
+  old_renamed=1
 fi
 
-log "Deployment completed"
-log "Monitor: http://${T4_BIND_HOST}:8000/monitor"
+log "Starting replacement ${T4_CONTAINER_NAME} on host port ${T4_PORT}"
+replacement_started=1
+start_container "${T4_CONTAINER_NAME}" "${T4_PORT}" unless-stopped
+wait_for_health "${T4_CONTAINER_NAME}" "${T4_PORT}" replacement
+verify_provider "${T4_CONTAINER_NAME}"
+
+deployment_ok=1
+
+log "Deployment completed (source ${SOURCE_COMMIT})"
+log "Monitor: http://${T4_BIND_HOST}:${T4_PORT}/monitor"
 if [[ "${T4_BIND_HOST}" == "127.0.0.1" ]]; then
-  log "Open an SSH tunnel from your computer: ssh -L 8000:127.0.0.1:8000 user@t4-server"
+  log "Open an SSH tunnel from your computer: ssh -L ${T4_PORT}:127.0.0.1:${T4_PORT} user@t4-server"
 fi
 log "Follow logs: docker logs -f ${T4_CONTAINER_NAME}"
+if [[ "${old_renamed}" == "1" ]]; then
+  log "Rollback point retained as ${previous_name}"
+fi

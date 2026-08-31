@@ -19,6 +19,10 @@ class FramePacket:
     frame_id: int
     captured_at: float
     frame: np.ndarray
+    # Incremented whenever a reconnect starts. Consumers can discard a packet
+    # that was decoded by the previous camera connection even if it was already
+    # in flight when the reader reported SOURCE_LOST.
+    source_epoch: int = 0
 
 
 class LatestFrameReader:
@@ -37,13 +41,25 @@ class LatestFrameReader:
         self._stop = threading.Event()
         self.ended = threading.Event()
         self._thread: threading.Thread | None = None
+        self._lifecycle_lock = threading.Lock()
+        self._source_epoch = 0
 
     def start(self) -> None:
-        thread = threading.Thread(target=self._capture_loop, name="frame-reader", daemon=True)
-        thread.start()
-        # Publish only once the thread is running: stop() runs on another thread and
-        # would otherwise be able to observe a thread it cannot join yet.
-        self._thread = thread
+        with self._lifecycle_lock:
+            if self._thread is not None:
+                return
+            thread = threading.Thread(
+                target=self._capture_loop, name="frame-reader", daemon=True
+            )
+            # Publish and start while holding the same lock that stop() uses. This
+            # removes both races from the old ordering: stop() cannot miss a
+            # just-created thread, and it cannot call join() before start().
+            self._thread = thread
+            try:
+                thread.start()
+            except Exception:
+                self._thread = None
+                raise
 
     def get(self, timeout: float = 0.5) -> FramePacket | None:
         try:
@@ -53,8 +69,18 @@ class LatestFrameReader:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=3.0)
+        with self._lifecycle_lock:
+            thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+
+    def clear(self) -> None:
+        """Drop decoded frames that would otherwise keep camera buffers alive."""
+        while True:
+            try:
+                self.frames.get_nowait()
+            except queue.Empty:
+                return
 
     def _capture_loop(self) -> None:
         capture: cv2.VideoCapture | None = None
@@ -69,6 +95,7 @@ class LatestFrameReader:
                     capture = self._open()
                     if not capture.isOpened():
                         if not announced_lost:
+                            self._source_epoch += 1
                             self.on_status(SearchStatus.SOURCE_LOST, "unable to open video source")
                             announced_lost = True
                         self._stop.wait(reconnect_delay)
@@ -94,6 +121,7 @@ class LatestFrameReader:
                     capture.release()
                     capture = None
                     if not announced_lost:
+                        self._source_epoch += 1
                         self.on_status(SearchStatus.SOURCE_LOST, "video source read failed")
                         announced_lost = True
                     continue
@@ -113,7 +141,12 @@ class LatestFrameReader:
                 if announced_lost or frame_id == 0:
                     self.on_status(SearchStatus.RUNNING, None)
                     announced_lost = False
-                packet = FramePacket(frame_id=frame_id, captured_at=time.monotonic(), frame=frame)
+                packet = FramePacket(
+                    frame_id=frame_id,
+                    captured_at=time.monotonic(),
+                    frame=frame,
+                    source_epoch=self._source_epoch,
+                )
                 frame_id += 1
                 try:
                     self.frames.put_nowait(packet)

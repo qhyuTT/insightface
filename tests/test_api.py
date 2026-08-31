@@ -7,6 +7,7 @@ import numpy as np
 from conftest import FakeFaceBackend, FakePersonDetector, make_face
 from fastapi.testclient import TestClient
 
+from person_search import API_VERSION
 from person_search.api import create_app
 from person_search.config import Settings
 from person_search.domain import SearchStatus, SourceConfig
@@ -22,7 +23,7 @@ def test_health_does_not_load_models() -> None:
     with client_with_face() as client:
         assert client.get("/healthz").json() == {
             "status": "ok",
-            "api_version": "0.2.0",
+            "api_version": API_VERSION,
             "capabilities": [
                 "replace_active",
                 "active_search",

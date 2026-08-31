@@ -187,6 +187,7 @@
   <script>
     const $ = (id) => document.getElementById(id);
     let targetId = null, targetName = '', searchId = null, socket = null, pollTimer = null, bestSimilarity = -1;
+    let eventSeq = 0, reconnectTimer = null, reconnectDelay = 1000, stopping = false;
 
     function fail(message) { $('notice').textContent = message; }
     function setState(status) {
@@ -423,7 +424,7 @@
       try {
         const response = await fetch('/v1/batch-searches', {method:'POST', body:data});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '批量搜索启动失败'));
-        searchId = body.search_id; targetName = `${body.found_count}/${body.total_count} 人`; bestSimilarity = -1;
+        searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; targetName = `${body.found_count}/${body.total_count} 人`; bestSimilarity = -1;
         renderTargets(body.targets); updateBatchAvailability();
         $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
         $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
@@ -437,7 +438,7 @@
       try {
         const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, source})});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));
-        searchId = body.search_id; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
+        searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
         updateBatchAvailability();
         $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
         $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
@@ -448,8 +449,18 @@
 
     async function stopSearch() {
       if (!searchId) return;
-      await fetch(`/v1/searches/${searchId}`, {method:'DELETE'});
-      if (socket) socket.close(); clearTimeout(pollTimer); setState('stopped');
+      stopping = true; $('stopBtn').disabled = true;
+      try {
+        const response = await fetch(`/v1/searches/${searchId}`, {method:'DELETE'});
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(problem(body, `停止失败（HTTP ${response.status}）`));
+        }
+      } catch (error) {
+        stopping = false; $('stopBtn').disabled = false; fail(error.message || '停止失败');
+        return;
+      }
+      if (socket) socket.close(); clearTimeout(pollTimer); clearTimeout(reconnectTimer); setState('stopped');
       $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('emptyState').style.display = 'block'; $('scanline').style.display = 'none';
       $('stopBtn').disabled = true; $('startBtn').disabled = true; targetId = null; targetName = ''; searchId = null; bestSimilarity = -1;
       renderTargets();
@@ -457,9 +468,19 @@
     }
     function connectEvents() {
       const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-      socket = new WebSocket(`${protocol}://${location.host}/v1/searches/${searchId}/events`);
+      if (!searchId || stopping) return;
+      clearTimeout(reconnectTimer);
+      socket = new WebSocket(`${protocol}://${location.host}/v1/searches/${searchId}/events?after_seq=${eventSeq}`);
       socket.onmessage = ({data}) => {
-        const event = JSON.parse(data); addEvent(event);
+        const event = JSON.parse(data);
+        if (event.type === 'replay_gap') {
+          addEvent({type:'replay_gap', occurred_at:Date.now(), data:{status:'事件有缺口，正在用状态对账'}});
+          pollStatus();
+          eventSeq = Number(event.data?.oldest_seq || event.seq || eventSeq);
+          return;
+        }
+        if (Number.isFinite(Number(event.seq))) eventSeq = Math.max(eventSeq, Number(event.seq));
+        addEvent(event);
         if (event.type === 'search_status') setState(event.data.status);
         if (event.type === 'candidate' || event.type === 'confirmed' || event.type === 'tiny_shadow_confirmed') {
           bestSimilarity = Math.max(bestSimilarity, event.data.similarity); $('similarityMetric').textContent = bestSimilarity.toFixed(3);
@@ -469,6 +490,15 @@
         if (event.type === 'tiny_shadow_lost') { $('banner').textContent = `◇ SHADOW 命中已失效 · ${event.data.target_name || targetName} · 继续寻找`; $('banner').classList.remove('found'); }
         if (event.type === 'all_found') { $('banner').textContent = '✓ 全部目标已找到'; $('banner').classList.add('found'); }
         if (event.type === 'lost') { $('banner').textContent = '● 目标暂时离开画面'; $('banner').classList.remove('found'); }
+      };
+      socket.onerror = () => socket.close();
+      socket.onclose = () => {
+        if (!stopping && searchId) {
+          reconnectTimer = setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+            connectEvents();
+          }, reconnectDelay);
+        }
       };
     }
     function addEvent(event) {

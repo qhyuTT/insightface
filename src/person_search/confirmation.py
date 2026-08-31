@@ -225,7 +225,31 @@ class TrackConfirmation:
         self._states: dict[int, _TrackState] = {}
 
     def reset(self) -> None:
+        for state in self._states.values():
+            self._clear_state_evidence(state)
         self._states.clear()
+
+    def clear_sensitive(self) -> None:
+        """Wipe per-track biometric evidence before a session is retained.
+
+        ``reset`` is used while a search is still running and deliberately only
+        drops the mapping.  A terminal session can remain available for HTTP
+        reconciliation, however, so simply dropping the mapping would leave
+        NumPy arrays reachable from the old state until the whole session is
+        collected.  Best-effort zeroing makes the lifecycle boundary explicit
+        while keeping the operation idempotent.
+        """
+        for state in self._states.values():
+            self._clear_state_evidence(state)
+            _wipe_array(state.last_bbox)
+            _wipe_array(state.last_face_bbox)
+        self._states.clear()
+
+    @staticmethod
+    def _clear_state_evidence(state: _TrackState) -> None:
+        for item in state.evidence:
+            _wipe_array(item.embedding)
+        state.evidence.clear()
 
     def active_track_states(self) -> dict[int, tuple[MatchState, float]]:
         return {
@@ -340,6 +364,27 @@ class TrackConfirmation:
         decisions: list[MatchDecision] = []
         outcomes: list[TrackOutcome] = []
         evidence_collected = 0
+        # A terminal session keeps an embedding-free Target metadata snapshot.
+        # It must remain safe to call this method defensively after cleanup, even
+        # though the normal worker never processes another frame at that point.
+        if target.embedding is None:
+            return ConfirmationResult(decisions=[], evidence_collected=0, outcomes=[])
+        # Validate the target once before walking the frame.  Provider shims and
+        # callers of this low-level class can hand us a scalar, ragged, or
+        # non-finite array; letting NumPy broadcast it in ``dot`` would either
+        # raise in the worker or produce a vector that is accidentally treated as
+        # a score.  A malformed target is a fail-closed frame, just like a
+        # malformed face embedding.
+        try:
+            target_array = np.asarray(target.embedding, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError, FloatingPointError):
+            return ConfirmationResult(decisions=[], evidence_collected=0, outcomes=[])
+        if (
+            target_array.ndim != 1
+            or target_array.size == 0
+            or not np.isfinite(target_array).all()
+        ):
+            return ConfirmationResult(decisions=[], evidence_collected=0, outcomes=[])
         tracks_by_id = {track.track_id: track for track in tracks}
         for track in tracks:
             state = self._states.setdefault(track.track_id, _TrackState())
@@ -354,14 +399,43 @@ class TrackConfirmation:
         # At most one face contributes to a track in a frame: keep the highest-quality face.
         best_by_track: dict[int, tuple[int, FaceObservation]] = {}
         for face_index, track_id in associations.items():
+            if not 0 <= face_index < len(faces):
+                # Associations are normally produced by the same frame's
+                # matcher, but a stale/third-party mapping must not turn a bad
+                # index into a worker-wide failure.
+                continue
+            if track_id not in tracks_by_id:
+                # Likewise, ignore an association to a track that was already
+                # evicted between matching and confirmation.
+                continue
             face = faces[face_index]
-            if not face.accepted:
+            if not face.accepted or face.embedding is None:
+                continue
+            try:
+                face_array = np.asarray(face.embedding, dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError, OverflowError, FloatingPointError):
+                continue
+            if (
+                face_array.size == 0
+                or face_array.size != target_array.size
+                or not np.isfinite(face_array).all()
+            ):
                 continue
             previous = best_by_track.get(track_id)
             if previous is None or face.quality > previous[1].quality:
                 best_by_track[track_id] = (face_index, face)
 
         for track_id, (face_index, face) in best_by_track.items():
+            try:
+                face_array = np.asarray(face.embedding, dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError, OverflowError, FloatingPointError):
+                continue
+            if (
+                face_array.size == 0
+                or face_array.size != target_array.size
+                or not np.isfinite(face_array).all()
+            ):
+                continue
             state = self._states[track_id]
             policy = face_policies.get(face_index) or FaceMatchPolicy(
                 threshold=self.settings.similarity_threshold,
@@ -373,13 +447,13 @@ class TrackConfirmation:
                 state.policy = policy
             elif state.shadow_confirmed and not self._is_shadow_policy(policy):
                 decisions.append(self._decision(MatchState.LOST, track_id, state))
-                state.evidence.clear()
+                self._clear_state_evidence(state)
                 state.shadow_confirmed = False
                 state.last_candidate_emit = -1e9
                 state.policy = policy
             elif is_stricter_policy(policy, state.policy):
                 if not state.confirmed:
-                    state.evidence.clear()
+                    self._clear_state_evidence(state)
                     state.last_candidate_emit = -1e9
                 state.policy = policy
             elif policy != state.policy:
@@ -390,13 +464,18 @@ class TrackConfirmation:
                 # Evidence is cleared in both directions so one window never mixes
                 # samples taken under different thresholds.
                 if not state.confirmed:
-                    state.evidence.clear()
+                    self._clear_state_evidence(state)
                     state.last_candidate_emit = -1e9
                 state.policy = policy
             else:
                 policy = state.policy
             state.tier = policy.tier
-            similarity = float(np.dot(target.embedding, face.embedding))
+            try:
+                similarity = float(np.dot(target_array, face_array))
+            except (TypeError, ValueError, OverflowError, FloatingPointError):
+                continue
+            if not np.isfinite(similarity):
+                continue
             if not policy.accepts_observation(face.detection_score, similarity):
                 continue
             # The crop belongs to the observation that is currently driving the
@@ -425,7 +504,7 @@ class TrackConfirmation:
                         timestamp=timestamp,
                         similarity=similarity,
                         quality=face.quality,
-                        embedding=face.embedding.copy(),
+                        embedding=face_array.copy(),
                     )
                 )
                 evidence_collected += 1
@@ -435,7 +514,8 @@ class TrackConfirmation:
                 state.sampled += 1
                 if policy.collect_all_observations:
                     while len(state.evidence) > policy.evidence_required:
-                        state.evidence.popleft()
+                        old = state.evidence.popleft()
+                        _wipe_array(old.embedding)
 
             if not state.confirmed and not state.shadow_confirmed:
                 if (
@@ -486,6 +566,7 @@ class TrackConfirmation:
                 face_expired = timestamp - state.last_face_seen >= grace
                 if track_expired or face_expired:
                     decisions.append(self._decision(MatchState.LOST, track_id, state))
+                    self._clear_state_evidence(state)
                     del self._states[track_id]
             elif (
                 not state.evidence
@@ -493,6 +574,7 @@ class TrackConfirmation:
                 and timestamp - state.last_track_seen >= grace
             ):
                 self._record_unconfirmed_outcome(track_id, state, outcomes, decisions)
+                self._clear_state_evidence(state)
                 del self._states[track_id]
 
         return ConfirmationResult(
@@ -615,7 +697,8 @@ class TrackConfirmation:
     def _expire_evidence(self, state: _TrackState, timestamp: float) -> None:
         window = self._policy_window(state)
         while state.evidence and timestamp - state.evidence[0].timestamp > window:
-            state.evidence.popleft()
+            old = state.evidence.popleft()
+            _wipe_array(old.embedding)
 
     def _evaluate(self, state: _TrackState, target: Target | None) -> _Attempt:
         """Run the confirmation gates in order and report the first one that fails.
@@ -682,17 +765,38 @@ class TrackConfirmation:
         (no evidence, or the weighted mean cancelled out), which the gate treats
         as a failure.
         """
-        if not state.evidence:
+        if not state.evidence or target.embedding is None:
             return None
-        embeddings = np.stack([item.embedding for item in state.evidence])
+        try:
+            target_embedding = np.asarray(target.embedding, dtype=np.float32).reshape(-1)
+            embeddings = np.stack(
+                [np.asarray(item.embedding, dtype=np.float32).reshape(-1) for item in state.evidence]
+            )
+        except (TypeError, ValueError, OverflowError, FloatingPointError):
+            return None
+        if (
+            target_embedding.size == 0
+            or embeddings.ndim != 2
+            or embeddings.shape[1] != target_embedding.size
+            or not np.isfinite(target_embedding).all()
+            or not np.isfinite(embeddings).all()
+        ):
+            return None
         weights = np.asarray([max(item.quality, 0.0) for item in state.evidence], dtype=np.float32)
         if not np.any(weights):
             weights = np.ones(len(state.evidence), dtype=np.float32)
-        aggregate = np.average(embeddings, axis=0, weights=weights)
-        magnitude = float(np.linalg.norm(aggregate))
+        try:
+            aggregate = np.average(embeddings, axis=0, weights=weights)
+            magnitude = float(np.linalg.norm(aggregate))
+        except (TypeError, ValueError, OverflowError, FloatingPointError):
+            return None
         if magnitude <= 1e-12:
             return None
-        return float(np.dot(target.embedding, aggregate / magnitude))
+        try:
+            similarity = float(np.dot(target_embedding, aggregate / magnitude))
+        except (TypeError, ValueError, OverflowError, FloatingPointError):
+            return None
+        return similarity if np.isfinite(similarity) else None
 
     def _decision(
         self,
@@ -907,6 +1011,18 @@ def is_stricter_policy(candidate: FaceMatchPolicy, current: FaceMatchPolicy) -> 
         or (current.allows_relaxed_association and not candidate.allows_relaxed_association)
         or (candidate.suppress_candidate and not current.suppress_candidate)
     )
+
+
+def _wipe_array(value: np.ndarray | None) -> None:
+    """Best-effort zeroing for sensitive NumPy buffers."""
+    if value is None:
+        return
+    try:
+        value.fill(0)
+    except (AttributeError, TypeError, ValueError):
+        # Read-only views can still be released safely; zeroing is only a
+        # defense-in-depth measure and must not turn cleanup into a failure.
+        return
 
 
 def normalize_bbox(

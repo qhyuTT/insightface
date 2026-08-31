@@ -93,10 +93,17 @@ RUN rm -f /app/models/pyproject.toml \
 
 RUN mkdir -p /models/.insightface
 
+# Keep the revision metadata after the expensive dependency/model layers. The
+# deployment script passes VCS_REF for traceability; placing this label here
+# prevents every commit from invalidating the apt/uv cache.
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="robot-person-search-poc" \
+      org.opencontainers.image.revision="${VCS_REF}"
+
 VOLUME ["/models"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl --fail --silent http://127.0.0.1:8000/healthz || exit 1
+  CMD-SHELL curl --fail --silent "http://127.0.0.1:$${PERSON_SEARCH_PORT:-8000}/healthz" || exit 1
 
 CMD ["person-search-api"]

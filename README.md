@@ -62,7 +62,35 @@ InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近�
 
 批量搜索会区分“完整身份竞争集”和“仍待确认目标集”：目标找到后不再累计证据，但仍保留在 Top1/Top2 身份竞争中。已找到目标继续出现在画面时，其人脸不会降级分配给剩余目标。
 
-CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px` 合格人脸的人体轨迹都会独立进入头肩 ROI 候选，不会被画面中的无关近脸关闭；每轮最多检测 `8` 个人体上方 `50%` 区域，T4 默认 `4 Hz`，CPU 默认关闭。ROI 检测尺度按裁剪大小量化成两档：不超过 `PERSON_SEARCH_ROI_FACE_DETECTION_SIZE`（默认 `320`）的裁剪仍上采样到该值，更大的裁剪用 `PERSON_SEARCH_ROI_FACE_DETECTION_MAX_SIZE`（默认 `640`）而不再被压回 320。只用两档是因为每个新的 ONNX 输入形状在 CUDA 上要付约 30 ms 重规划。ROI 只能改善检测和关键点稳定性，不会增加原始身份纹理。
+CUDA 环境下全帧人脸检测默认按 `10 Hz` 运行。每个缺少 `>=80 px` 合格人脸的人体轨迹都会独立进入头肩 ROI 候选，不会被画面中的无关近脸关闭；每轮最多调度 `3` 条人体轨迹的人体上方 `50%` 区域（`roi_max_tracks_per_pass=3`），T4 默认 `4 Hz`，CPU 默认关闭。`roi_batch_size` 默认是 `8`，它只表示同一检测尺度下每个批次的裁剪数，不是每轮的轨迹上限。ROI 检测尺度按裁剪大小量化成两档：不超过 `PERSON_SEARCH_ROI_FACE_DETECTION_SIZE`（默认 `320`）的裁剪仍上采样到该值，更大的裁剪用 `PERSON_SEARCH_ROI_FACE_DETECTION_MAX_SIZE`（默认 `640`）而不再被压回 320。只用两档是因为每个新的 ONNX 输入形状在 CUDA 上要付约 30 ms 重规划。ROI 只能改善检测和关键点稳定性，不会增加原始身份纹理。
+
+### 运行预算与诊断
+
+以下容量保护参数都可用同名 `PERSON_SEARCH_...` 环境变量覆盖，并会在
+`GET /v1/searches/{search_id}` 的 `effective_config` 中回显。它们限制单帧工作的峰值，
+不会改变相似度或证据门槛：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `roi_max_tracks_per_pass` | `3` | 一次 ROI pass 最多尝试的人体轨迹数 |
+| `roi_batch_size` | `8` | 同一输入尺度下每个检测批次的 ROI 裁剪数；不是轨迹数上限 |
+| `arcface_micro_batch_size` | `16` | 每次 ArcFace embedding 调用最多处理的人脸数；启用 flip TTA 时镜像行在批次内部加倍，但仍按人脸数切块 |
+| `max_faces_per_frame` | `64` | 一帧进入 ArcFace 前保留的人脸上限；超出后按人体关联、尺寸和质量优先保留 |
+
+建议持续采集搜索响应中的 `source_fps`、`processed_fps`、`dropped_frames`、`drop_rate`、
+`roi_batch_count`、`embedding_batch_count`、`faces_dropped_by_budget` 和
+`embedding_failures`。`stage_p95_latency_ms` 显示 `person`、`face_full`、`face_roi`、
+`face_embed` 等阶段的 P95，`effective_hz` 显示各阶段实际调用频率；`budget_skips` 会区分
+`face_roi_floor`（处理帧率已触及下限）和 `face_roi_credit`（信用桶余额不足）。
+`end_to_end_p95_latency_ms` 是从帧采集到本轮处理完成的 P95，可作为 frame age（帧龄）
+的聚合代理，不能用浏览器预览延迟代替。`faces_dropped_by_budget` 既包含每帧上限淘汰，
+也包含嵌入容量回退时本帧放弃的脸；`embedding_failures` 则表示可恢复的嵌入调用错误。
+
+YOLOX 的 ONNX Runtime 可选调优变量为 `PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS`、
+`PERSON_SEARCH_ORT_INTER_OP_NUM_THREADS` 和 `PERSON_SEARCH_ORT_CUDA_DEVICE_ID`。留空时
+保持 ORT 原生线程池和设备选择；设置时使用非负整数，设备编号对应 `nvidia-smi -L`。
+部署脚本中的对应前缀是 `T4_ORT_*`，只在显式设置时传入。当前这些变量配置的是
+YOLOX detector session，InsightFace `FaceAnalysis` 的 provider/session 仍需单独核验。
 
 ## 使用 uv 安装
 
@@ -88,7 +116,7 @@ InsightFace 自身会传递依赖 CPU 版 `onnxruntime`，而 `onnxruntime-gpu` 
 
 #### 在 NVIDIA T4 上快速测试
 
-T4 具备 16 GB 显存，运行当前的 YOLOX-Tiny + `buffalo_l` 模型没有显存压力。机场场景建议输入 `1920x1080`，保持 CUDA 全帧人脸检测 `10 Hz`，并启用默认的 `4 Hz` 人体 ROI 补充检测（每轮最多 `8` 个人体框）；不要在未回归误报率和 P95 延迟前继续下调最小人脸尺寸。服务器需要已安装 NVIDIA 驱动、CUDA/cuDNN 和 Python 3.11；先确认驱动可以看到 GPU：
+T4 具备 16 GB 显存，运行当前的 YOLOX-Tiny + `buffalo_l` 模型没有显存压力。机场场景建议输入 `1920x1080`，保持 CUDA 全帧人脸检测 `10 Hz`，并启用默认的 `4 Hz` 人体 ROI 补充检测（每轮最多调度 `3` 条人体轨迹；`roi_batch_size=8` 只是同一尺度的批处理分组大小）；不要在未回归误报率和 P95 延迟前继续下调最小人脸尺寸。服务器需要已安装 NVIDIA 驱动、CUDA/cuDNN 和 Python 3.11；先确认驱动可以看到 GPU：
 
 ```bash
 nvidia-smi
@@ -144,7 +172,7 @@ curl http://127.0.0.1:8000/healthz
 
 部署脚本在构建前会依次探测阿里云、中科大、PyPI 官方，选第一个可用的作为 Python 包源。这一步是必要的：镜像站可能对某个 IP 限流并返回 403，而失败会发生在构建的中段，白费上面所有层。用 `T4_PIP_INDEX_URL` 可以指定固定源，跳过探测；用 `T4_PIP_INDEX_CANDIDATES` 可以自定义候选列表。
 
-推荐在 T4 服务器直接使用部署脚本。脚本会预取 YOLOX 权重、构建镜像、验证 NVIDIA Container Toolkit、替换同名旧容器、持久化模型目录、启动 API，并使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
+推荐在 T4 服务器直接使用部署脚本。脚本会预取 YOLOX 权重、构建带 commit 标识的镜像、验证 NVIDIA Container Toolkit，先在 loopback canary 容器中完成健康/provider 检查，再安全替换同名旧容器；旧容器会保留为 rollback point。模型目录持久化，且会使用真实 YOLOX session 验证 `CUDAExecutionProvider`：
 
 完整的源码发布、服务器更新、容器替换、GitHub 不可达备用方案和 GPU 核验步骤见 [T4 部署与 GPU 验证](docs/t4-deployment.md)。
 
@@ -180,6 +208,12 @@ T4_PRELOAD_INSIGHTFACE=1 \
 ```
 
 `T4_PRELOAD_INSIGHTFACE=1` 会在部署阶段下载 `buffalo_l`；若服务器无法访问 InsightFace 上游，可保持默认值 `0`，并将准备好的模型目录放入 Docker volume `person-search-models`。
+
+部署脚本默认以 shadow 模式运行超小脸确认。只有同时设置
+`T4_TINY_FACE_SHADOW_MODE=false` 和 `T4_ALLOW_PHYSICAL_ACTIONS=true` 才允许该档触发正式动作。
+生产部署还应设置 `T4_EXPECTED_COMMIT`（完整或短 SHA）和 `T4_EXPECTED_REMOTE_URL`；脚本默认拒绝 dirty checkout。
+候选容器默认使用 `T4_CANARY_PORT=18000`，正式端口为 `T4_PORT=8000`，优雅停止超时由
+`T4_STOP_TIMEOUT_SECONDS=30` 控制。
 
 ##### YOLOX 权重的获取方式
 
@@ -283,6 +317,20 @@ uv run person-search-api
 ```
 
 默认只监听 `127.0.0.1:8000`，Swagger UI 位于 `http://127.0.0.1:8000/docs`。机器人需要远程访问时设置 `PERSON_SEARCH_HOST=0.0.0.0`，并在受控网络或反向代理鉴权之后使用。
+
+### 安全边界（重要）
+
+默认监听 loopback 是有意的安全边界。当前没有全局 API 认证：除证据下载与释放接口（配置
+`PERSON_SEARCH_EVIDENCE_API_KEY` 后才受 `X-API-Key` 保护）外，目标登记、搜索创建/停止、
+MJPEG 预览、WebSocket 事件、监控页和文档都可以匿名访问。不要把服务端口直接暴露到公网或
+不受控局域网；需要绑定 `0.0.0.0` 时，必须放在反向代理/API gateway 或 mTLS 后，并用
+防火墙/网络 ACL 限制调用方。证据 API key 只保护证据接口，不是全局凭据。
+
+RTSP source 为支持本地隧道和摄像头网段，允许 loopback、私网及任意可解析的主机名。这也
+意味着未受信调用方可能诱导服务访问内网地址（SSRF/端口探测）。只接受受信控制面提交的
+`source`，并在反代鉴权之外于防火墙/网络层配置 RTSP 主机 allowlist 或出站 ACL；不要把
+RTSP 用户名、密码写入仓库、命令历史或日志。API 响应中的 RTSP URI 会脱敏，但这不替代
+访问控制。
 
 可视化监控页位于 `http://127.0.0.1:8000/monitor`（根路径也会打开该页面）。页面可以完成目标照片登记、启动/停止搜索，并显示带人物框和人脸框的实时视频：普通轨迹为蓝框，候选目标为黄框，连续多帧确认后为绿框。状态、FPS、延迟、相似度和识别事件会同步更新。视频预览使用只保留最新帧的 MJPEG 流，不会因浏览器读取慢而阻塞推理。
 
@@ -498,6 +546,13 @@ uv run person-search-eval \
   --dump-similarities \
   --output-dir artifacts/calibration
 ```
+
+离线 `report.json` 的 `quality_diagnostics` 还会区分两类嵌入异常：
+`embedding_failures` 是没有得到有效向量的**人脸输入数**，
+`embedding_provider_failures` 是可恢复的**推理调用失败数**（一次调用可能在
+OOM 拆分或重试后对应多张脸，因此两者不应相加）；`embedding_batch_count` 和
+`faces_dropped_by_budget` 用来判断是否触发了微批次或单帧人脸预算。坏响应会按脸
+跳过，评测会继续生成报告而不会把整段视频标成成功匹配。
 
 区间标注不含逐脸真值，所以标签是**推导**出来的，报告里会写明这一点：落在任何 `expected_intervals_seconds` 之外的帧目标不在场，其中每张脸都算异人样本；落在区间内的帧只取该帧相似度最高的那张脸作为同人样本，其余不猜。
 

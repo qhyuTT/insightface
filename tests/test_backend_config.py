@@ -10,6 +10,7 @@ import pytest
 from person_search.backends import InsightFaceBackend, _resolve_input_size
 from person_search.config import Settings
 from person_search.domain import FaceObservation
+from person_search.errors import ModelUnavailableError
 
 
 def test_face_detection_uses_insightface_auto_mode_by_default() -> None:
@@ -121,6 +122,18 @@ class _RecordingDetector:
         return np.empty((0, 5), dtype=np.float32), None
 
 
+class _NativeBatchFailureDetector(_RecordingDetector):
+    """Advertises the optional batch hook but rejects it at runtime."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls = 0
+
+    def detect_batch(self, frames, input_size=None, max_num=0):
+        self.batch_calls += 1
+        raise RuntimeError("native batch is unsupported for this input")
+
+
 def _detect_scales(settings: Settings, *, enrollment: bool, detection_size=None) -> object:
     backend = InsightFaceBackend(settings)
     detector = _RecordingDetector()
@@ -214,3 +227,104 @@ def test_flip_tta_can_be_switched_off() -> None:
 
     assert recogniser.batch_sizes == [1]
     assert embedded[0].embedding == pytest.approx([1.0, 0.0])
+
+
+def test_detect_faces_batch_preserves_one_result_list_per_crop() -> None:
+    backend = InsightFaceBackend(Settings())
+    detector = _RecordingDetector()
+    backend._app = SimpleNamespace(det_model=detector)
+    frames = [
+        np.zeros((120, 160, 3), dtype=np.uint8),
+        np.zeros((90, 140, 3), dtype=np.uint8),
+    ]
+
+    result = backend.detect_faces_batch(frames, detection_size=320)
+
+    assert result == [[], []]
+    assert detector.input_sizes == [(320, 320), (320, 320)]
+
+
+def test_detect_faces_batch_falls_back_when_optional_native_hook_fails() -> None:
+    backend = InsightFaceBackend(Settings())
+    detector = _NativeBatchFailureDetector()
+    backend._app = SimpleNamespace(det_model=detector)
+    frames = [
+        np.zeros((120, 160, 3), dtype=np.uint8),
+        np.zeros((90, 140, 3), dtype=np.uint8),
+    ]
+
+    result = backend.detect_faces_batch(frames, detection_size=320)
+
+    assert result == [[], []]
+    assert detector.batch_calls == 1
+    # The optional fast path failed, but both crops still received the ordinary
+    # detector call under the backend lock.
+    assert detector.input_sizes == [(320, 320), (320, 320)]
+
+
+def test_detect_faces_rejects_malformed_detector_result() -> None:
+    backend = InsightFaceBackend(Settings())
+
+    class MalformedDetector:
+        def detect(self, frame, input_size=None, max_num=0):
+            return np.asarray(0.0, dtype=np.float32), None
+
+    backend._app = SimpleNamespace(det_model=MalformedDetector())
+
+    with pytest.raises(ModelUnavailableError, match="malformed output"):
+        backend.detect_faces(np.zeros((120, 160, 3), dtype=np.uint8))
+
+
+def test_detect_faces_rejects_landmarks_with_wrong_rank() -> None:
+    backend = InsightFaceBackend(Settings())
+
+    class MalformedDetector:
+        def detect(self, frame, input_size=None, max_num=0):
+            return np.zeros((1, 5), dtype=np.float32), np.zeros((1,), dtype=np.float32)
+
+    backend._app = SimpleNamespace(det_model=MalformedDetector())
+
+    with pytest.raises(ModelUnavailableError, match="malformed output"):
+        backend.detect_faces(np.zeros((120, 160, 3), dtype=np.uint8))
+
+
+def test_arcface_micro_batch_bounds_recogniser_rows() -> None:
+    pytest.importorskip("insightface", reason="micro-batch test needs face_align")
+    recogniser = _StubRecogniser()
+    backend = InsightFaceBackend(
+        Settings(embedding_flip_tta=False, arcface_micro_batch_size=2)
+    )
+    backend._app = SimpleNamespace(models={"recognition": recogniser})
+    frame = np.zeros((600, 600, 3), dtype=np.uint8)
+    faces = []
+    for index in range(5):
+        offset = float(index * 70)
+        face = _landmarked_face()
+        face.bbox = face.bbox + np.asarray([offset, 0, offset, 0], dtype=np.float32)
+        face.landmarks = face.landmarks + np.asarray([offset, 0], dtype=np.float32)
+        faces.append(face)
+
+    embedded = backend.embed_faces(frame, faces)
+
+    assert len(embedded) == 5
+    assert recogniser.batch_sizes == [2, 2, 1]
+
+
+def test_embed_faces_discards_scalar_provider_response() -> None:
+    pytest.importorskip("insightface", reason="malformed output test needs face_align")
+
+    class ScalarRecogniser(_StubRecogniser):
+        def get_feat(self, crops):
+            self.batch_sizes.append(len(crops))
+            return np.asarray(0.0, dtype=np.float32)
+
+    recogniser = ScalarRecogniser()
+    backend = InsightFaceBackend(Settings(embedding_flip_tta=False))
+    backend._app = SimpleNamespace(models={"recognition": recogniser})
+
+    embedded = backend.embed_faces(
+        np.zeros((400, 400, 3), dtype=np.uint8), [_landmarked_face()]
+    )
+
+    assert embedded == []
+    assert recogniser.batch_sizes == [1]

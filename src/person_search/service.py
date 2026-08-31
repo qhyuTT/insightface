@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
@@ -51,6 +52,7 @@ from .tracker import ByteTracker
 from .video import LatestFrameReader
 
 MAX_TARGET_NAME_LENGTH = 80
+MAX_REQUEST_ID_LENGTH = 128
 STOP_WAIT_SECONDS = 15.0
 # Global motion is estimated on a downscaled grayscale frame: a couple of
 # milliseconds, and translation of a whole scene survives the downsample intact.
@@ -59,6 +61,7 @@ MOTION_ESTIMATE_WIDTH = 320
 # not a translation of each other (a cut, a reconnect, a fast rotation), and a
 # fabricated shift is worse for association than no shift at all.
 MOTION_MIN_RESPONSE = 0.05
+logger = logging.getLogger(__name__)
 
 
 class EventHub:
@@ -83,10 +86,29 @@ class EventHub:
             return envelope
 
     def after(self, seq: int, timeout: float = 1.0) -> list[dict[str, Any]]:
+        events, _, _ = self.after_with_meta(seq, timeout=timeout)
+        return events
+
+    def after_with_meta(
+        self, seq: int, timeout: float = 1.0
+    ) -> tuple[list[dict[str, Any]], bool, int | None]:
+        """Return events plus whether the requested cursor has fallen behind.
+
+        The original ``after`` API is intentionally kept for callers that only
+        need a list.  Replay-aware clients can use the metadata to reconcile a
+        cursor that was evicted from the bounded history instead of silently
+        assuming that the stream is complete.
+        """
         with self._condition:
             if not any(item["seq"] > seq for item in self._events):
                 self._condition.wait(timeout=timeout)
-            return [item.copy() for item in self._events if item["seq"] > seq]
+            oldest_seq = self._events[0]["seq"] if self._events else None
+            gap = oldest_seq is not None and seq < oldest_seq - 1
+            return (
+                [item.copy() for item in self._events if item["seq"] > seq],
+                gap,
+                oldest_seq,
+            )
 
 
 class PreviewHub:
@@ -118,6 +140,13 @@ class PreviewHub:
     def unsubscribe(self) -> None:
         with self._condition:
             self._subscribers = max(0, self._subscribers - 1)
+
+    def clear(self) -> None:
+        """Release the retained JPEG when a session reaches its terminal state."""
+        with self._condition:
+            self._jpeg = None
+            self._seq += 1
+            self._condition.notify_all()
 
     @property
     def has_subscribers(self) -> bool:
@@ -151,11 +180,27 @@ class SearchSession:
 
     def __post_init__(self) -> None:
         if self.targets is None:
-            self.targets = [self.target] if self.target is not None else []
-        if not self.targets:
+            incoming_targets = [self.target] if self.target is not None else []
+        else:
+            incoming_targets = list(self.targets)
+        if not incoming_targets:
             raise ValueError("at least one target is required")
-        if self.target is None:
-            self.target = self.targets[0]
+        # A session owns its gallery.  SearchManager may still have the same
+        # Target objects in its enrollment store while the worker is running;
+        # copying here means terminal cleanup can release biometric arrays
+        # without zeroing a manager/external reference that is about to be used
+        # for another request.
+        self.targets = [_clone_target(target) for target in incoming_targets]
+        primary_id = self.target.target_id if self.target is not None else self.targets[0].target_id
+        self.target = next(
+            (target for target in self.targets if target.target_id == primary_id),
+            self.targets[0],
+        )
+        self._target_metadata = tuple(
+            (target.target_id, target.name) for target in self.targets
+        )
+        self._primary_target_id = self.target.target_id
+        self._primary_target_name = self.target.name
         self.status = SearchStatus.INITIALIZING
         self.error: str | None = None
         self.metrics = SearchMetrics()
@@ -198,6 +243,18 @@ class SearchSession:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._reader: LatestFrameReader | None = None
+        # A failed queue flush is retained for the next idempotent cleanup pass;
+        # dropping the only reference after an exception would turn a transient
+        # reader failure into a permanent buffer leak.
+        self._reader_cleanup_pending: object | None = None
+        # ``clear_sensitive_state`` may detach the reader while a worker is
+        # still in its startup path (for example when shutdown races
+        # ``LatestFrameReader.start``).  Keep a separate tombstone so the
+        # worker cannot publish a fresh reader reference after cleanup has
+        # already claimed the old one.
+        self._reader_detached = False
+        self._reader_stop_lock = threading.Lock()
+        self._reader_stop_succeeded = False
         self._lock = threading.RLock()
         self._track_states: dict[int, tuple[str, float]] = {}
         self._shadow_tracks: set[int] = set()
@@ -205,10 +262,16 @@ class SearchSession:
         # currently backed off for.
         self._roi_misses: dict[int, int] = {}
         self._roi_skips: dict[int, int] = {}
+        self._roi_last_pass: dict[int, int] = {}
+        self._roi_schedule_counter = 0
         # The size tier each live track is judged by. Held here rather than per
         # target because the tier follows the observation, and every target has to
         # resolve the hysteresis margin against the same answer.
         self._track_tiers: dict[int, str] = {}
+        # Incremented whenever the reader reports a source loss. The worker
+        # consumes this generation and resets temporal state so track ids and
+        # evidence never cross a reconnect boundary.
+        self._source_epoch = 0
         # Loop credit for opportunistic stages. Cheap frames bank headroom, an
         # expensive optional pass spends it. See _roi_fits_budget.
         self._budget_credit = 0.0
@@ -230,12 +293,40 @@ class SearchSession:
         self._discarded_evidence: set[str] = set()
         self._evidence_cleanup_timer: threading.Timer | None = None
         self._evidence_cleanup_generation = 0
+        self._sensitive_cleared = False
+        # A stop/shutdown may time out while capture or inference is blocked.
+        # Keep a single daemon watcher so the terminal cleanup is retried after
+        # the worker finally exits (and so a transient cleanup failure does not
+        # become a permanent biometric-buffer leak).
+        self._sensitive_cleanup_watcher: threading.Thread | None = None
+        self._finished_at: float | None = None
 
     def start(self) -> None:
         self._worker = threading.Thread(
             target=self._run, name=f"search-{self.search_id[:8]}", daemon=True
         )
         self._worker.start()
+
+    def _stop_reader_once(self, reader: object) -> None:
+        """Stop one reader at most once after a successful call.
+
+        ``stop`` can be reached concurrently from an API request, the worker
+        finalizer, and deferred sensitive cleanup. Serializing the call avoids
+        duplicate joins (which can each wait several seconds) while retaining a
+        failed call for a later retry.
+        """
+        with self._reader_stop_lock:
+            with self._lock:
+                if self._reader_stop_succeeded:
+                    return
+            stop_reader = getattr(reader, "stop", None)
+            if stop_reader is None:
+                with self._lock:
+                    self._reader_stop_succeeded = True
+                return
+            stop_reader()
+            with self._lock:
+                self._reader_stop_succeeded = True
 
     @property
     def finished(self) -> threading.Event:
@@ -249,13 +340,19 @@ class SearchSession:
         # intentionally keeps the bytes until their TTL or an acknowledgement.
         self.clear_evidence()
         self._transition(SearchStatus.STOPPING, None)
-        if self._reader:
-            self._reader.stop()
+        with self._lock:
+            reader = self._reader
+        if reader is not None:
+            try:
+                self._stop_reader_once(reader)
+            except Exception as exc:  # noqa: BLE001 - worker finalizer still owns terminal cleanup
+                logger.warning("reader stop request failed: %s", type(exc).__name__)
         if (
             self._worker
             and self._worker is not threading.current_thread()
             and not self._finished.wait(timeout=timeout)
         ):
+            self.defer_sensitive_cleanup()
             raise SearchStopTimeoutError("搜索线程未能在停止时限内退出；请稍后重试或重启识别服务")
 
     def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
@@ -344,6 +441,388 @@ class SearchSession:
             for result in self._confirmed_results:
                 if result.get("evidence_id"):
                     result["evidence_available"] = False
+        # A stop/timeout can leave the capture worker winding down for a few
+        # seconds. Release the latest annotated frame immediately rather than
+        # retaining it until that worker reaches its finalizer. Preview cleanup
+        # is auxiliary; a broken viewer must never abort evidence cleanup.
+        try:
+            self.preview.clear()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("preview clear failed: %s", type(exc).__name__)
+
+    def clear_sensitive_state(self) -> None:
+        """Release biometric arrays while retaining a JSON-safe terminal view.
+
+        Completed sessions stay queryable for request reconciliation and event
+        replay.  They must not, however, keep the enrolled target embeddings or
+        per-track ArcFace evidence alive for the entire process lifetime.
+        """
+        reader: LatestFrameReader | None = None
+        worker_for_retry: object | None = None
+        cleanup_complete = True
+
+        def cleanup_failed(label: str, exc: Exception) -> None:
+            nonlocal cleanup_complete
+            cleanup_complete = False
+            logger.warning("%s cleanup failed: %s", label, type(exc).__name__)
+
+        with self._lock:
+            if self._sensitive_cleared:
+                return
+            worker = getattr(self, "_worker", None)
+            try:
+                finished = self._finished.is_set()
+            except Exception:  # noqa: BLE001 - legacy sessions may omit the event
+                finished = False
+            if (
+                _worker_is_alive(worker)
+                and worker is not threading.current_thread()
+                and not finished
+            ):
+                # Never wipe a gallery while another thread may still be inside
+                # provider inference. The caller's stop/shutdown path signals
+                # the worker first; the watcher then retries after its terminal
+                # event. A worker invoking this method from its own finalizer is
+                # the one safe exception.
+                try:
+                    self.defer_sensitive_cleanup()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("sensitive cleanup deferral failed: %s", type(exc).__name__)
+                return
+            # Claim the reader slot before touching any other component.  The
+            # worker may still be between construction and ``self._reader =``;
+            # ``_reader_detached`` makes that startup path observe the claim and
+            # stop its local reader instead of attaching a reference after this
+            # cleanup pass.
+            reader = (
+                self._reader_cleanup_pending
+                if self._reader_cleanup_pending is not None
+                else self._reader
+            )
+            self._reader = None
+            self._reader_cleanup_pending = None
+            self._reader_detached = True
+            targets_by_identity: dict[int, Target] = {}
+            # Legacy/integration callers may hand a session a malformed target
+            # container. Discover each source independently so one broken
+            # dictionary/list cannot prevent the remaining buffers from being
+            # wiped (or the reader/preview from being detached below).
+            def read_attr(name: str, default: object, label: str) -> object:
+                try:
+                    return getattr(self, name, default)
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failed(label, exc)
+                    return default
+
+            def discover_targets(value: object, label: str) -> list[Target]:
+                try:
+                    if isinstance(value, dict):
+                        return list(value.values())
+                    return list(value or ())  # type: ignore[arg-type]
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failed(label, exc)
+                    return []
+
+            for label, value in (
+                ("target discovery", read_attr("targets", [], "target discovery")),
+                (
+                    "identity target discovery",
+                    read_attr("_identity_targets", {}, "identity target discovery"),
+                ),
+                (
+                    "active target discovery",
+                    read_attr("_active_targets", {}, "active target discovery"),
+                ),
+            ):
+                for target in discover_targets(value, label):
+                    try:
+                        targets_by_identity[id(target)] = target
+                    except Exception as exc:  # noqa: BLE001
+                        cleanup_failed("target discovery", exc)
+            try:
+                primary_target = read_attr("target", None, "primary target discovery")
+                if primary_target is not None:
+                    targets_by_identity[id(primary_target)] = primary_target
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("primary target discovery", exc)
+            for target in targets_by_identity.values():
+                try:
+                    _wipe_array(target.embedding)
+                except Exception as exc:  # noqa: BLE001 - defensive for legacy targets
+                    cleanup_failed("target embedding", exc)
+
+            try:
+                confirmations = list(read_attr("_confirmations", {}, "confirmation discovery").values())  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("confirmation discovery", exc)
+                confirmations = []
+            for confirmation in confirmations:
+                try:
+                    confirmation.clear_sensitive()
+                except Exception as exc:  # noqa: BLE001 - one stale track must not block the rest
+                    cleanup_failed("confirmation", exc)
+
+            # Keep scalar target/status metadata available for terminal views and
+            # for callers that inspect a session after the worker exits, but
+            # replace every gallery value with an embedding-free copy.  Clearing
+            # the dictionaries outright made a completed batch look as if its
+            # unfound targets had never existed and broke the long-standing
+            # identity-competition diagnostics.
+            def metadata_target(target: Target) -> Target:
+                """Return an embedding-free copy even for a malformed legacy target."""
+                try:
+                    return _clone_target(target, include_embedding=False)
+                except Exception as exc:  # noqa: BLE001 - retain scalar metadata if possible
+                    cleanup_failed("target snapshot", exc)
+                    try:
+                        return Target(
+                            target_id=target.target_id,
+                            embedding=None,
+                            view=target.view,
+                            name=target.name,
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        cleanup_failed("target snapshot fallback", fallback_exc)
+                        # Keep a last-resort legacy object only after severing
+                        # its embedding reference.  A failed snapshot must not
+                        # leave a credential-bearing ndarray attached forever;
+                        # the failed flag below permits a later retry.
+                        try:
+                            target.embedding = None
+                        except Exception as detach_exc:  # noqa: BLE001
+                            cleanup_failed("target embedding detach", detach_exc)
+                        return target
+
+            def metadata_gallery(value: object, label: str) -> dict[str, Target]:
+                try:
+                    items = list(value.items())  # type: ignore[union-attr]
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failed(label, exc)
+                    return {}
+                snapshot: dict[str, Target] = {}
+                for target_id, target in items:
+                    try:
+                        snapshot[target_id] = metadata_target(target)
+                    except Exception as exc:  # noqa: BLE001
+                        cleanup_failed(label, exc)
+                return snapshot
+
+            try:
+                self._identity_targets = metadata_gallery(
+                    read_attr("_identity_targets", {}, "identity gallery snapshot"),
+                    "identity gallery snapshot",
+                )
+            except Exception as exc:  # noqa: BLE001 - continue with other buffers
+                cleanup_failed("identity gallery snapshot", exc)
+            try:
+                self._active_targets = metadata_gallery(
+                    read_attr("_active_targets", {}, "active gallery snapshot"),
+                    "active gallery snapshot",
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("active gallery snapshot", exc)
+            try:
+                self.targets = [
+                    metadata_target(target)
+                    for target in discover_targets(
+                        read_attr("targets", [], "target list snapshot"),
+                        "target list snapshot",
+                    )
+                ]
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("target list snapshot", exc)
+            try:
+                primary_target = read_attr("target", None, "primary target snapshot")
+                if primary_target is not None:
+                    self.target = metadata_target(primary_target)
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("primary target snapshot", exc)
+
+            try:
+                debug_faces = list(read_attr("_debug_faces", [], "debug face discovery"))
+            except Exception as exc:  # noqa: BLE001 - malformed legacy debug storage
+                cleanup_failed("debug face discovery", exc)
+                debug_faces = []
+            for item in debug_faces:
+                try:
+                    face, _, _ = item
+                    _wipe_array(face.embedding)
+                    _wipe_array(face.bbox)
+                    _wipe_array(face.landmarks)
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failed("debug face", exc)
+            try:
+                self._debug_faces.clear()
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("debug face storage", exc)
+                try:
+                    self._debug_faces = []
+                except Exception as fallback_exc:  # noqa: BLE001
+                    cleanup_failed("debug face storage fallback", fallback_exc)
+            for label, attr in (
+                ("deferred event storage", "_deferred_events"),
+                ("ROI miss storage", "_roi_misses"),
+                ("ROI skip storage", "_roi_skips"),
+                ("track tier storage", "_track_tiers"),
+            ):
+                try:
+                    value = read_attr(attr, {}, label)
+                    value.clear()
+                except Exception as exc:  # noqa: BLE001
+                    cleanup_failed(label, exc)
+                    try:
+                        setattr(
+                            self,
+                            attr,
+                            {} if attr.endswith(("misses", "skips", "tiers")) else [],
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        cleanup_failed(f"{label} fallback", fallback_exc)
+            self._roi_last_pass = {}
+            self._roi_schedule_counter = 0
+            # Tracker memories contain bbox/velocity arrays tied to decoded
+            # frames. They are not biometric embeddings, but resetting both
+            # trackers releases those frame references along the same lifecycle
+            # boundary.
+            try:
+                read_attr("_tracker", None, "person tracker discovery").reset()  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                cleanup_failed("person tracker", exc)
+            try:
+                read_attr("_face_tracker", None, "face tracker discovery").reset()  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                cleanup_failed("face tracker", exc)
+            self._budget_credit = 0.0
+            self._motion_hanning = None
+            try:
+                self.source = _sanitize_source(read_attr("source", None, "source discovery"))  # type: ignore[arg-type]
+            except Exception as exc:  # noqa: BLE001 - source must not retain credentials
+                cleanup_failed("source sanitization", exc)
+                # Source validation should make this unreachable, but lifecycle
+                # cleanup must remain best-effort even for legacy sessions.
+                try:
+                    # ``model_copy(update=...)`` does not revalidate and a
+                    # malformed legacy object could return the original URI.
+                    # Use a freshly validated local-camera placeholder so no
+                    # RTSP credentials (or an arbitrary file path) survive.
+                    self.source = SourceConfig(type=SourceType.CAMERA, device_index=0)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    cleanup_failed("source sanitization fallback", fallback_exc)
+                    try:
+                        # ``model_construct`` is deliberately the final escape
+                        # hatch for a monkeypatched/legacy validator; its fields
+                        # are explicit and contain no caller-controlled URI.
+                        self.source = SourceConfig.model_construct(
+                            type=SourceType.CAMERA,
+                            uri=None,
+                            device_index=0,
+                            debug_preview=False,
+                        )
+                    except Exception as placeholder_exc:  # noqa: BLE001
+                        cleanup_failed("source sanitization placeholder", placeholder_exc)
+            worker_for_retry = self._worker
+
+        if reader is not None:
+            reader_cleanup_failed = False
+            try:
+                self._stop_reader_once(reader)
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failed("reader stop", exc)
+                reader_cleanup_failed = True
+            try:
+                clear_reader = getattr(reader, "clear", None)
+                if clear_reader is not None:
+                    clear_reader()
+            except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+                cleanup_failed("reader buffer", exc)
+                reader_cleanup_failed = True
+            if reader_cleanup_failed:
+                with self._lock:
+                    self._reader_cleanup_pending = reader
+        try:
+            self.preview.clear()
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            cleanup_failed("preview", exc)
+        with self._lock:
+            # Do not make a partial wipe look complete.  A later lifecycle pass
+            # (or the deferred watcher) must be allowed to retry failed actions.
+            if self._reader_cleanup_pending is not None:
+                cleanup_complete = False
+            self._sensitive_cleared = cleanup_complete
+        if not cleanup_complete and _worker_is_alive(worker_for_retry):
+            # The worker finalizer can reach this method before publishing its
+            # ``finished`` event. Arrange a retry on the watcher rather than
+            # recursively calling cleanup on the worker thread itself.
+            self.defer_sensitive_cleanup()
+
+    def defer_sensitive_cleanup(self) -> None:
+        """Retry sensitive cleanup once a timed-out worker has exited.
+
+        Wiping arrays while inference is still executing can race the provider,
+        so a stop timeout does not forcefully mutate live state.  A daemon waiter
+        instead follows the worker's terminal event and retries the idempotent
+        cleanup routine. Sessions that never started (or whose thread is already
+        dead) are cleaned synchronously.
+        """
+        with self._lock:
+            if self._sensitive_cleared:
+                return
+            worker = self._worker
+            worker_alive = _worker_is_alive(worker)
+            watcher = self._sensitive_cleanup_watcher
+            if worker_alive and watcher is not None:
+                try:
+                    watcher_alive = watcher.is_alive()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("sensitive cleanup watcher liveness failed: %s", type(exc).__name__)
+                    watcher_alive = False
+                # A watcher object is published before ``start`` so a second
+                # concurrent caller cannot create a duplicate. ``ident`` is
+                # still ``None`` during that tiny hand-off window.
+                watcher_started = getattr(watcher, "ident", None) is not None
+                if watcher_alive or not watcher_started:
+                    return
+            if worker_alive:
+                watcher = threading.Thread(
+                    target=self._wait_and_clear_sensitive,
+                    name=f"cleanup-{self.search_id[:8]}",
+                    daemon=True,
+                )
+                self._sensitive_cleanup_watcher = watcher
+            else:
+                watcher = None
+        if watcher is None:
+            try:
+                self.clear_sensitive_state()
+            except Exception as exc:  # noqa: BLE001 - caller must retain original error
+                logger.warning("sensitive cleanup retry failed: %s", type(exc).__name__)
+            return
+        try:
+            watcher.start()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                if self._sensitive_cleanup_watcher is watcher:
+                    self._sensitive_cleanup_watcher = None
+            logger.warning("sensitive cleanup watcher start failed: %s", type(exc).__name__)
+            try:
+                self.clear_sensitive_state()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("sensitive cleanup fallback failed: %s", type(cleanup_exc).__name__)
+
+    def _wait_and_clear_sensitive(self) -> None:
+        # Normally ``_finished`` is set by the worker finalizer.  If thread
+        # startup failed before entering ``_run``, however, the event may never
+        # be published; observing the thread liveness keeps that rare path from
+        # retaining sensitive state forever.
+        while not self._finished.wait(timeout=0.5):
+            with self._lock:
+                worker = self._worker
+                if not _worker_is_alive(worker):
+                    break
+        try:
+            self.clear_sensitive_state()
+        except Exception as exc:  # noqa: BLE001 - final cleanup is best effort
+            logger.warning("deferred sensitive cleanup failed: %s", type(exc).__name__)
 
     def cleanup_expired_evidence(self) -> int:
         """Drop expired JPEGs and return the number removed.
@@ -461,17 +940,17 @@ class SearchSession:
             metrics = self.metrics.snapshot()
             target_views = [
                 TargetSearchView(
-                    target_id=target.target_id,
-                    name=target.name,
-                    **self._target_status[target.target_id],
+                    target_id=target_id,
+                    name=name,
+                    **self._target_status[target_id],
                 )
-                for target in self.targets
+                for target_id, name in self._target_metadata
             ]
             found_count = sum(item.status == "found" for item in target_views)
             return SearchView(
                 search_id=self.search_id,
-                target_id=self.target.target_id,
-                target_name=self.target.name,
+                target_id=self._primary_target_id,
+                target_name=self._primary_target_name,
                 status=self.status,
                 source=_sanitize_source(self.source),
                 provider=f"face={self.face_backend.provider_name},person={self.person_detector.provider_name}",
@@ -537,11 +1016,20 @@ class SearchSession:
             "roi_face_detection_size": settings.roi_face_detection_size,
             "roi_face_detection_max_size": settings.roi_face_detection_max_size,
             "roi_max_tracks_per_pass": settings.roi_max_tracks_per_pass,
+            # Runtime cost guards.  ``getattr`` keeps views readable for sessions
+            # created by older callers that supply a pre-hardening Settings object.
+            "roi_batch_enabled": bool(getattr(settings, "roi_batch_enabled", True)),
+            "roi_batch_size": int(getattr(settings, "roi_batch_size", 8)),
+            "arcface_micro_batch_size": int(
+                getattr(settings, "arcface_micro_batch_size", 16)
+            ),
+            "max_faces_per_frame": int(getattr(settings, "max_faces_per_frame", 64)),
             "match_profile": settings.match_profile,
             "evidence_statistic": settings.evidence_statistic,
             "evidence_top_k": settings.evidence_top_k,
             "face_tier_hysteresis_px": settings.face_tier_hysteresis_px,
             "camera_motion_compensation": settings.camera_motion_compensation,
+            "source_epoch": self._source_epoch,
             "embedding_flip_tta": settings.embedding_flip_tta,
             "similarity_threshold": settings.similarity_threshold,
             "small_face_similarity_threshold": settings.small_face_similarity_threshold,
@@ -589,13 +1077,40 @@ class SearchSession:
 
     def _run(self) -> None:
         self.metrics.started_at = time.monotonic()
-        reader = LatestFrameReader(
-            self.source,
-            self.settings,
-            on_status=self._transition,
-            on_drop=self._on_drop,
-        )
-        self._reader = reader
+        try:
+            reader = LatestFrameReader(
+                self.source,
+                self.settings,
+                on_status=self._on_reader_status,
+                on_drop=self._on_drop,
+            )
+        except Exception as exc:  # noqa: BLE001 - startup failures must still release the slot
+            self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
+            self._finished_at = time.monotonic()
+            target_ids = [target.target_id for target in self.targets]
+            try:
+                self.on_finished(self.search_id, target_ids)
+            except Exception as callback_exc:  # noqa: BLE001
+                logger.warning("search completion callback failed: %s", type(callback_exc).__name__)
+            try:
+                self._publish_terminal_event()
+            except Exception as event_exc:  # noqa: BLE001
+                logger.warning("terminal event publication failed: %s", type(event_exc).__name__)
+            try:
+                self.clear_sensitive_state()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("sensitive state cleanup failed: %s", type(cleanup_exc).__name__)
+            self._finished.set()
+            return
+        # Publish the reader under the same lock used by stop/terminal cleanup.
+        # A stop can arrive before the worker reaches this line; in that case
+        # cleanup has already detached the slot and the newly-created reader
+        # must be stopped locally instead of being attached after the fact.
+        attach_reader = False
+        with self._lock:
+            if not self._reader_detached and not self._stop.is_set():
+                self._reader = reader
+                attach_reader = True
         tracks: list[Track] = []
         last_person_at = -1e9
         last_face_at = -1e9
@@ -628,8 +1143,16 @@ class SearchSession:
         deep_scan_every_n = self.settings.face_deep_scan_every_n
         face_pass_index = 0
         previous_motion_gray: np.ndarray | None = None
+        seen_source_epoch = -1
         try:
-            reader.start()
+            if attach_reader:
+                reader.start()
+            else:
+                # A concurrent stop/cleanup claimed the reader slot before the
+                # worker could attach it.  Do not start a detached capture
+                # thread; the surrounding ``finally`` still drives the normal
+                # terminal transition and cleanup path.
+                self._stop.set()
             while not self._stop.is_set():
                 if (
                     self.timeout_seconds is not None
@@ -642,10 +1165,35 @@ class SearchSession:
                     if reader.ended.is_set():
                         break
                     continue
+                packet_epoch = getattr(packet, "source_epoch", None)
+                with self._lock:
+                    source_epoch = (
+                        int(packet_epoch)
+                        if isinstance(packet_epoch, (int, np.integer))
+                        else self._source_epoch
+                    )
+                if source_epoch != seen_source_epoch:
+                    self._reset_temporal_state()
+                    tracks = []
+                    previous_motion_gray = None
+                    seen_source_epoch = source_epoch
+                    # Never let a reconnect wait for the previous cadence
+                    # deadline before running the mandatory stages on its first
+                    # fresh frame.
+                    last_person_at = -1e9
+                    last_face_at = -1e9
+                    last_roi_face_at = -1e9
+                    last_preview_at = -1e9
+                    face_pass_index = 0
                 started = time.monotonic()
                 now = packet.captured_at
                 with self._lock:
                     self.metrics.frame_height, self.metrics.frame_width = packet.frame.shape[:2]
+                # Face/track association is deterministic for a given detection
+                # list and track snapshot.  Keep the full-frame result keyed by
+                # observation identity so the common no-ROI path does not run the
+                # same Hungarian/greedy matcher twice in one frame.
+                association_cache: dict[int, tuple[int, str]] = {}
                 if now - last_person_at >= 1.0 / max(person_hz, 0.1):
                     stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
@@ -674,7 +1222,9 @@ class SearchSession:
                     self._record_face_source("full_frame", len(faces))
                     last_face_at = now
                     roi_clock = time.monotonic()
-                    roi_tracks = self._tracks_needing_roi_face_pass(faces, tracks)
+                    roi_tracks = self._tracks_needing_roi_face_pass(
+                        faces, tracks, association_cache=association_cache
+                    )
                     if (
                         roi_face_hz > 0
                         and roi_clock - last_roi_face_at >= 1.0 / roi_face_hz
@@ -686,8 +1236,18 @@ class SearchSession:
                         self._record_stage("face_roi", stage_started)
                         self._record_face_source("roi", len(roi_faces))
                         faces = _merge_faces(faces, roi_faces)
-                        last_roi_face_at = roi_clock
+                        # Rate-limit from completion time: a long ROI inference
+                        # must not make the next pass immediately eligible and
+                        # create a burst on top of the still-running loop.
+                        last_roi_face_at = time.monotonic()
                     self._record_face_metrics(faces)
+
+                # A source loss may race an in-flight inference. Do not commit
+                # observations from the old connection to the new temporal state.
+                with self._lock:
+                    epoch_changed = self._source_epoch != source_epoch
+                if epoch_changed:
+                    continue
 
                 # ArcFace runs once, here, and only on faces that survived dedup and
                 # the quality gate. Detections thrown away by _merge_faces or
@@ -695,17 +1255,40 @@ class SearchSession:
                 matchable = [
                     face for face in faces if SearchSession._is_face_matchable(self, face)
                 ]
+                matchable_before_budget = matchable
+                matchable = self._limit_matchable_faces(
+                    matchable, tracks, association_cache=association_cache
+                )
+                budget_limited = len(matchable) != len(matchable_before_budget)
                 if matchable:
                     stage_started = time.monotonic()
-                    accepted_faces = self.face_backend.embed_faces(packet.frame, matchable)
+                    accepted_faces = self._embed_faces_microbatched(packet.frame, matchable)
                     self._record_stage("face_embed", stage_started)
                 else:
                     accepted_faces = []
-                self._record_target_observations(accepted_faces)
+                with self._lock:
+                    epoch_changed = self._source_epoch != source_epoch
+                if epoch_changed:
+                    continue
+                # Compute identity ranking once per face and share it between the
+                # diagnostics pass and the confirmation pass below.  This is
+                # especially valuable for a 20-target gallery where each ranking
+                # otherwise performs a complete dot-product + sort twice.
+                ranked_matches_by_face = {
+                    id(face): self._rank_identity_matches(face) for face in accepted_faces
+                }
+                self._record_target_observations(
+                    accepted_faces, ranked_matches_by_face=ranked_matches_by_face
+                )
                 self._record_rejected_observations(
                     [face for face in faces if not SearchSession._is_face_matchable(self, face)]
                 )
-                detailed = associate_faces_to_tracks_detailed(accepted_faces, tracks)
+                detailed = self._cached_associations(
+                    accepted_faces,
+                    tracks,
+                    association_cache,
+                    allow_cache=not budget_limited,
+                )
                 association_by_face = {
                     face_index: track_id for face_index, (track_id, _) in detailed.items()
                 }
@@ -782,7 +1365,7 @@ class SearchSession:
                 for face_index, face in enumerate(accepted_faces):
                     if not self._active_targets:
                         break
-                    ranked_matches = self._rank_identity_matches(face)
+                    ranked_matches = ranked_matches_by_face.get(id(face), ())
                     if not ranked_matches:
                         continue
                     target_id, similarity = ranked_matches[0]
@@ -946,19 +1529,39 @@ class SearchSession:
         except Exception as exc:  # noqa: BLE001 - the worker must fail closed and release resources
             self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
         finally:
-            reader.stop()
-            if self._stop_requested or self.status not in (
-                SearchStatus.FAILED,
-                SearchStatus.STOPPED,
-                SearchStatus.COMPLETED,
-                SearchStatus.TIMED_OUT,
-            ):
-                self._transition(SearchStatus.STOPPED, None, publish=False)
             try:
-                self.on_finished(self.search_id, [target.target_id for target in self.targets])
+                try:
+                    self._stop_reader_once(reader)
+                except Exception:  # noqa: BLE001 - cleanup must continue if capture teardown fails
+                    self._transition(
+                        SearchStatus.FAILED,
+                        "video source cleanup failed",
+                        publish=False,
+                    )
+                if self._stop_requested or self.status not in (
+                    SearchStatus.FAILED,
+                    SearchStatus.STOPPED,
+                    SearchStatus.COMPLETED,
+                    SearchStatus.TIMED_OUT,
+                ):
+                    self._transition(SearchStatus.STOPPED, None, publish=False)
             finally:
-                self._publish_terminal_event()
-                self._finished.set()
+                target_ids = [target.target_id for target in self.targets]
+                self._finished_at = time.monotonic()
+                try:
+                    self.on_finished(self.search_id, target_ids)
+                except Exception as exc:  # noqa: BLE001 - callback failures are isolated
+                    logger.warning("search completion callback failed: %s", type(exc).__name__)
+                try:
+                    self._publish_terminal_event()
+                except Exception as exc:  # noqa: BLE001 - terminal cleanup must still run
+                    logger.warning("terminal event publication failed: %s", type(exc).__name__)
+                try:
+                    self.clear_sensitive_state()
+                except Exception as exc:  # noqa: BLE001 - best-effort memory cleanup
+                    logger.warning("sensitive state cleanup failed: %s", type(exc).__name__)
+                finally:
+                    self._finished.set()
 
     def _publish_preview(
         self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
@@ -1174,12 +1777,22 @@ class SearchSession:
             self.metrics.stage_latencies_ms.setdefault(stage, []).append(latency_ms)
             self.metrics.stage_call_counts[stage] = self.metrics.stage_call_counts.get(stage, 0) + 1
 
-    def _record_target_observations(self, faces: list[FaceObservation]) -> None:
+    def _record_target_observations(
+        self,
+        faces: list[FaceObservation],
+        *,
+        ranked_matches_by_face: dict[int, list[tuple[str, float]]] | None = None,
+    ) -> None:
         if not faces or not self._active_targets:
             return
         best_in_frame: dict[str, tuple[float, FaceObservation]] = {}
         for face in faces:
-            for target_id, similarity in self._rank_identity_matches(face):
+            ranked = (
+                ranked_matches_by_face.get(id(face))
+                if ranked_matches_by_face is not None
+                else self._rank_identity_matches(face)
+            )
+            for target_id, similarity in ranked or ():
                 if target_id not in self._active_targets:
                     continue
                 previous = best_in_frame.get(target_id)
@@ -1222,18 +1835,294 @@ class SearchSession:
                     current["last_rejection_reason"] = ",".join(largest.rejection_reasons)
                     current["last_rejection_face_px"] = largest.short_side
 
+    def _limit_matchable_faces(
+        self,
+        faces: list[FaceObservation],
+        tracks: list[Track],
+        *,
+        association_cache: dict[int, tuple[int, str]] | None = None,
+    ) -> list[FaceObservation]:
+        """Apply a per-frame ArcFace budget while preserving useful evidence.
+
+        Crowded frames can contain hundreds of detector boxes.  Sending all of
+        them to ArcFace creates a latency/VRAM spike that then starves the
+        confirmation sampler.  Faces owned by a live person track are retained
+        ahead of unassociated faces; within each group larger, sharper and
+        higher-confidence observations win.  The original observation order is
+        restored after selection so downstream association and event payloads
+        remain deterministic.
+        """
+        if not faces:
+            return []
+        configured = getattr(self.settings, "max_faces_per_frame", len(faces))
+        try:
+            limit = max(1, int(configured))
+        except (TypeError, ValueError):
+            limit = len(faces)
+        if len(faces) <= limit:
+            return faces
+
+        cache = association_cache if association_cache is not None else {}
+        cache_method = getattr(self, "_cached_associations", None)
+        if callable(cache_method):
+            detailed = cache_method(faces, tracks, cache)
+        else:
+            detailed = SearchSession._cached_associations(self, faces, tracks, cache)
+        associated = {face_index: value for face_index, value in detailed.items()}
+
+        def priority(item: tuple[int, FaceObservation]) -> tuple[object, ...]:
+            index, face = item
+            association = associated.get(index)
+            track_id = association[0] if association is not None else None
+            state = getattr(self, "_track_states", {}).get(track_id, ("tracking", 0.0))[0]
+            # A candidate/shadow track already carrying evidence is more valuable
+            # than a fresh tracking box.  Confirmed tracks are normally excluded
+            # from ROI, but keeping their face here is harmless and deterministic.
+            state_rank = {"candidate": 0, "shadow": 0, "confirmed": 1}.get(state, 2)
+            return (
+                0 if association is not None and association[1] == "person_strict" else (
+                    1 if association is not None else 2
+                ),
+                state_rank,
+                -face.short_side,
+                -float(face.quality),
+                -float(face.detection_score),
+                index,
+            )
+
+        selected_indices = {
+            index for index, _ in sorted(enumerate(faces), key=priority)[:limit]
+        }
+        dropped = len(faces) - len(selected_indices)
+        with self._lock:
+            if hasattr(self.metrics, "faces_dropped_by_budget"):
+                self.metrics.faces_dropped_by_budget += dropped
+        return [face for index, face in enumerate(faces) if index in selected_indices]
+
+    def _embed_faces_microbatched(
+        self, frame: np.ndarray, faces: list[FaceObservation]
+    ) -> list[FaceObservation]:
+        """Run ArcFace in bounded chunks, with an OOM-aware split fallback."""
+        if not faces:
+            return []
+        configured = getattr(self.settings, "arcface_micro_batch_size", len(faces))
+        try:
+            batch_size = max(1, int(configured))
+        except (TypeError, ValueError):
+            batch_size = len(faces)
+        embedded: list[FaceObservation] = []
+        for offset in range(0, len(faces), batch_size):
+            embedded.extend(
+                self._embed_face_chunk(frame, faces[offset : offset + batch_size])
+            )
+        return embedded
+
+    def _embed_face_chunk(
+        self,
+        frame: np.ndarray,
+        faces: list[FaceObservation],
+        *,
+        split_depth: int = 0,
+    ) -> list[FaceObservation]:
+        if not faces:
+            return []
+        stop_event = getattr(self, "_stop", None)
+        if stop_event is not None and stop_event.is_set():
+            return []
+        with self._lock:
+            if hasattr(self.metrics, "embedding_batch_count"):
+                self.metrics.embedding_batch_count += 1
+        try:
+            embedded = self.face_backend.embed_faces(frame, faces)
+        except ModelUnavailableError:
+            # A missing/unloadable model is a process-level fault. Let the worker
+            # fail closed so the API exposes its actionable 503-style message.
+            raise
+        except Exception as exc:
+            if not _is_embedding_capacity_error(exc):
+                if not _is_recoverable_embedding_error(exc):
+                    raise
+                # CUDA/TensorRT can transiently reject one execution (for example
+                # after a context reset) even though the next frame is usable. Drop
+                # this chunk and keep the search alive; a counter makes the degraded
+                # frame visible in the existing status payload.
+                with self._lock:
+                    if hasattr(self.metrics, "embedding_failures"):
+                        self.metrics.embedding_failures += 1
+                return []
+            # Retry at most four levels deep.  This bounds the number of expensive
+            # retries while still allowing a 16-row batch to fall back to singles
+            # on a very small GPU.  Faces that still cannot be embedded are dropped
+            # for this frame; the next frame gets a fresh chance.
+            if len(faces) > 1 and split_depth < 4:
+                midpoint = max(1, len(faces) // 2)
+                return self._embed_face_chunk(
+                    frame, faces[:midpoint], split_depth=split_depth + 1
+                ) + self._embed_face_chunk(
+                    frame, faces[midpoint:], split_depth=split_depth + 1
+                )
+            with self._lock:
+                if hasattr(self.metrics, "faces_dropped_by_budget"):
+                    self.metrics.faces_dropped_by_budget += len(faces)
+            return []
+        if embedded is None:
+            with self._lock:
+                if hasattr(self.metrics, "embedding_failures"):
+                    self.metrics.embedding_failures += 1
+            return []
+        try:
+            embedded_list = list(embedded)
+        except Exception as exc:  # noqa: BLE001 - malformed provider output is a frame-local miss
+            logger.warning(
+                "embedding provider returned a non-iterable result: %s",
+                type(exc).__name__,
+            )
+            with self._lock:
+                if hasattr(self.metrics, "embedding_failures"):
+                    self.metrics.embedding_failures += 1
+            return []
+        # Most backends return ``dataclasses.replace(face, embedding=...)``.  A
+        # provider can nevertheless return a scalar, a foreign object, a NaN
+        # vector, or rows in a different order.  Reconcile only validated
+        # FaceObservation rows to the input detections; anything that cannot be
+        # mapped unambiguously is dropped for this frame.  This keeps malformed
+        # output out of association/ranking while preserving object identity for
+        # the normal path (and therefore reusing the association cache).
+        expected_dimensions: set[int] = set()
+        try:
+            gallery = getattr(self, "_identity_targets", {})
+            gallery_values = gallery.values() if isinstance(gallery, dict) else ()
+            for target in gallery_values:
+                normalized = _safe_normalize_embedding(getattr(target, "embedding", None))
+                if normalized is not None:
+                    expected_dimensions.add(normalized.size)
+        except Exception:  # noqa: BLE001 - a malformed legacy gallery must not break a frame
+            expected_dimensions.clear()
+        expected_dimension = (
+            next(iter(expected_dimensions)) if len(expected_dimensions) == 1 else None
+        )
+
+        source_boxes = [_coerce_face_bbox(getattr(face, "bbox", None)) for face in faces]
+        source_by_identity = {id(face): index for index, face in enumerate(faces)}
+        unused_sources = set(range(len(faces)))
+        assignments: dict[int, tuple[FaceObservation, np.ndarray]] = {}
+        malformed = False
+
+        for output_index, result in enumerate(embedded_list):
+            if not isinstance(result, FaceObservation):
+                malformed = True
+                continue
+            result_bbox = _coerce_face_bbox(getattr(result, "bbox", None))
+            embedding = _safe_normalize_embedding(getattr(result, "embedding", None))
+            if result_bbox is None or embedding is None:
+                malformed = True
+                continue
+            if expected_dimension is not None and embedding.size != expected_dimension:
+                malformed = True
+                continue
+
+            # Identity is the strongest mapping signal for backends that mutate
+            # the supplied observation in place.
+            source_index = source_by_identity.get(id(result))
+            if source_index is not None and source_index in unused_sources:
+                if source_boxes[source_index] is not None and np.allclose(
+                    source_boxes[source_index], result_bbox, rtol=0.0, atol=1e-3
+                ):
+                    unused_sources.remove(source_index)
+                    assignments[source_index] = (result, embedding)
+                    continue
+
+            candidates = [
+                index
+                for index in unused_sources
+                if source_boxes[index] is not None
+                and np.allclose(
+                    source_boxes[index], result_bbox, rtol=0.0, atol=1e-3
+                )
+            ]
+            # Duplicate boxes are inherently ambiguous.  An exact positional
+            # match is still safe for the common full-cardinality response;
+            # otherwise fail closed instead of assigning one person's vector to
+            # another person's detection.
+            if len(candidates) != 1:
+                positional = (
+                    output_index
+                    if output_index in unused_sources
+                    and output_index in candidates
+                    else None
+                )
+                if positional is None:
+                    malformed = True
+                    continue
+                source_index = positional
+            else:
+                source_index = candidates[0]
+            unused_sources.remove(source_index)
+            assignments[source_index] = (result, embedding)
+
+        accepted: list[FaceObservation] = []
+        for source_index in range(len(faces)):
+            item = assignments.get(source_index)
+            if item is None:
+                continue
+            _, embedding = item
+            source = faces[source_index]
+            try:
+                source.embedding = embedding
+                accepted.append(source)
+            except Exception:  # noqa: BLE001 - immutable legacy observations are copied
+                try:
+                    accepted.append(replace(source, embedding=embedding))
+                except Exception:  # noqa: BLE001 - a malformed observation is a local miss
+                    malformed = True
+
+        if malformed:
+            with self._lock:
+                if hasattr(self.metrics, "embedding_failures"):
+                    self.metrics.embedding_failures += 1
+        return accepted
+
+    def _cached_associations(
+        self,
+        faces: list[FaceObservation],
+        tracks: list[Track],
+        cache: dict[int, tuple[int, str]],
+        *,
+        allow_cache: bool = True,
+    ) -> dict[int, tuple[int, str]]:
+        """Reuse detection-time associations when the face objects are unchanged."""
+        if allow_cache and faces and cache and all(id(face) in cache for face in faces):
+            return {index: cache[id(face)] for index, face in enumerate(faces)}
+        detailed = associate_faces_to_tracks_detailed(faces, tracks)
+        for face_index, value in detailed.items():
+            if 0 <= face_index < len(faces):
+                cache[id(faces[face_index])] = value
+        return detailed
+
     def _rank_identity_matches(self, face: FaceObservation) -> list[tuple[str, float]]:
         """Rank against the immutable batch gallery, including found targets."""
-        if face.embedding is None:
+        face_embedding = _safe_normalize_embedding(getattr(face, "embedding", None))
+        if face_embedding is None:
             return []
-        return sorted(
-            (
-                (target_id, float(np.dot(target.embedding, face.embedding)))
-                for target_id, target in self._identity_targets.items()
-            ),
-            key=lambda item: item[1],
-            reverse=True,
-        )
+        ranked: list[tuple[str, float]] = []
+        try:
+            target_items = self._identity_targets.items()
+        except Exception:  # noqa: BLE001 - fail closed for malformed legacy galleries
+            return []
+        for target_id, target in target_items:
+            target_embedding = _safe_normalize_embedding(
+                getattr(target, "embedding", None)
+            )
+            if target_embedding is None or target_embedding.size != face_embedding.size:
+                continue
+            try:
+                similarity = float(np.dot(target_embedding, face_embedding))
+            except (TypeError, ValueError, OverflowError, FloatingPointError):
+                continue
+            if np.isfinite(similarity):
+                ranked.append((target_id, similarity))
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        return ranked
 
     def _record_track_outcomes(self, outcomes: list[TrackOutcome]) -> None:
         """Fold one frame's per-track post-mortems into the metrics.
@@ -1371,7 +2260,11 @@ class SearchSession:
         return self._motion_hanning
 
     def _tracks_needing_roi_face_pass(
-        self, faces: list[FaceObservation], tracks: list[Track]
+        self,
+        faces: list[FaceObservation],
+        tracks: list[Track],
+        *,
+        association_cache: dict[int, tuple[int, str]] | None = None,
     ) -> list[Track]:
         """Return tracks that do not own a preferred-size full-frame face.
 
@@ -1382,6 +2275,10 @@ class SearchSession:
             return []
         accepted = [face for face in faces if SearchSession._is_face_matchable(self, face)]
         associations = associate_faces_to_tracks_detailed(accepted, tracks)
+        if association_cache is not None:
+            for face_index, value in associations.items():
+                if 0 <= face_index < len(accepted):
+                    association_cache[id(accepted[face_index])] = value
         satisfied_track_ids = {
             track_id
             for face_index, (track_id, _) in associations.items()
@@ -1389,7 +2286,7 @@ class SearchSession:
         }
         confirmed_track_ids = {
             track_id
-            for track_id, (state, _) in self._track_states.items()
+            for track_id, (state, _) in getattr(self, "_track_states", {}).items()
             if state in ("confirmed", "shadow")
         }
         candidates: list[Track] = []
@@ -1408,12 +2305,29 @@ class SearchSession:
             key: value for key, value in self._roi_misses.items() if key in live_ids
         }
         self._roi_skips = {key: value for key, value in self._roi_skips.items() if key in live_ids}
+        last_pass = getattr(self, "_roi_last_pass", {})
+        self._roi_last_pass = {
+            key: value for key, value in last_pass.items() if key in live_ids
+        }
+        # A score-only sort lets one high-confidence track consume every pass.
+        # Older attempts are promoted first, while score remains the tie-breaker
+        # for tracks that have never been examined.  The scheduler state is kept
+        # lazily so small test stubs and legacy callers need no new fields.
+        last_pass: dict[int, int] = self._roi_last_pass
+        candidates.sort(
+            key=lambda track: (last_pass.get(track.track_id, -1), -track.score, track.track_id)
+        )
+        self._roi_last_pass = last_pass
         return candidates
 
     def _analyze_person_rois(self, frame: np.ndarray, tracks: list[Track]) -> list[FaceObservation]:
         height, width = frame.shape[:2]
-        ranked = sorted(tracks, key=lambda track: track.score, reverse=True)
-        observations: list[FaceObservation] = []
+        last_pass: dict[int, int] = getattr(self, "_roi_last_pass", {})
+        ranked = sorted(
+            tracks,
+            key=lambda track: (last_pass.get(track.track_id, -1), -track.score, track.track_id),
+        )
+        prepared: list[tuple[Track, np.ndarray, int, int, int]] = []
         analyzed_tracks = 0
         for track in ranked:
             x1, y1, x2, y2 = track.bbox.astype(int)
@@ -1426,18 +2340,40 @@ class SearchSession:
             analyzed_tracks += 1
             roi_bottom = min(y2, y1 + max(1, int(self.settings.roi_person_fraction * (y2 - y1))))
             roi = frame[y1:roi_bottom, x1:x2]
-            # A crop is already tight, so the full-frame Auto dual-scale pass would
-            # only double the cost here. Detection only — embedding happens once,
-            # later, after dedup against the full-frame results. The scale keeps a
-            # small crop upsampled while never shrinking a large one back below the
-            # pixels the crop existed to preserve.
-            found = self.face_backend.detect_faces(
-                roi,
-                enrollment=False,
-                detection_size=self.settings.roi_detection_scale(roi.shape[1], roi.shape[0]),
-            )
-            self._note_roi_outcome(track.track_id, hit=bool(found))
-            for face in found:
+            scale = self.settings.roi_detection_scale(roi.shape[1], roi.shape[0])
+            prepared.append((track, roi, x1, y1, scale))
+            # Mark the attempt before inference.  If a provider errors or returns
+            # no face, the next pass still rotates to the other tracks.
+            last_pass[track.track_id] = getattr(self, "_roi_schedule_counter", 0)
+            self._roi_schedule_counter = last_pass[track.track_id] + 1
+
+        observations_by_track: dict[int, list[FaceObservation]] = {}
+        # Keep first-seen bucket order (rather than sorting scales) so debug output
+        # and deterministic tests retain the scheduler's track order.
+        buckets: dict[int, list[tuple[Track, np.ndarray, int, int, int]]] = {}
+        for item in prepared:
+            buckets.setdefault(item[4], []).append(item)
+        batch_enabled = bool(getattr(self.settings, "roi_batch_enabled", True))
+        configured_batch_size = getattr(self.settings, "roi_batch_size", 8)
+        try:
+            batch_size = max(1, int(configured_batch_size))
+        except (TypeError, ValueError):
+            batch_size = 1
+        for scale, bucket in buckets.items():
+            for offset in range(0, len(bucket), batch_size):
+                chunk = bucket[offset : offset + batch_size]
+                rois = [item[1] for item in chunk]
+                found_lists = SearchSession._detect_roi_batch(
+                    self, rois, scale, enabled=batch_enabled
+                )
+                for item, found in zip(chunk, found_lists, strict=True):
+                    track, _, x1, y1, _ = item
+                    observations_by_track[track.track_id] = list(found)
+                    self._note_roi_outcome(track.track_id, hit=bool(found))
+
+        observations: list[FaceObservation] = []
+        for track, _, x1, y1, _ in prepared:
+            for face in observations_by_track.get(track.track_id, []):
                 observations.append(
                     replace(
                         face,
@@ -1453,6 +2389,52 @@ class SearchSession:
             self.metrics.roi_calls += analyzed_tracks
         return observations
 
+    def _detect_roi_batch(
+        self,
+        rois: list[np.ndarray],
+        scale: int,
+        *,
+        enabled: bool,
+    ) -> list[list[FaceObservation]]:
+        """Dispatch one fixed-scale ROI group, with a legacy fallback.
+
+        Third-party/fake backends written before ``detect_faces_batch`` remain
+        valid: each crop is sent through the existing method when the optional
+        capability is absent or disabled.  A malformed batch response also falls
+        back rather than dropping an entire frame.
+        """
+        if not rois:
+            return []
+        batch_method = getattr(self.face_backend, "detect_faces_batch", None)
+        if enabled and callable(batch_method):
+            try:
+                result = batch_method(
+                    rois, enrollment=False, detection_size=scale
+                )
+                if isinstance(result, list) and len(result) == len(rois):
+                    with self._lock:
+                        if hasattr(self.metrics, "roi_batch_count"):
+                            self.metrics.roi_batch_count += 1
+                    return [list(item or []) for item in result]
+            except (TypeError, AttributeError, NotImplementedError):
+                # A legacy implementation may expose a similarly named helper
+                # with a narrower signature.  Use the proven single-crop path.
+                pass
+        results: list[list[FaceObservation]] = []
+        for roi in rois:
+            results.append(
+                list(
+                    self.face_backend.detect_faces(
+                        roi, enrollment=False, detection_size=scale
+                    )
+                    or []
+                )
+            )
+        with self._lock:
+            if hasattr(self.metrics, "roi_batch_count"):
+                self.metrics.roi_batch_count += len(rois)
+        return results
+
     def _note_roi_outcome(self, track_id: int, *, hit: bool) -> None:
         """Back a track off exponentially while its ROI crop keeps coming up empty."""
         if hit:
@@ -1466,6 +2448,92 @@ class SearchSession:
     def _on_drop(self) -> None:
         with self._lock:
             self.metrics.dropped_frames += 1
+
+    def _on_reader_status(self, status: SearchStatus, error: str | None) -> None:
+        """Bridge reader status changes and mark reconnect boundaries."""
+        if self._stop.is_set() and status not in {
+            SearchStatus.STOPPING,
+            SearchStatus.STOPPED,
+            SearchStatus.FAILED,
+            SearchStatus.COMPLETED,
+            SearchStatus.TIMED_OUT,
+        }:
+            return
+        if status == SearchStatus.SOURCE_LOST:
+            with self._lock:
+                self._source_epoch += 1
+                reader = self._reader
+            # Frames decoded before the reconnect belong to the old source. Drop
+            # queued packets immediately; the worker will reset trackers and
+            # confirmation windows when it observes the incremented epoch. The
+            # getattr keeps fake/legacy readers used by integrations compatible.
+            clear_reader = getattr(reader, "clear", None)
+            if clear_reader is not None:
+                try:
+                    clear_reader()
+                except Exception as exc:  # noqa: BLE001 - a failed flush must not kill the reader thread
+                    logger.warning("source epoch reader flush failed: %s", type(exc).__name__)
+        self._transition(status, error)
+
+    def _reset_temporal_state(self) -> None:
+        """Reset association/evidence state after a source epoch changes."""
+        try:
+            self._tracker.reset()
+        except Exception as exc:  # noqa: BLE001 - replace a broken tracker at the boundary
+            logger.warning("person tracker epoch reset failed: %s", type(exc).__name__)
+            self._tracker = ByteTracker()
+        try:
+            self._face_tracker.reset()
+        except Exception as exc:  # noqa: BLE001 - replace a broken tracker at the boundary
+            logger.warning("face tracker epoch reset failed: %s", type(exc).__name__)
+            self._face_tracker = FaceTracker(
+                iou_threshold=self.settings.face_track_iou_threshold,
+                buffer_seconds=self.settings.face_track_buffer_seconds,
+            )
+        for confirmation in list(self._confirmations.values()):
+            # A reconnect is a privacy and correctness boundary: drop old
+            # embeddings as well as the track mapping so no evidence can cross
+            # from one camera connection into the next.
+            try:
+                confirmation.clear_sensitive()
+            except Exception as exc:  # noqa: BLE001 - one stale track must not poison a new epoch
+                logger.warning("confirmation epoch reset failed: %s", type(exc).__name__)
+        for face, _, _ in self._debug_faces:
+            _wipe_array(face.embedding)
+            _wipe_array(face.bbox)
+            _wipe_array(face.landmarks)
+        self._debug_faces.clear()
+        self._track_states.clear()
+        self._shadow_tracks.clear()
+        self._roi_misses.clear()
+        self._roi_skips.clear()
+        self._track_tiers.clear()
+        self._roi_last_pass = {}
+        self._roi_schedule_counter = 0
+        self._budget_credit = 0.0
+        self._motion_hanning = None
+        with self._lock:
+            for state in self._target_status.values():
+                if state.get("status") == "found":
+                    continue
+                state.update(
+                    {
+                        "evidence_count": 0,
+                        "required_evidence": 0,
+                        "qualifying_evidence": 0,
+                        "window_similarity": None,
+                        "window_statistic": None,
+                        "required_similarity": None,
+                        "aggregate_similarity": None,
+                        "required_aggregate_similarity": None,
+                        "tier": None,
+                        "last_face_px": None,
+                        "best_similarity": None,
+                        "best_observed_similarity": None,
+                        "last_rejection_reason": None,
+                        "last_rejection_face_px": None,
+                    }
+                )
 
     def _transition(self, status: SearchStatus, error: str | None, *, publish: bool = True) -> None:
         with self._lock:
@@ -1525,12 +2593,29 @@ class SearchManager:
         self.person_detector = person_detector or YoloXOnnxDetector(settings)
         self._targets: dict[str, Target] = {}
         self._sessions: dict[str, SearchSession] = {}
+        self._request_index: dict[str, str] = {}
         self._active_search_id: str | None = None
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
+        self._prune_timer: threading.Timer | None = None
+        self._prune_timer_deadline: float | None = None
+        self._prune_generation = 0
+        self._shutdown = False
 
     def enroll(self, image: np.ndarray, name: str = "目标") -> TargetView:
+        self._ensure_open()
         target_name = _normalize_target_name(name)
+        # Fail before model inference when the bounded enrollment gallery is
+        # already full.  The insertion-time check below remains necessary for a
+        # concurrent caller racing this fast path.
+        with self._lock:
+            max_targets = int(getattr(self.settings, "max_enrolled_targets", 100))
+            if len(self._targets) >= max_targets:
+                raise PersonSearchError(
+                    "too many enrolled targets",
+                    code="target_capacity_exceeded",
+                    status_code=429,
+                )
         faces = self.face_backend.analyze(image, enrollment=True)
         if not faces:
             raise EnrollmentError("no face detected", code="no_face")
@@ -1556,21 +2641,46 @@ class SearchManager:
             quality_score=face.quality,
             model=self.face_backend.model_name,
         )
-        with self._lock:
-            self._targets[target_id] = Target(
-                target_id=target_id, embedding=embedding, view=view, name=target_name
-            )
+        # Shutdown can race the model inference above.  Re-check while holding
+        # the lifecycle gate immediately before publishing the new target so a
+        # request that started before shutdown cannot resurrect manager state.
+        try:
+            with self._lifecycle_lock:
+                self._ensure_open()
+                with self._lock:
+                    if len(self._targets) >= max_targets:
+                        raise PersonSearchError(
+                            "too many enrolled targets",
+                            code="target_capacity_exceeded",
+                            status_code=429,
+                        )
+                    self._targets[target_id] = Target(
+                        target_id=target_id, embedding=embedding, view=view, name=target_name
+                    )
+        except Exception:
+            # The embedding is a local sensitive buffer until the insertion is
+            # committed.  Do not leave it alive when a lifecycle/capacity check
+            # rejects the request.
+            _wipe_array(embedding)
+            raise
         return view
 
     def delete_target(self, target_id: str) -> bool:
-        with self._lock:
-            if self._active_search_id:
-                session = self._sessions[self._active_search_id]
-                if any(target.target_id == target_id for target in session.targets):
+        with self._lifecycle_lock:
+            with self._lock:
+                # A callback/prune failure must not turn a stale active id into a
+                # KeyError that blocks all target administration.
+                _, session = self._active_session_locked()
+                if session is not None and any(
+                    target.target_id == target_id for target in session.targets
+                ):
                     raise PersonSearchError(
                         "target is used by an active search", code="target_in_use", status_code=409
                     )
-            return self._targets.pop(target_id, None) is not None
+                target = self._targets.pop(target_id, None)
+            if target is not None:
+                _wipe_array(target.embedding)
+            return target is not None
 
     def get_target(self, target_id: str) -> Target:
         with self._lock:
@@ -1590,6 +2700,7 @@ class SearchManager:
         replace_active: bool = False,
         request_id: str | None = None,
     ) -> SearchView:
+        self._ensure_open()
         if not target_ids:
             raise PersonSearchError(
                 "at least one target is required", code="invalid_targets", status_code=422
@@ -1598,11 +2709,29 @@ class SearchManager:
             raise PersonSearchError(
                 "timeout_seconds must be positive", code="invalid_timeout", status_code=422
             )
+        normalized_request_id = _normalize_request_id(request_id)
+        if len(set(target_ids)) != len(target_ids):
+            raise PersonSearchError(
+                "target_ids must be unique", code="duplicate_targets", status_code=422
+            )
+        self._prune_sessions()
         with self._lifecycle_lock:
+            # The first check happens before validation for a cheap fast path;
+            # this one closes the shutdown race after the caller acquired the
+            # lifecycle gate.
+            self._ensure_open()
             with self._lock:
-                active_id = self._active_search_id
-                active_session = self._sessions.get(active_id) if active_id else None
-                if request_id and active_session and active_session.request_id == request_id:
+                active_id, active_session = self._active_session_locked()
+                if normalized_request_id:
+                    retained_id = self._request_index.get(normalized_request_id)
+                    retained = self._sessions.get(retained_id) if retained_id else None
+                    if retained is not None:
+                        return retained.view()
+                    if retained_id is not None:
+                        self._request_index.pop(normalized_request_id, None)
+                if normalized_request_id and active_session and (
+                    active_session.request_id == normalized_request_id
+                ):
                     return active_session.view()
                 targets: list[Target] = []
                 for target_id in target_ids:
@@ -1612,6 +2741,12 @@ class SearchManager:
                             "target not found", code="target_not_found", status_code=404
                         )
                     targets.append(target)
+            # The worker callback does not take ``_lifecycle_lock`` and may
+            # release the active slot while target validation above is running.
+            # Re-read under ``_lock`` so a session that just became terminal
+            # cannot produce a stale capacity error.
+            with self._lock:
+                active_id, active_session = self._active_session_locked()
             if active_id is not None:
                 if not replace_active:
                     raise PersonSearchError(
@@ -1619,10 +2754,17 @@ class SearchManager:
                         code="search_capacity_exceeded",
                         status_code=409,
                     )
-                self.stop_search(active_id)
+                if active_session is not None:
+                    if active_session.finished.is_set():
+                        active_session.clear_evidence()
+                    else:
+                        active_session.stop()
             ensure_ready = getattr(self.person_detector, "ensure_ready", None)
             if ensure_ready:
                 ensure_ready()
+            # Model warm-up may take seconds and shutdown is allowed to happen
+            # while it runs.  Never publish a session after the manager closed.
+            self._ensure_open()
             search_id = str(uuid.uuid4())
             session = SearchSession(
                 search_id=search_id,
@@ -1634,22 +2776,35 @@ class SearchManager:
                 on_finished=self._on_finished,
                 targets=targets,
                 timeout_seconds=timeout_seconds,
-                request_id=request_id,
+                request_id=normalized_request_id,
             )
             with self._lock:
                 self._sessions[search_id] = session
+                if normalized_request_id:
+                    self._request_index[normalized_request_id] = search_id
                 self._active_search_id = search_id
             try:
                 session.start()
             except Exception:
                 with self._lock:
                     self._sessions.pop(search_id, None)
+                    if normalized_request_id and self._request_index.get(normalized_request_id) == search_id:
+                        self._request_index.pop(normalized_request_id, None)
                     if self._active_search_id == search_id:
                         self._active_search_id = None
+                try:
+                    session.clear_evidence()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("failed-start evidence cleanup failed: %s", type(exc).__name__)
+                try:
+                    session.defer_sensitive_cleanup()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("failed-start sensitive cleanup failed: %s", type(exc).__name__)
                 raise
             return session.view()
 
     def get_search(self, search_id: str) -> SearchView:
+        self._prune_sessions()
         return self._get_session(search_id).view()
 
     def get_session(self, search_id: str) -> SearchSession:
@@ -1665,18 +2820,15 @@ class SearchManager:
         No image data is persisted by this index; it only scans the existing
         in-memory session metadata.
         """
-        normalized = request_id.strip()
+        normalized = _normalize_request_id(request_id)
         if not normalized:
             return None
+        self._prune_sessions()
         with self._lock:
-            session = next(
-                (
-                    candidate
-                    for candidate in self._sessions.values()
-                    if candidate.request_id == normalized
-                ),
-                None,
-            )
+            search_id = self._request_index.get(normalized)
+            session = self._sessions.get(search_id) if search_id else None
+            if session is None and search_id is not None:
+                self._request_index.pop(normalized, None)
         return session.view() if session is not None else None
 
     def stop_search(self, search_id: str) -> None:
@@ -1690,28 +2842,126 @@ class SearchManager:
             session.stop()
 
     def active_search(self) -> SearchView | None:
+        self._prune_sessions()
         with self._lock:
-            active = self._active_search_id
-            session = self._sessions.get(active) if active else None
+            _, session = self._active_session_locked()
         return session.view() if session else None
 
     def shutdown(self) -> None:
-        with self._lock:
-            active = self._active_search_id
-        if active:
+        # Serialize the state transition with the critical portions of enroll
+        # and start_batch_search.  Expensive worker stopping stays outside this
+        # short section, but no new target/session can be committed after the
+        # shutdown bit becomes visible.
+        with self._lifecycle_lock, self._lock:
+            active_id = self._active_search_id
+            active_session = self._sessions.get(active_id) if active_id else None
+            if active_session is not None:
+                try:
+                    if active_session.finished.is_set():
+                        active_session = None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("active session liveness check failed during shutdown: %s", type(exc).__name__)
+                    active_session = None
+            self._shutdown = True
+            # Once shutdown is visible there is no active slot to advertise.
+            # Keep the local session reference above so a still-running worker
+            # can be stopped without consulting the now-cleared slot.
+            self._active_search_id = None
+            prune_timer = self._prune_timer
+            self._prune_timer = None
+            self._prune_timer_deadline = None
+            self._prune_generation += 1
+            self._request_index.clear()
+        if prune_timer is not None:
             try:
-                self.stop_search(active)
+                prune_timer.cancel()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("terminal timer shutdown cancellation failed: %s", type(exc).__name__)
+        if active_session is not None:
+            try:
+                active_session.stop()
             except SearchStopTimeoutError:
                 # Keep the process alive until the worker can release its slot; the
                 # caller will still see a clear timeout if this is an API stop.
-                pass
+                logger.warning("active search did not stop before shutdown timeout")
+            except Exception as exc:  # noqa: BLE001 - shutdown must clean the rest
+                logger.warning("active search shutdown failed: %s", type(exc).__name__)
         with self._lock:
             sessions = list(self._sessions.values())
+            targets = list(self._targets.values())
             self._targets.clear()
+        for target in targets:
+            _wipe_array(target.embedding)
         for session in sessions:
-            session.clear_evidence()
+            try:
+                session.clear_evidence()
+            except Exception as exc:  # noqa: BLE001 - continue releasing other sessions
+                logger.warning("session evidence shutdown cleanup failed: %s", type(exc).__name__)
+            # Finished/dead sessions can be wiped immediately.  A live worker
+            # gets a daemon watcher that retries after its terminal event, which
+            # avoids racing an in-flight provider call.
+            try:
+                session.defer_sensitive_cleanup()
+            except Exception as exc:  # noqa: BLE001 - shutdown remains best effort
+                logger.warning("session sensitive shutdown cleanup failed: %s", type(exc).__name__)
+
+    def _ensure_open(self) -> None:
+        with self._lock:
+            if self._shutdown:
+                raise PersonSearchError(
+                    "search manager is shut down",
+                    code="manager_shutdown",
+                    status_code=503,
+                )
+
+    def _active_session_locked(self) -> tuple[str | None, SearchSession | None]:
+        """Return the live active session and clear stale slot pointers.
+
+        ``_active_search_id`` is updated by a worker callback, while request
+        handlers can observe it in the small interval before that callback (or
+        after a failed/legacy callback).  Treat a missing or terminal session as
+        stale so one abandoned id cannot permanently consume the singleton
+        search slot.  The caller must hold ``self._lock``.
+        """
+        active_id = self._active_search_id
+        if active_id is None:
+            return None, None
+        session = self._sessions.get(active_id)
+        stale = session is None
+        if session is not None:
+            try:
+                stale = session.finished.is_set()
+            except Exception as exc:  # noqa: BLE001 - a broken legacy session is not a live slot
+                logger.warning("active session liveness check failed: %s", type(exc).__name__)
+                stale = True
+            if not stale:
+                try:
+                    status = getattr(session, "status", None)
+                    if status in {
+                        SearchStatus.COMPLETED,
+                        SearchStatus.TIMED_OUT,
+                        SearchStatus.STOPPED,
+                        SearchStatus.FAILED,
+                    }:
+                        stale = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("active session status check failed: %s", type(exc).__name__)
+                    stale = True
+        if stale:
+            self._active_search_id = None
+            if session is None:
+                # A failed start/callback can leave an idempotency index entry
+                # pointing at a session that was already removed.  Drop only
+                # those dangling entries; retained terminal sessions keep their
+                # request keys for reconciliation.
+                for request_key, search_id in list(self._request_index.items()):
+                    if search_id == active_id:
+                        self._request_index.pop(request_key, None)
+            return None, None
+        return active_id, session
 
     def _get_session(self, search_id: str) -> SearchSession:
+        self._prune_sessions()
         with self._lock:
             session = self._sessions.get(search_id)
         if session is None:
@@ -1719,19 +2969,258 @@ class SearchManager:
         return session
 
     def _on_finished(self, search_id: str, target_ids: list[str]) -> None:
+        removed_targets: list[Target] = []
         with self._lock:
             if self._active_search_id == search_id:
                 self._active_search_id = None
             for target_id in target_ids:
-                self._targets.pop(target_id, None)
+                try:
+                    target = self._targets.pop(target_id, None)
+                    if target is not None:
+                        removed_targets.append(target)
+                except Exception as exc:  # noqa: BLE001 - one target must not block slot release
+                    logger.warning("terminal target cleanup failed: %s", type(exc).__name__)
+        for target in removed_targets:
+            _wipe_array(target.embedding)
+        # Clearing the active slot and one-shot targets is the critical part of
+        # completion.  Retention/janitor bookkeeping is best effort: an
+        # unexpected metadata failure must never make the worker callback raise
+        # and leave callers believing the search is still active.
+        try:
+            self._prune_sessions()
+        except Exception as exc:  # noqa: BLE001 - callback must be fail-safe
+            logger.warning("terminal session pruning failed: %s", type(exc).__name__)
+        # ``SearchSession`` invokes this callback just before setting its
+        # ``finished`` event. Schedule a short follow-up even when the first
+        # prune pass cannot yet see the terminal bit.
+        try:
+            self._schedule_prune_timer()
+        except Exception as exc:  # noqa: BLE001 - callback must be fail-safe
+            logger.warning("terminal session timer failed: %s", type(exc).__name__)
+
+    def _prune_sessions(self) -> None:
+        """Retain only bounded, recently finished sessions for reconciliation."""
+        to_release: list[SearchSession] = []
+        try:
+            now = time.monotonic()
+            try:
+                ttl = float(getattr(self.settings, "terminal_session_ttl_seconds", 3600.0))
+            except (TypeError, ValueError) as exc:
+                logger.warning("terminal session TTL is invalid: %s", type(exc).__name__)
+                ttl = 3600.0
+            try:
+                max_retained = max(1, int(getattr(self.settings, "max_retained_sessions", 32)))
+            except (TypeError, ValueError) as exc:
+                logger.warning("max retained sessions is invalid: %s", type(exc).__name__)
+                max_retained = 32
+            with self._lock:
+                terminal: list[SearchSession] = []
+                for session in list(self._sessions.values()):
+                    try:
+                        if session.finished.is_set() and session._finished_at is not None:
+                            terminal.append(session)
+                    except Exception as exc:  # noqa: BLE001 - malformed legacy entries are skipped
+                        logger.warning("terminal session inspection failed: %s", type(exc).__name__)
+                expired = [
+                    session
+                    for session in terminal
+                    if now - float(session._finished_at or now) >= ttl
+                ]
+                expired_ids = {session.search_id for session in expired}
+                retained = [
+                    session for session in terminal if session.search_id not in expired_ids
+                ]
+                retained.sort(key=lambda session: float(session._finished_at or 0.0))
+                if len(retained) > max_retained:
+                    expired.extend(retained[: len(retained) - max_retained])
+                for session in expired:
+                    try:
+                        removed = self._sessions.pop(session.search_id, None)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("terminal session removal failed: %s", type(exc).__name__)
+                        removed = None
+                    if removed is not None:
+                        if self._active_search_id == session.search_id:
+                            self._active_search_id = None
+                        try:
+                            for request_id, indexed_search_id in list(self._request_index.items()):
+                                if indexed_search_id == session.search_id:
+                                    self._request_index.pop(request_id, None)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("terminal request index cleanup failed: %s", type(exc).__name__)
+                        to_release.append(session)
+            # A janitor must never stop at the first bad session.  Keep each
+            # cleanup component isolated and ask the session's own watcher to
+            # retry if a worker or a legacy object is still holding buffers.
+            for session in to_release:
+                try:
+                    session.clear_evidence()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal evidence cleanup failed: %s", type(exc).__name__)
+                try:
+                    session.clear_sensitive_state()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal sensitive cleanup failed: %s", type(exc).__name__)
+                try:
+                    if not getattr(session, "_sensitive_cleared", False):
+                        session.defer_sensitive_cleanup()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal sensitive cleanup retry failed: %s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - janitor failures must not kill request/timer threads
+            logger.warning("terminal session pruning failed: %s", type(exc).__name__)
+        finally:
+            # Always re-arm the timer, including when one session's cleanup or a
+            # malformed legacy object raised unexpectedly.
+            try:
+                self._schedule_prune_timer()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("terminal session timer scheduling failed: %s", type(exc).__name__)
+
+    def _schedule_prune_timer(self) -> None:
+        """Arrange lazy-but-automatic TTL cleanup for idle managers.
+
+        A dedicated janitor thread per manager would multiply background threads
+        in tests and in embedding applications. A single daemon timer per manager
+        wakes at the nearest terminal deadline (or shortly after a worker invokes
+        ``on_finished``) and reschedules itself after pruning.
+        """
+        with self._lock:
+            if self._shutdown:
+                old_timer = self._prune_timer
+                self._prune_timer = None
+                self._prune_timer_deadline = None
+                self._prune_generation += 1
+                if old_timer is not None:
+                    try:
+                        old_timer.cancel()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("terminal timer cancellation failed: %s", type(exc).__name__)
+                return
+            now = time.monotonic()
+            try:
+                ttl = max(
+                    0.001,
+                    float(getattr(self.settings, "terminal_session_ttl_seconds", 3600.0)),
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning("terminal session TTL is invalid: %s", type(exc).__name__)
+                ttl = 3600.0
+            try:
+                max_retained = max(
+                    1, int(getattr(self.settings, "max_retained_sessions", 32))
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning("max retained sessions is invalid: %s", type(exc).__name__)
+                max_retained = 32
+            terminal: list[SearchSession] = []
+            for session in list(self._sessions.values()):
+                try:
+                    if session._finished_at is not None:
+                        terminal.append(session)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal session timer inspection failed: %s", type(exc).__name__)
+            if not terminal:
+                timer = self._prune_timer
+                self._prune_timer = None
+                self._prune_timer_deadline = None
+                self._prune_generation += 1
+                if timer is not None:
+                    try:
+                        timer.cancel()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("terminal timer cancellation failed: %s", type(exc).__name__)
+                return
+            deadlines: list[float] = []
+            finished_count = 0
+            for session in terminal:
+                try:
+                    if session.finished.is_set():
+                        finished_count += 1
+                        deadlines.append(float(session._finished_at or now) + ttl)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal session timer inspection failed: %s", type(exc).__name__)
+            # The callback is made before ``finished.set()``; give it a brief
+            # grace period rather than risking cleanup while terminal events are
+            # still being published.
+            delay = min(deadlines) - now if deadlines else 0.05
+            if finished_count > max_retained:
+                delay = 0.01
+            delay = max(0.01, min(delay, 60.0))
+            scheduled_deadline = now + delay
+            old_timer = self._prune_timer
+            old_deadline = self._prune_timer_deadline
+            # Frequent status/active requests call ``_prune_sessions``. Keep an
+            # existing timer when it already fires no later than the newly
+            # computed deadline; cancel/recreate only when a new terminal session
+            # introduces an earlier deadline or the prior timer is gone.
+            if old_timer is not None:
+                try:
+                    timer_alive = old_timer.is_alive()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("terminal timer liveness check failed: %s", type(exc).__name__)
+                    timer_alive = False
+                if timer_alive:
+                    if old_deadline is not None and old_deadline <= scheduled_deadline + 0.01:
+                        return
+                    try:
+                        old_timer.cancel()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("terminal timer cancellation failed: %s", type(exc).__name__)
+            self._prune_generation += 1
+            generation = self._prune_generation
+            timer = threading.Timer(
+                delay, self._run_prune_timer, args=(generation,)
+            )
+            timer.daemon = True
+            self._prune_timer = timer
+            self._prune_timer_deadline = scheduled_deadline
+            try:
+                timer.start()
+            except Exception:
+                # Do not leave an unstarted timer object looking live to the
+                # next request; a subsequent prune pass can install a fresh
+                # janitor safely.
+                if self._prune_timer is timer:
+                    self._prune_timer = None
+                    self._prune_timer_deadline = None
+                    self._prune_generation += 1
+                raise
+
+    def _run_prune_timer(self, generation: int | None = None) -> None:
+        with self._lock:
+            if generation is not None and generation != self._prune_generation:
+                return
+            self._prune_timer = None
+            self._prune_timer_deadline = None
+            if self._shutdown:
+                return
+        try:
+            self._prune_sessions()
+        except Exception as exc:  # noqa: BLE001 - timer threads must remain self-healing
+            logger.warning("terminal session timer callback failed: %s", type(exc).__name__)
+            try:
+                self._schedule_prune_timer()
+            except Exception as schedule_exc:  # noqa: BLE001
+                logger.warning(
+                    "terminal session timer reschedule failed: %s",
+                    type(schedule_exc).__name__,
+                )
 
 
 def _sanitize_source(source: SourceConfig) -> SourceConfig:
     if source.type != SourceType.RTSP or not source.uri:
         return source.model_copy()
-    parts = urlsplit(source.uri)
+    try:
+        parts = urlsplit(source.uri)
+        parsed_port = parts.port
+    except (TypeError, ValueError):
+        # Validation normally prevents this path. Keep log/status rendering
+        # safe for legacy sessions carrying a malformed URI.
+        return source.model_copy(update={"uri": "rtsp://source/***"})
     host = parts.hostname or "source"
-    port = f":{parts.port}" if parts.port else ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = f":{parsed_port}" if parsed_port else ""
     return source.model_copy(update={"uri": f"{parts.scheme}://{host}{port}/***"})
 
 
@@ -1747,10 +3236,129 @@ def _normalize_target_name(name: str) -> str:
     return normalized
 
 
+def _normalize_request_id(request_id: str | None) -> str | None:
+    """Normalize an idempotency key without allowing unbounded/control input."""
+    if request_id is None:
+        return None
+    if not isinstance(request_id, str):
+        raise PersonSearchError(
+            "request_id must be a string", code="invalid_request_id", status_code=422
+        )
+    # Validate the submitted value before trimming it.  ``str.strip`` would
+    # otherwise erase a leading/trailing newline (or another control/format
+    # character), allowing that character to reach logs, metrics, or a
+    # request-index key while making it invisible to the caller.  ``isprintable``
+    # covers the Unicode control/format and line-separator characters that the
+    # old ASCII-only ordinal check missed (for example U+0085, U+200B, U+2028).
+    if any(not char.isprintable() for char in request_id):
+        raise PersonSearchError(
+            "request_id is invalid", code="invalid_request_id", status_code=422
+        )
+    normalized = request_id.strip()
+    if not normalized:
+        return None
+    if len(normalized) > MAX_REQUEST_ID_LENGTH:
+        raise PersonSearchError(
+            "request_id is invalid", code="invalid_request_id", status_code=422
+        )
+    return normalized
+
+
 def _safe_error(exc: Exception) -> str:
     if isinstance(exc, ModelUnavailableError):
-        return exc.message
+        # Loader exceptions often include absolute model paths, environment
+        # values, or provider internals.  Keep those details in controlled logs
+        # while exposing a stable, actionable terminal message to API clients.
+        logger.error("model unavailable: %s", exc.message)
+        return "model unavailable; verify model files and runtime configuration"
     return f"{type(exc).__name__}: processing failed"
+
+
+def _is_embedding_capacity_error(exc: Exception) -> bool:
+    """Recognise provider allocation failures that are safe to retry smaller."""
+    if isinstance(exc, (MemoryError, OverflowError)):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "out of memory",
+            "failed to allocate",
+            "alloc_failed",
+            "bfc arena",
+            "cuda out of memory",
+            "cudnn_status_alloc",
+            "resource exhausted",
+        )
+    )
+
+
+def _is_recoverable_embedding_error(exc: Exception) -> bool:
+    """Whether a recogniser/provider error can be isolated to this frame.
+
+    Programming errors and explicit model-unavailable failures should still
+    terminate the worker. Runtime/provider allocation and execution failures are
+    safe to degrade for one frame, preserving the stream and confirmation window
+    instead of turning a transient CUDA hiccup into a terminal search failure.
+    """
+    if isinstance(exc, (RuntimeError, OSError, ValueError)):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "rknn_err_malloc_fail",
+            "cuda_error_out_of_memory",
+            "cuda execution provider",
+            "tensorrt",
+            "provider execution",
+            "execution provider",
+            "resource exhausted",
+            "allocation failed",
+        )
+    )
+
+
+def _wipe_array(value: np.ndarray | None) -> None:
+    """Best-effort zeroing for biometric buffers held by a terminal session."""
+    if value is None:
+        return
+    try:
+        value.fill(0)
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
+def _worker_is_alive(worker: object | None) -> bool:
+    """Read worker liveness without allowing a broken test/integration object to leak."""
+    if worker is None:
+        return False
+    is_alive = getattr(worker, "is_alive", None)
+    if not callable(is_alive):
+        return False
+    try:
+        return bool(is_alive())
+    except Exception as exc:  # noqa: BLE001 - lifecycle checks are defensive
+        logger.warning("worker liveness check failed: %s", type(exc).__name__)
+        return False
+
+
+def _clone_target(target: Target, *, include_embedding: bool = True) -> Target:
+    """Copy a target without sharing its mutable biometric buffer.
+
+    Terminal sessions pass ``include_embedding=False`` to retain only the
+    display metadata needed for reconciliation.  Live copies always normalize to
+    a standalone float32 array so cleanup cannot mutate the manager's gallery.
+    """
+    embedding = None
+    if include_embedding and target.embedding is not None:
+        embedding = np.asarray(target.embedding, dtype=np.float32).copy()
+    return Target(
+        target_id=target.target_id,
+        embedding=embedding,
+        view=target.view,
+        name=target.name,
+    )
 
 
 def _merge_faces(

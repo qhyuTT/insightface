@@ -604,3 +604,49 @@ set-url` 修正并把这条写进服务器 `~/deploy/README.txt` 与 lessons。
 - [ ] 下一步仍是**现场读数**：跑一次真实寻人，看 `实际采样率 vs 需求采样率` 和
       `未确认卡点` 分桶，再决定是减负载还是标定阈值。切 transit 档只需
       `T4_MATCH_PROFILE=transit ./scripts/deploy_t4.sh` 重跑一次。
+
+### 部署（192.168.17.60，2026-09-01）
+
+上线 `6c7ae3c`，容器 `person-search:t4` healthy，`current` 已指向
+`insightface-release-6c7ae3c`。本次是**行为变更上线**，不是纯加固：
+
+- `PERSON_SEARCH_MATCH_PROFILE=transit`（原 conservative）：远脸档
+  `6 帧/3.0s/5 票` → `4 帧/2.0s/3 票`，检测分 `0.65 → 0.55`，
+  统计量 `median → top_k_mean`，采样间隔全档位 `0.2s → 0.1s`。
+  **没有动任何相似度阈值**——放宽的是帧预算和检测分。
+- `PERSON_SEARCH_TINY_FACE_SHADOW_MODE=false` + `T4_ALLOW_PHYSICAL_ACTIONS=true`：
+  维持线上原有行为（远脸命中直接发 `target_found`）。新脚本默认是 shadow，
+  保留现状需要显式开这道闸。
+- 其余不变：`face_detection_size=1280`、`departure_adjudication=false`、
+  `bind 0.0.0.0`。Evidence API key 从在跑的容器里读出直接传入，未落地未打印。
+
+回滚点：`person-search:t4.rollback-cb1c82c-20260831T141230Z`（上线前那版）、
+`person-search:t4.rollback-67f93ce-20260831T235506Z`，以及脚本自动保留的
+`person-search.previous.20260901075509.3968025` 容器。
+
+#### 这次上线卡了两轮，都在 Dockerfile 的 HEALTHCHECK 一行上
+
+1. `0564295` **构建即失败**：`CMD-SHELL` 是 compose 的写法，Dockerfile 解析器直接拒绝。
+   金丝雀流程让失败停在构建阶段，生产容器全程未被触碰。
+2. `67f93ce` 构建通过、服务正常，但容器被标 `unhealthy`：修构建时顺手加的 `\$`
+   是错的。Docker 的变量替换不作用于 HEALTHCHECK，`${}` 本就原样存入、由运行时 sh
+   展开，加转义反而让 sh 读成字面 `$`，curl 退出 3。
+   T4 实测 plain `rc=0` / escaped `rc=3`，`6c7ae3c` 修掉后容器 5s 内 healthy。
+
+根因不是手误，是**一条把坏字符串原样钉住的测试**：
+`assert 'CMD-SHELL curl ... $${...}' in source` 对着一个永远构建不出来的 Dockerfile
+长期显绿。已改成断言正确形式 + 三条反向守卫，并逐个把坏形式代回确认会红。
+详见 `tasks/lessons.md`。
+
+另：服务器 `git fetch origin main` 期间 GitHub 连接被重置，改用 README.txt 里的
+bundle 通道完成。`insightface-release-0564295` 目录留在服务器上（对应镜像从未构建成功）。
+
+#### 仍未做
+
+- [ ] **现场读数**（第三次列入）：跑一次真实寻人，读 `实际采样率 vs 需求采样率` 与
+      `未确认卡点` 分桶。transit 放宽的是帧预算，**它是否解决问题取决于卡点在哪**——
+      卡在 `insufficient_samples` 才有用，卡在 `window_statistic_low` 则无效且徒增误报。
+      这次上线把判据摆上了监控页，但没有人读过。
+- [ ] **transit 的误报代价没有测量**：检测分 0.65→0.55 和 median→top_k_mean 都是放宽，
+      在候机厅多人场景下的假阳率未知。按 lessons 第五次要求，仍需 `--dump-similarities`
+      跑正负素材定阈值。

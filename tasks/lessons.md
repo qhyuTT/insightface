@@ -105,3 +105,9 @@
   Dockerfile 长期为绿。文本断言只能证明字符串没变，不能证明它可用；给这类断言配上
   反向守卫（`assert "CMD-SHELL" not in source`、`assert r"\${PERSON_SEARCH_PORT"
   not in source`），并且逐个把已知坏形式代回去确认测试真的会红。
+- `cmd | tail -5 && echo ok` 的退出码取自管道**最后一环**（`tail`），不是 `cmd`。用它做
+  「重试并确认成功」的检查，会在 `git fetch` 失败时照样打印 "fetch ok"，然后
+  `git merge FETCH_HEAD`（FETCH_HEAD 是空的）报 "Already up to date"——整条链路看起来
+  全绿而代码没更新，和上一条 `cp -a` 复制 origin 的坑是同一种静默失败。要么别加管道，
+  要么 `set -o pipefail`，但真正可靠的仍是核对**结果**（`git rev-parse --short HEAD`），
+  不是核对命令有没有报错。

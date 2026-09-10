@@ -7,9 +7,14 @@ import numpy as np
 import pytest
 
 from person_search.config import Settings
+from person_search.detector import _preprocess as _preprocess_onnx_yolox
 from person_search.domain import SourceConfig, SourceType
 from person_search.gstreamer_capture import GStreamerCapture
-from person_search.rknn_backends import RknnFaceBackend, RknnYoloXDetector
+from person_search.rknn_backends import (
+    RknnFaceBackend,
+    RknnYoloXDetector,
+    _preprocess_yolox,
+)
 from person_search.rknn_runtime import (
     RKNN_QUERY_IN_OUT_NUM,
     RKNN_QUERY_INPUT_ATTR,
@@ -223,6 +228,16 @@ def test_rknn_yolox_detector_decodes_person_head(tmp_path: Path) -> None:
     assert len(detections) == 1
     assert detections[0].score == pytest.approx(0.81)
     assert np.allclose(detections[0].bbox, [0.0, 0.0, 20.0, 20.0], atol=1e-5)
+
+
+def test_rknn_yolox_preprocessing_matches_the_existing_onnx_bgr_path() -> None:
+    frame = np.arange(7 * 11 * 3, dtype=np.uint8).reshape(7, 11, 3)
+
+    onnx_image, onnx_ratio = _preprocess_onnx_yolox(frame, (416, 416))
+    rknn_image, rknn_ratio = _preprocess_yolox(frame, (416, 416))
+
+    assert rknn_ratio == onnx_ratio
+    assert np.array_equal(rknn_image.transpose(2, 0, 1), onnx_image)
 
 
 def test_rknn_face_backend_decodes_scrfd_and_arcface(tmp_path: Path) -> None:

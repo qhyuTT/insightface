@@ -122,7 +122,7 @@ class RknnYoloXDetector:
         input_hw = self._input_hw
         if model is None or input_hw is None:
             raise ModelUnavailableError("RKNN YOLOX initialization did not complete")
-        image, ratio = _preprocess_yolox_rgb(frame, input_hw)
+        image, ratio = _preprocess_yolox(frame, input_hw)
         output = model.run(image)
         raw = np.asarray(output[0], dtype=np.float32)
         if raw.ndim == 3 and raw.shape[0] == 1:
@@ -473,7 +473,7 @@ def _prediction_count(input_hw: tuple[int, int]) -> int:
     return sum((height // stride) * (width // stride) for stride in _YOLOX_STRIDES)
 
 
-def _preprocess_yolox_rgb(
+def _preprocess_yolox(
     frame: np.ndarray, input_hw: tuple[int, int]
 ) -> tuple[np.ndarray, float]:
     _validate_frame(frame)
@@ -482,7 +482,6 @@ def _preprocess_yolox_rgb(
     resized_width = max(1, int(frame.shape[1] * ratio))
     resized_height = max(1, int(frame.shape[0] * ratio))
     resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-    resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     padded = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
     padded[:resized_height, :resized_width] = resized
     return padded, ratio

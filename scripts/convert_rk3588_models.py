@@ -7,9 +7,9 @@ This script is run in a conversion environment containing Rockchip's
 
 The face models use the same RGB preprocessing semantics as InsightFace:
 SCRFD is normalized with mean 127.5 / std 128 and ArcFace with mean/std 127.5.
-YOLOX keeps raw 0-255 pixels, matching the project's existing ONNX preprocessing
-after letterbox and RGB conversion.  FP models are the default because they
-are the safest first parity target; INT8 conversion requires a representative
+YOLOX keeps raw 0-255 BGR pixels, matching the project's existing ONNX
+preprocessing after letterbox.  FP models are the default because they are the
+safest first parity target; INT8 conversion requires a representative
 calibration dataset and is opt-in.
 """
 
@@ -36,6 +36,7 @@ from person_search.model_assets import sha256
 class ConversionSpec:
     name: str
     source: Path
+    input_name: str
     input_size: tuple[int, int, int, int]
     mean_values: list[list[float]]
     std_values: list[list[float]]
@@ -116,6 +117,7 @@ def build_specs(args: argparse.Namespace) -> list[ConversionSpec]:
             ConversionSpec(
                 name="yolox_tiny",
                 source=args.yolox,
+                input_name="images",
                 input_size=(1, 3, 416, 416),
                 mean_values=[[0.0, 0.0, 0.0]],
                 std_values=[[1.0, 1.0, 1.0]],
@@ -128,6 +130,7 @@ def build_specs(args: argparse.Namespace) -> list[ConversionSpec]:
                 ConversionSpec(
                     name="scrfd_10g_640",
                     source=face_root / "det_10g.onnx",
+                    input_name="input.1",
                     input_size=(1, 3, 640, 640),
                     mean_values=[[127.5, 127.5, 127.5]],
                     std_values=[[128.0, 128.0, 128.0]],
@@ -136,6 +139,7 @@ def build_specs(args: argparse.Namespace) -> list[ConversionSpec]:
                 ConversionSpec(
                     name="w600k_r50",
                     source=face_root / "w600k_r50.onnx",
+                    input_name="input.1",
                     input_size=(1, 3, 112, 112),
                     mean_values=[[127.5, 127.5, 127.5]],
                     std_values=[[127.5, 127.5, 127.5]],
@@ -161,6 +165,7 @@ def convert_one(rknn_factory: Any, spec: ConversionSpec, args: argparse.Namespac
         check(
             rknn.load_onnx(
                 model=str(spec.source),
+                inputs=[spec.input_name],
                 input_size_list=[list(spec.input_size)],
             ),
             "rknn.load_onnx",
@@ -178,6 +183,7 @@ def convert_one(rknn_factory: Any, spec: ConversionSpec, args: argparse.Namespac
     record = {
         "name": spec.name,
         "source": str(spec.source),
+        "input_name": spec.input_name,
         "source_sha256": sha256(spec.source),
         "output": str(output),
         "output_sha256": sha256(output),

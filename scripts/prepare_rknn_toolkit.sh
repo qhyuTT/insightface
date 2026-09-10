@@ -17,7 +17,19 @@ test -f "${toolkit_wheel}" || {
   exit 1
 }
 
-uv venv --python "${rknn_python}" "${rknn_venv}"
+uv venv --allow-existing --python "${rknn_python}" "${rknn_venv}"
+uv pip install --python "${rknn_venv}/bin/python" \
+  'cmake>=3.22' \
+  'setuptools==69.5.1'
+
+# onnxoptimizer 0.3.8 currently has no manylinux aarch64 wheel.  Its bundled
+# ONNX CMake project declares an obsolete minimum policy, so use a user-local
+# CMake and opt into the compatibility policy rather than requiring sudo to
+# upgrade the box's system CMake.
+conversion_path="${rknn_venv}/bin:${PATH}"
+conversion_cmake_args="${RKNN_CMAKE_ARGS:--DCMAKE_POLICY_VERSION_MINIMUM=3.5}"
+conversion_max_jobs="${RKNN_MAX_JOBS:-4}"
+PATH="${conversion_path}" CMAKE_ARGS="${conversion_cmake_args}" MAX_JOBS="${conversion_max_jobs}" \
 uv pip install --python "${rknn_venv}/bin/python" \
   "${toolkit_wheel}" \
   'numpy<2' \

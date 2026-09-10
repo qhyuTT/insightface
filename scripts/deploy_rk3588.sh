@@ -30,19 +30,37 @@ commit="$(git -C "${repo_dir}" rev-parse HEAD)"
 echo "deploying ${commit} from ${current_branch} to ${ssh_target}:${remote_dir}"
 
 command -v ssh >/dev/null || { echo "ssh is required" >&2; exit 1; }
-command -v rsync >/dev/null || { echo "rsync is required" >&2; exit 1; }
+command -v tar >/dev/null || { echo "tar is required" >&2; exit 1; }
 
 remote_dir_q="$(printf '%q' "${remote_dir}")"
 ssh "${ssh_target}" "mkdir -p -- ${remote_dir_q}"
-rsync -az \
-  --exclude '.git/' \
-  --exclude '.venv/' \
-  --exclude '.rknn-venv/' \
-  --exclude 'models/*' \
-  --exclude 'artifacts/' \
-  --exclude '__pycache__/' \
-  --exclude '*.pyc' \
-  "${repo_dir}/" "${ssh_target}:${remote_dir%/}/"
+remote_has_rsync=0
+if ssh "${ssh_target}" "command -v rsync >/dev/null 2>&1"; then
+  remote_has_rsync=1
+fi
+if [[ "${remote_has_rsync}" == "1" ]] && command -v rsync >/dev/null; then
+  rsync -az \
+    --exclude '.git/' \
+    --exclude '.venv/' \
+    --exclude '.rknn-venv/' \
+    --exclude 'models/*' \
+    --exclude 'artifacts/' \
+    --exclude '__pycache__/' \
+    --exclude '*.pyc' \
+    "${repo_dir}/" "${ssh_target}:${remote_dir%/}/"
+else
+  echo "remote rsync unavailable; using SSH tar transport"
+  tar -czf - \
+    --exclude '.git' \
+    --exclude '.venv' \
+    --exclude '.rknn-venv' \
+    --exclude 'models/*' \
+    --exclude 'artifacts' \
+    --exclude '__pycache__' \
+    --exclude '*.pyc' \
+    -C "${repo_dir}" . \
+    | ssh "${ssh_target}" "tar -xzf - -C ${remote_dir_q}"
+fi
 
 if [[ -n "${RK3588_ENV_FILE:-}" ]]; then
   test -f "${RK3588_ENV_FILE}" || {
@@ -59,7 +77,14 @@ if [[ -n "${RK3588_MODEL_DIR:-}" ]]; then
     echo "RK3588_MODEL_DIR does not exist: ${RK3588_MODEL_DIR}" >&2
     exit 1
   }
-  rsync -az "${RK3588_MODEL_DIR%/}/" "${ssh_target}:${remote_dir%/}/models/rk3588/"
+  model_dir_q="$(printf '%q' "${remote_dir%/}/models/rk3588")"
+  if [[ "${remote_has_rsync}" == "1" ]] && command -v rsync >/dev/null; then
+    rsync -az "${RK3588_MODEL_DIR%/}/" "${ssh_target}:${remote_dir%/}/models/rk3588/"
+  else
+    ssh "${ssh_target}" "mkdir -p -- ${model_dir_q}"
+    tar -czf - -C "${RK3588_MODEL_DIR}" . \
+      | ssh "${ssh_target}" "tar -xzf - -C ${model_dir_q}"
+  fi
 fi
 
 if [[ -n "${RK3588_RUNTIME_LIBRARY:-}" ]]; then

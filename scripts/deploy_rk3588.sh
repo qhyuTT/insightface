@@ -117,7 +117,7 @@ ssh "${ssh_target}" "
     uv_bin=\"\${RK3588_UV_BIN:-\${HOME}/.local/bin/uv}\"
   fi
   test -x \"\${uv_bin}\"
-  \"\${uv_bin}\" venv --python ${remote_python_q} .venv
+  \"\${uv_bin}\" venv --allow-existing --python ${remote_python_q} .venv
   \"\${uv_bin}\" sync --python .venv/bin/python --no-dev
   mkdir -p \"\${XDG_CONFIG_HOME:-\${HOME}/.config}/systemd/user\"
   install -m 0644 deploy/person-search-rk3588.service \"\${XDG_CONFIG_HOME:-\${HOME}/.config}/systemd/user/person-search-rk3588.service\"

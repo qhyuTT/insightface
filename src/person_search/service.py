@@ -67,6 +67,13 @@ SENSITIVE_CLEANUP_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 logger = logging.getLogger(__name__)
 
 
+def _provider_is_accelerated(provider: object) -> bool:
+    """Select the high-rate budget branch for GPU and RK3588 NPU providers."""
+
+    value = str(provider).upper()
+    return any(token in value for token in ("CUDA", "TENSORRT", "RKNN", "NPU"))
+
+
 class EventHub:
     def __init__(self, capacity: int = 256):
         self._events: deque[dict[str, Any]] = deque(maxlen=capacity)
@@ -1030,19 +1037,22 @@ class SearchSession:
             self.face_backend, "detection_provider_name", self.face_backend.provider_name
         )
         face_is_cuda = "CUDA" in face_provider
-        person_is_cuda = "CUDA" in self.person_detector.provider_name
+        face_is_accelerated = _provider_is_accelerated(face_provider)
+        person_is_accelerated = _provider_is_accelerated(self.person_detector.provider_name)
         return {
             "person_detection_hz": (
                 settings.person_detection_hz_cuda
-                if person_is_cuda
+                if person_is_accelerated
                 else settings.person_detection_hz_cpu
             ),
             "face_detection_hz": (
-                settings.face_detection_hz_cuda if face_is_cuda else settings.face_detection_hz_cpu
+                settings.face_detection_hz_cuda
+                if face_is_accelerated
+                else settings.face_detection_hz_cpu
             ),
             "roi_face_detection_hz": (
                 settings.roi_face_detection_hz_cuda
-                if face_is_cuda
+                if face_is_accelerated
                 else settings.roi_face_detection_hz_cpu
             ),
             "target_loop_hz": settings.target_loop_hz,
@@ -1160,20 +1170,21 @@ class SearchSession:
             self.face_backend, "detection_provider_name", self.face_backend.provider_name
         )
         face_is_cuda = "CUDA" in face_detection_provider
-        person_is_cuda = "CUDA" in self.person_detector.provider_name
+        face_is_accelerated = _provider_is_accelerated(face_detection_provider)
+        person_is_accelerated = _provider_is_accelerated(self.person_detector.provider_name)
         person_hz = (
             self.settings.person_detection_hz_cuda
-            if person_is_cuda
+            if person_is_accelerated
             else self.settings.person_detection_hz_cpu
         )
         face_hz = (
             self.settings.face_detection_hz_cuda
-            if face_is_cuda
+            if face_is_accelerated
             else self.settings.face_detection_hz_cpu
         )
         roi_face_hz = (
             self.settings.roi_face_detection_hz_cuda
-            if face_is_cuda
+            if face_is_accelerated
             else self.settings.roi_face_detection_hz_cpu
         )
         shallow_scales = self.settings.full_frame_detection_scales(
@@ -2669,8 +2680,22 @@ class SearchManager:
         person_detector: PersonDetector | None = None,
     ):
         self.settings = settings
-        self.face_backend = face_backend or InsightFaceBackend(settings)
-        self.person_detector = person_detector or YoloXOnnxDetector(settings)
+        if face_backend is None:
+            if settings.inference_backend == "rknn":
+                from .rknn_backends import RknnFaceBackend
+
+                face_backend = RknnFaceBackend(settings)
+            else:
+                face_backend = InsightFaceBackend(settings)
+        if person_detector is None:
+            if settings.inference_backend == "rknn":
+                from .rknn_backends import RknnYoloXDetector
+
+                person_detector = RknnYoloXDetector(settings)
+            else:
+                person_detector = YoloXOnnxDetector(settings)
+        self.face_backend = face_backend
+        self.person_detector = person_detector
         self._targets: dict[str, Target] = {}
         self._sessions: dict[str, SearchSession] = {}
         self._request_index: dict[str, str] = {}
@@ -3045,6 +3070,13 @@ class SearchManager:
                 session.defer_sensitive_cleanup()
             except Exception as exc:  # noqa: BLE001 - shutdown remains best effort
                 logger.warning("session sensitive shutdown cleanup failed: %s", type(exc).__name__)
+        for component in (self.face_backend, self.person_detector):
+            close = getattr(component, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001 - release other components too
+                    logger.warning("model shutdown cleanup failed: %s", type(exc).__name__)
 
     def _ensure_open(self) -> None:
         with self._lock:

@@ -185,8 +185,14 @@ def run_offline(
     if not capture.isOpened():
         raise SystemExit(f"cannot open video: {video_path}")
 
-    face_backend = InsightFaceBackend(settings)
-    detector = YoloXOnnxDetector(settings)
+    if settings.inference_backend == "rknn":
+        from .rknn_backends import RknnFaceBackend, RknnYoloXDetector
+
+        face_backend = RknnFaceBackend(settings)
+        detector = RknnYoloXDetector(settings)
+    else:
+        face_backend = InsightFaceBackend(settings)
+        detector = YoloXOnnxDetector(settings)
     manager = SearchManager(settings, face_backend=face_backend, person_detector=detector)
     target_view = manager.enroll(photo, name or photo_path.stem)
     target = manager.get_target(target_view.target_id)

@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     insightface_model: str = "buffalo_l"
     insightface_root: Path = Path("~/.insightface").expanduser()
     yolox_model: Path = Path("models/yolox_tiny.onnx")
+    # The default remains the existing ONNX Runtime path.  RKNN is opt-in so a
+    # normal development checkout does not fail merely because librknnrt.so and
+    # converted models are absent.
+    inference_backend: Literal["onnx", "rknn"] = "onnx"
+    rknn_runtime_library: Path | None = None
+    rknn_yolox_model: Path | None = None
+    rknn_face_detection_model: Path | None = None
+    rknn_face_recognition_model: Path | None = None
     prefer_cuda: bool = True
     # 0 uses InsightFace 1.x Auto mode: 128x128 + 640x640. The small pass is
     # important for close-up faces that can be missed by a fixed 640x640 pass.
@@ -229,6 +237,14 @@ class Settings(BaseSettings):
     rtsp_reconnect_max_seconds: float = Field(default=10.0, gt=0, le=3600)
     rtsp_open_timeout_seconds: float = Field(default=5.0, gt=0, le=3600)
     rtsp_read_timeout_seconds: float = Field(default=5.0, gt=0, le=3600)
+    # The RK3588 image has a Rockchip GStreamer decoder, while the Python 3.11
+    # OpenCV wheel generally does not expose that build.  The gstreamer reader
+    # therefore delegates capture to the box's system Python/OpenCV helper.
+    video_backend: Literal["opencv", "gstreamer"] = "opencv"
+    gstreamer_python: Path = Path("/usr/bin/python3")
+    gstreamer_helper: Path = Path("scripts/rk3588_gstreamer_capture.py")
+    gstreamer_latency_ms: int = Field(default=100, ge=0, le=10000)
+    gstreamer_rtsp_codec: Literal["auto", "h264", "h265"] = "auto"
 
     # Terminal sessions retain only a metadata snapshot after the worker is done;
     # these bounds are used by SearchManager's TTL/LRU cleanup.  A positive TTL is

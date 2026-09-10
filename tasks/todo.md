@@ -1,3 +1,16 @@
+# RK3588 原生部署适配（eis100，2026-09-10）
+
+## 本轮清单
+
+- [x] 增加 RKNN Runtime（ctypes）及 YOLOX / SCRFD / ArcFace 后端
+- [x] 增加 RK3588 GStreamer 硬解输入，保留 OpenCV/ONNX 默认路径
+- [x] 增加 RKNN 模型转换脚本、原生部署脚本和盒子配置说明
+- [x] 补齐配置、后端、视频输入测试，并通过本地质量检查
+- [ ] 在盒子上做无破坏性 smoke test，确认端口、NPU 和服务 ready
+- [ ] 等用户提供真实 RTSP 与登记照片后，完成现场识别及阈值标定
+
+---
+
 # 线上 embedding、版本与生命周期收尾（2026-08-31）
 
 ## 基线

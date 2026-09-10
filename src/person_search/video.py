@@ -13,6 +13,7 @@ import numpy as np
 from .config import Settings
 from .domain import SearchStatus, SourceConfig, SourceType
 from .errors import SearchStopTimeoutError
+from .gstreamer_capture import GStreamerCapture
 
 _READER_STOP_TIMEOUT_SECONDS = 3.0
 
@@ -90,7 +91,7 @@ class LatestFrameReader:
                 return
 
     def _capture_loop(self) -> None:
-        capture: cv2.VideoCapture | None = None
+        capture: cv2.VideoCapture | GStreamerCapture | None = None
         reconnect_delay = 1.0
         frame_id = 0
         announced_lost = False
@@ -164,10 +165,12 @@ class LatestFrameReader:
                 capture.release()
             self.ended.set()
 
-    def _open(self) -> cv2.VideoCapture:
+    def _open(self) -> cv2.VideoCapture | GStreamerCapture:
         if self.source.type == SourceType.CAMERA:
             return cv2.VideoCapture(int(self.source.device_index))
         if self.source.type == SourceType.RTSP:
+            if self.settings.video_backend == "gstreamer":
+                return GStreamerCapture(self.source, self.settings)
             # OpenCV delegates RTSP to FFmpeg. Without an explicit transport,
             # FFmpeg commonly selects UDP and damaged H.264 frames persist until
             # the next keyframe when packets are lost.

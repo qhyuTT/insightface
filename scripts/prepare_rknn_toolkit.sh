@@ -21,7 +21,9 @@ uv venv --python "${rknn_python}" "${rknn_venv}"
 uv pip install --python "${rknn_venv}/bin/python" \
   "${toolkit_wheel}" \
   'numpy<2' \
-  'onnx<1.17'
+  'onnx<1.17' \
+  'onnxoptimizer==0.3.8' \
+  'Pillow>=10.0.1'
 
 "${rknn_venv}/bin/python" -c \
   'from rknn.api import RKNN; print("RKNN Toolkit2 import OK:", RKNN)'

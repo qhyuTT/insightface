@@ -120,11 +120,12 @@ class TensorInfo:
 def _context_type() -> type[ctypes._SimpleCData]:
     """Return the context scalar used by the RKNN ABI on this architecture."""
 
-    # rknn_context is uint32_t in the current header on both 32-bit and 64-bit
-    # targets.  Keeping the function makes the ABI choice explicit and leaves a
-    # single place to adjust if a vendor runtime ever changes it.
-    _ = platform.machine()
-    return ctypes.c_uint32
+    # The vendor header uses uint32_t only under the 32-bit ``__arm__`` define;
+    # aarch64 and x86_64 take the uint64_t branch.  Passing a 32-bit context to
+    # rknn_destroy/query truncates the native handle and can segfault after a
+    # seemingly successful rknn_init.
+    machine = platform.machine().lower()
+    return ctypes.c_uint32 if machine.startswith("arm") and "aarch64" not in machine else ctypes.c_uint64
 
 
 def _candidate_runtime_paths(explicit: Path | None) -> list[Path]:

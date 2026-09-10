@@ -150,7 +150,7 @@ def test_rknn_runtime_queries_abi_and_copies_released_output(monkeypatch, tmp_pa
 
         @staticmethod
         def init(context_ptr, *_args):
-            ctypes.cast(context_ptr, ctypes.POINTER(ctypes.c_uint32))[0] = 7
+            ctypes.cast(context_ptr, ctypes.POINTER(ctypes.c_uint64))[0] = 7
             return 0
 
         @staticmethod

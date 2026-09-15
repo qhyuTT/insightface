@@ -17,7 +17,8 @@ RTSP / USB
 
 EIS100 RK3588 使用原生部署路径即可，不要求 Docker：Python 3.11 服务通过
 `librknnrt.so` 调用 NPU，系统 Python/OpenCV 的 GStreamer helper 让 Rockchip MPP 完成
-RTSP 硬解。默认监听 `18080`，避免与盒端已有的 `8000` 服务冲突。详细步骤见
+RTSP 硬解；RK3588 现场默认以 NV12 桥接 4K H.265，避免系统 `videoconvert` 拖慢预览。
+默认监听 `18080`，避免与盒端已有的 `8000` 服务冲突。详细步骤见
 [RK3588 原生部署](docs/rk3588-deployment.md)；普通开发和 T4 部署仍默认使用 ONNX/OpenCV。
 
 服务一次只运行一个搜索任务，每个任务可包含最多 20 个目标。目标照片和 embedding 只保存在进程内存，搜索停止后自动清除。RTSP URI 在 API 响应中会脱敏。

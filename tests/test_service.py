@@ -28,6 +28,7 @@ from person_search.service import (
     PreviewHub,
     SearchManager,
     SearchSession,
+    _advance_stage_deadline,
     _clone_target,
     _coerce_face_bbox,
     _merge_faces,
@@ -35,6 +36,7 @@ from person_search.service import (
     _safe_error,
     _safe_normalize_embedding,
     _sanitize_source,
+    _select_staggered_stage,
 )
 
 
@@ -44,9 +46,12 @@ def _preview_stub(track_states: dict, *, settings: Settings | None = None) -> Si
     hub.subscribe()
     return SimpleNamespace(
         _track_states=track_states,
+        _debug_faces=[],
         preview=hub,
         settings=settings or Settings(),
         source=SourceConfig(type="camera", device_index=0),
+        metrics=SearchMetrics(),
+        _lock=threading.Lock(),
     )
 
 
@@ -176,6 +181,24 @@ def test_preview_downscales_to_the_configured_width() -> None:
     decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert decoded.shape[1] == 960
     assert decoded.shape[0] == 540
+
+
+def test_preview_metrics_record_frame_age_and_encode_cost() -> None:
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    stub = _preview_stub({})
+
+    assert SearchSession._publish_preview(
+        stub,
+        frame,
+        [],
+        [],
+        captured_at=time.monotonic() - 0.2,
+    )
+
+    assert stub.metrics.preview_frames == 1
+    assert stub.metrics.preview_published_at
+    assert stub.metrics.preview_frame_ages_ms[0] >= 150.0
+    assert stub.metrics.preview_encode_latencies_ms[0] >= 0.0
 
 
 def test_person_roi_faces_translate_bbox_and_landmarks_to_frame_coordinates() -> None:
@@ -1663,6 +1686,7 @@ def _budget_stub(
         metrics=metrics,
         _lock=threading.Lock(),
         _budget_credit=credit_seconds,
+        _last_budget_settle_at=0.0,
     )
     stub._stage_p95_ms = lambda stage: SearchSession._stage_p95_ms(stub, stage)
     stub._record_budget_skip = lambda stage: SearchSession._record_budget_skip(stub, stage)
@@ -1708,7 +1732,14 @@ def test_budget_credit_is_capped_in_both_directions() -> None:
     settings = Settings(target_loop_hz=10.0, budget_credit_max_frames=2.0)
     cap = 2.0 / 10.0
     session = _budget_stub(settings, roi_p95_ms=0.0)
-    session._settle_budget_credit = lambda cost: SearchSession._settle_budget_credit(session, cost)
+    settled_at = 0.0
+
+    def settle(cost):
+        nonlocal settled_at
+        settled_at += 0.1
+        SearchSession._settle_budget_credit(session, cost, settled_at=settled_at)
+
+    session._settle_budget_credit = settle
 
     for _ in range(20):
         session._settle_budget_credit(0.001)  # a long stretch of near-free frames
@@ -1716,6 +1747,37 @@ def test_budget_credit_is_capped_in_both_directions() -> None:
 
     session._settle_budget_credit(5.0)  # one catastrophic pass
     assert session._budget_credit == pytest.approx(-cap)
+
+
+def test_budget_credit_refills_from_elapsed_time_not_frame_count() -> None:
+    session = _budget_stub(Settings(target_loop_hz=10.0), roi_p95_ms=0.0)
+
+    SearchSession._settle_budget_credit(session, 0.005, settled_at=0.05)
+    assert session._budget_credit == pytest.approx(0.045)
+    # A long pause refills at most one target period, not the whole pause.
+    SearchSession._settle_budget_credit(session, 0.005, settled_at=1.05)
+    assert session._budget_credit == pytest.approx(0.14)
+
+
+def test_staggered_full_frame_scheduler_is_fair_and_skips_missed_bursts() -> None:
+    person_deadline = face_deadline = 0.0
+    selected: list[str] = []
+    for now in (0.0, 0.1, 0.2, 0.3, 0.4, 1.5, 1.6):
+        person_due, face_due = _select_staggered_stage(
+            now, person_deadline, face_deadline
+        )
+        assert not (person_due and face_due)
+        if person_due:
+            selected.append("person")
+            person_deadline = _advance_stage_deadline(person_deadline, 0.25, now)
+        if face_due:
+            selected.append("face")
+            face_deadline = _advance_stage_deadline(face_deadline, 0.25, now)
+
+    assert selected[:4] == ["person", "face", "person", "face"]
+    assert selected[-2:] == ["person", "face"]
+    assert person_deadline > 1.5
+    assert face_deadline > 1.6
 
 
 def test_quality_rejected_faces_never_reach_arcface() -> None:
@@ -1763,6 +1825,50 @@ def test_effective_config_reports_the_resolved_rates_and_gates() -> None:
     assert config["required_sampling_hz"] == pytest.approx(3 / 1.5)
     assert config["small_face_required_sampling_hz"] == pytest.approx(4 / 2.0)
     assert config["effective_search_min_face_px"] == Settings().effective_search_min_face_px
+    assert config["video_backend"] == "opencv"
+    assert config["gstreamer_latency_ms"] == 500
+    assert config["gstreamer_drop_on_latency"] is False
+    assert config["gstreamer_output_format"] == "bgr"
+    assert config["gstreamer_nv12_converter_requested"] == "opencv"
+    assert config["gstreamer_nv12_converter_active"] == "not_started"
+    assert config["stagger_full_frame_detection"] is False
+    # The ONNX fakes have no static graph; the RKNN fields exist but are empty.
+    assert config["face_detection_static_input"] is None
+    assert config["person_detection_static_input"] is None
+    assert config["rknn_core_mask"] == 0
+    assert config["rknn_core_mask_applied"] == {"person": None, "face": None}
+
+    manager.stop_search(search.search_id)
+
+
+def test_effective_config_reports_static_npu_input_over_the_scale_setting() -> None:
+    """A static RKNN graph ignores face_detection_size; the panel must say what runs."""
+
+    class _StaticFaceBackend(FakeFaceBackend):
+        static_input_hw = (736, 1280)
+        core_mask_applied = True
+
+    class _StaticPersonDetector(FakePersonDetector):
+        static_input_hw = (384, 640)
+        core_mask_applied = False
+
+    manager = SearchManager(
+        Settings(face_detection_size=640, rknn_core_mask=7),
+        _StaticFaceBackend([make_face()]),
+        _StaticPersonDetector(),
+    )
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "Alice")
+    search = manager.start_search(
+        target.target_id, SourceConfig(type="camera", device_index=0)
+    )
+    session = manager.get_session(search.search_id)
+
+    config = session.view().effective_config
+
+    assert config["face_detection_static_input"] == "1280x736"
+    assert config["person_detection_static_input"] == "640x384"
+    assert config["rknn_core_mask"] == 7
+    assert config["rknn_core_mask_applied"] == {"person": False, "face": True}
 
     manager.stop_search(search.search_id)
 

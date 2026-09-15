@@ -84,6 +84,17 @@ class Settings(BaseSettings):
     rknn_yolox_model: Path | None = None
     rknn_face_detection_model: Path | None = None
     rknn_face_recognition_model: Path | None = None
+    # Enrollment photos are close-ups; search frames are far scenes.  The same
+    # asymmetry the ONNX backend expresses with enrollment_detection_size: a
+    # static graph quantised on far 4K frames rejected a portrait that the
+    # FP16 640x640 graph accepted (detection_score_low).  Unset means the search
+    # detector serves both.
+    rknn_enrollment_face_detection_model: Path | None = None
+    # RK3588 has three NPU cores and a context runs on one of them by default.
+    # 7 (RKNN_NPU_CORE_0_1_2) spreads each model across all three; measured on the
+    # EIS100 box: ArcFace 24 -> 15.7 ms, SCRFD-10G 87 -> 74 ms.  0 keeps the vendor
+    # default so a runtime without that many cores is never asked for them.
+    rknn_core_mask: int = Field(default=0, ge=0, le=7)
     prefer_cuda: bool = True
     # 0 uses InsightFace 1.x Auto mode: 128x128 + 640x640. The small pass is
     # important for close-up faces that can be missed by a fixed 640x640 pass.
@@ -120,6 +131,10 @@ class Settings(BaseSettings):
     person_detection_hz_cuda: float = Field(default=12.0, gt=0, le=240)
     face_detection_hz_cpu: float = Field(default=5.0, gt=0, le=240)
     face_detection_hz_cuda: float = Field(default=10.0, gt=0, le=240)
+    # When both full-frame detectors are overdue on an accelerator, run them on
+    # alternating frames instead of serialising both into one long frame. The
+    # first frame after (re)connect still runs both to seed tracks and faces.
+    stagger_full_frame_detection: bool = False
     frame_queue_size: int = Field(default=2, ge=1, le=256)
 
     face_detection_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
@@ -243,7 +258,23 @@ class Settings(BaseSettings):
     video_backend: Literal["opencv", "gstreamer"] = "opencv"
     gstreamer_python: Path = Path("/usr/bin/python3")
     gstreamer_helper: Path = Path("scripts/rk3588_gstreamer_capture.py")
-    gstreamer_latency_ms: int = Field(default=100, ge=0, le=10000)
+    # Keep enough jitter-buffer headroom for the RK3588 H.265 main stream.  The
+    # helper uses a latest-frame appsink, so this does not create a consumer-side
+    # queue; it only prevents late RTP packets from being discarded too eagerly.
+    gstreamer_latency_ms: int = Field(default=500, ge=0, le=10000)
+    # ``drop-on-latency`` can turn a late H.265 reference frame into a green MPP
+    # surface on the EIS100 image.  It is opt-in for experiments, never the safe
+    # default.
+    gstreamer_drop_on_latency: bool = False
+    # BGR remains the portable default.  The RK3588 deployment selects NV12 so
+    # the system helper does not pay a 4K software videoconvert before the frame
+    # crosses into the application's Python environment.
+    gstreamer_output_format: Literal["bgr", "nv12"] = "bgr"
+    # Auto attempts the RK3588 RGA and permanently falls back to OpenCV if the
+    # library, device permission, or a concrete buffer is unsupported.  Keeping
+    # the portable default on OpenCV avoids probing librga on ordinary hosts.
+    gstreamer_nv12_converter: Literal["opencv", "auto", "rga"] = "opencv"
+    rga_runtime_library: Path = Path("/lib/aarch64-linux-gnu/librga.so.2")
     gstreamer_rtsp_codec: Literal["auto", "h264", "h265"] = "auto"
 
     # Terminal sessions retain only a metadata snapshot after the worker is done;

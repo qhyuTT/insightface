@@ -6,6 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/ssd/person-search
+# The box is 4x Cortex-A76 (cpu4-7) + 4x Cortex-A55 (cpu0-3).  Pre/post-processing
+# measured 3-7x slower on the little cores (4K NV12->BGR, letterbox, NMS, JPEG),
+# and the scheduler left the worker thread there.  The capture helper inherits
+# this mask.  Inference itself stays on the NPU regardless.
+CPUAffinity=4-7
 Environment=PYTHONUNBUFFERED=1
 Environment=PERSON_SEARCH_HOST=0.0.0.0
 Environment=PERSON_SEARCH_PORT=18080
@@ -13,16 +18,56 @@ Environment=PERSON_SEARCH_INFERENCE_BACKEND=rknn
 Environment=PERSON_SEARCH_VIDEO_BACKEND=gstreamer
 Environment=PERSON_SEARCH_PREFER_CUDA=false
 Environment=PERSON_SEARCH_RKNN_RUNTIME_LIBRARY=/ssd/person-search/runtime/librknnrt.so
-Environment=PERSON_SEARCH_RKNN_YOLOX_MODEL=/ssd/person-search/models/rk3588/yolox_tiny.rknn
-Environment=PERSON_SEARCH_RKNN_FACE_DETECTION_MODEL=/ssd/person-search/models/rk3588/scrfd_10g_640.rknn
+# Static NPU graphs built for the 16:9 4K camera (scripts/convert_rk3588_models.py,
+# see docs/rk3588-deployment.md "性能基线").  SCRFD 1280x736 INT8: 48 ms on three cores
+# against 71 ms for the old 640x640 FP16, with twice the pixels per face and 53/53
+# detections matching ONNX on held-out frames.  YOLOX 640x384 stays FP16: its INT8
+# build lost 8 of 91 persons, and person boxes drive face association.
+Environment=PERSON_SEARCH_RKNN_YOLOX_MODEL=/ssd/person-search/models/rk3588/yolox_tiny_640x384.rknn
+Environment=PERSON_SEARCH_PERSON_INPUT_WIDTH=640
+Environment=PERSON_SEARCH_PERSON_INPUT_HEIGHT=384
+Environment=PERSON_SEARCH_RKNN_FACE_DETECTION_MODEL=/ssd/person-search/models/rk3588/scrfd_10g_1280x736_int8.rknn
+# Enrollment photos are close-ups.  The INT8 far-scene graph rejected a portrait
+# the FP16 640x640 graph accepts (detection_score_low), so enrollment keeps the
+# graph that was validated for it.  Enrollment gates themselves are unchanged.
+Environment=PERSON_SEARCH_RKNN_ENROLLMENT_FACE_DETECTION_MODEL=/ssd/person-search/models/rk3588/scrfd_10g_640.rknn
 Environment=PERSON_SEARCH_RKNN_FACE_RECOGNITION_MODEL=/ssd/person-search/models/rk3588/w600k_r50.rknn
 Environment=PERSON_SEARCH_GSTREAMER_PYTHON=/usr/bin/python3
 Environment=PERSON_SEARCH_GSTREAMER_HELPER=/ssd/person-search/scripts/rk3588_gstreamer_capture.py
+Environment=PERSON_SEARCH_GSTREAMER_LATENCY_MS=500
+Environment=PERSON_SEARCH_GSTREAMER_DROP_ON_LATENCY=false
+Environment=PERSON_SEARCH_GSTREAMER_OUTPUT_FORMAT=nv12
+Environment=PERSON_SEARCH_GSTREAMER_NV12_CONVERTER=auto
+Environment=PERSON_SEARCH_RGA_RUNTIME_LIBRARY=/lib/aarch64-linux-gnu/librga.so.2
+Environment=PERSON_SEARCH_GSTREAMER_RTSP_CODEC=auto
+Environment=PERSON_SEARCH_RTSP_TRANSPORT=tcp
 Environment=PERSON_SEARCH_FACE_DETECTION_SIZE=640
 Environment=PERSON_SEARCH_ENROLLMENT_DETECTION_SIZE=640
 Environment=PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CPU=0
 Environment=PERSON_SEARCH_TINY_FACE_ENABLED=true
 Environment=PERSON_SEARCH_TINY_FACE_SHADOW_MODE=true
+# Run each RKNN context on all three NPU cores (ArcFace 24->15.7ms, SCRFD 87->74ms).
+Environment=PERSON_SEARCH_RKNN_CORE_MASK=7
+# Fixed wall camera (camera_motion_px_p95 = 4.7px): motion compensation is a 4K
+# cvtColor+resize per person pass for nothing.  Re-enable on a moving robot.
+Environment=PERSON_SEARCH_CAMERA_MOTION_COMPENSATION=false
+# YOLOX and SCRFD otherwise become due together and serialize into a 163ms frame.
+# Alternate overdue passes after the reconnect seed frame; at a 10fps loop this
+# preserves roughly 5Hz for each detector instead of locking the loop near 6fps.
+Environment=PERSON_SEARCH_STAGGER_FULL_FRAME_DETECTION=true
+Environment=PERSON_SEARCH_PERSON_DETECTION_HZ_CUDA=4
+Environment=PERSON_SEARCH_FACE_DETECTION_HZ_CUDA=4
+# This is the ROI budget denominator, not a loop throttle. Keep 4 so the small-
+# face ROI supplement retains its measured duty cycle after detector staggering.
+Environment=PERSON_SEARCH_TARGET_LOOP_HZ=4
+# Walkers are frame-starved: top_k_mean, 0.1s sample spacing, 4-frame far tier.
+# Spends frames only; no similarity threshold moves.
+Environment=PERSON_SEARCH_MATCH_PROFILE=transit
+# A seated person with no body box lives on a face-only track; one missed
+# detection at ~4 fps must not reset its evidence.  The fallback policy stays.
+Environment=PERSON_SEARCH_FACE_TRACK_BUFFER_SECONDS=2.5
+# systemd lets EnvironmentFile override Environment=, whatever the order, so keep
+# the keys above out of .env unless the intent is to change them.
 EnvironmentFile=-/ssd/person-search/.env
 ExecStart=/ssd/person-search/.venv/bin/person-search-api
 Restart=on-failure

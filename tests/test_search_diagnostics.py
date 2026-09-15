@@ -57,6 +57,8 @@ def test_search_view_diagnostic_fields_are_backward_compatible() -> None:
     assert view.match_stage_counts == {}
     assert view.stage_p95_latency_ms == {}
     assert view.effective_hz == {}
+    assert view.preview_fps == 0.0
+    assert view.preview_frame_age_p95_ms == 0.0
 
     target = TargetSearchView(target_id="target-1", name="目标")
     assert target.best_observed_similarity is None

@@ -1,3 +1,84 @@
+# RK3588 识别 10–15 FPS 实测与 RGA 加速（2026-09-15）
+
+- [x] 只读核对现网：三模型均为 `RKNN_NPU`、A76 affinity 生效、NV12 桥接生效，`target_loop_hz=4`
+- [x] 盒端静态 4K 基准：YOLOX 108.2ms、SCRFD 65.0ms、串行 163.0ms（完整检测上限 6.13fps）
+- [x] 为 `/dev/rga` 配置持久 `root:render 0660` 权限并验证非 root 可访问
+- [x] 实现 RGA NV12→BGR 可选加速、首帧实测择优、CPU 自动回退和运行时可观测性
+- [x] 补齐单元测试、全量 pytest、ruff 与 diff 静态检查（338 passed）
+- [x] 部署到 `.203`，验证三模型 readiness、设备权限和 RGA 失败自动回退
+- [x] 用真实 RTSP A/B 全帧检测同帧/错峰；`target_loop_hz` 只控制 ROI 信用，不再误作循环限速旋钮
+- [x] 最终配置保留错峰和 3 路 ROI：处理循环 4.93→10.25fps；全帧人脸约3.52Hz，未冒充10Hz完整识别
+- [x] 撤回 `roi_max_tracks_per_pass=1`：机场多人补检容量保持 3，不以降低多人召回换帧率
+
+# RK3588 登记检测模型隔离（2026-09-14）
+
+- [ ] 在盒端用同一近距离人脸 A/B `SCRFD 1280x736 INT8` 与 `SCRFD 640x640 FP16`，记录检测分和质量门结果
+- [ ] 核对登记调用链只选择独立 FP16 640 图，搜索/ROI 继续使用 1280x736 INT8 图
+- [ ] 补齐生产配置、可观测性与回归测试，不调整 `min_enrollment_detection_score`
+- [ ] 部署并通过 `/readyz`、真实登记请求及搜索静态输入检查
+
+# RK3588 性能与识别率优化（2026-09-14，实测驱动）
+
+实测见 `docs/rk3588-deployment.md` 的「性能基线」节。推理全部保留在 NPU；CPU 侧只做解码后转换、缩放、NMS、预览。
+
+- [x] P0 配置：`CPUAffinity=4-7`、关 CMC、`target_loop_hz=4`、`match_profile=transit`、`face_track_buffer_seconds=2.5`
+- [x] P1 `GStreamerCapture.grab()` 不做 NV12→BGR（丢弃帧不再付 19ms 转换）
+- [x] P1 `rknn_core_mask`（`rknn_set_core_mask`，默认 0 不改行为；缺符号/被拒只告警）
+- [x] P1 RKNN 后端上报真实静态输入尺寸与掩码是否生效到 `effective_config` / 面板
+- [x] P1 采集 helper 的 stderr 尾部进日志（脱敏 RTSP 凭据）
+- [x] 文档：CPU 是 4×A76+4×A55；`/dev/rga` 权限；基线数字
+- [x] 测试 + ruff 全绿（新增 7 个测试）
+- [x] 部署到 .203、重启：三个 provider 均 `RKNN_NPU`，进程 affinity `4-7`，环境变量全部生效
+- [x] 步骤 0：RKNN vs ONNX 一致性 —— ArcFace cos **1.0000**（3 个裁剪），SCRFD 分数相关 0.9999、
+      max|diff| 0.0011。旧快照的 `best_observed_similarity=0.0246` 是目标不在画面，不是链路问题。
+- [x] ArcFace 对齐改为 Umeyama 最小二乘（与 InsightFace/skimage 参考逐元素一致；LMEDS 在远脸噪声下 10% 裁剪偏 ≥6px）；已部署
+- [x] **现场读数**（2026-09-14 20:27 任务，用户坐姿约 8 分钟后走近）：处理 6.0–6.6 fps / 源 13 fps，无重连；
+      坐姿人脸 56–165px（4K）落���脸档，最高相似度 0.537 < 0.64，卡点 `similarity_low`（关联与 ROI 均正常：
+      `person_strict` 677、`person_relaxed` 34、`face_fallback` 110、`roi/frame` 0.55–0.96）；
+      走近后普通档 3 帧、相似度 0.653 确认，调度侧收到并完成返程。
+- [ ] **现场读数（对齐修正后）**：跑一次真实寻人，读 `processed_fps`、`stage_p95_latency_ms`、
+      `unconfirmed_gate_counts`、`association_counts`（期望 `person_relaxed`>0、`unassociated` 占比下降）、
+      `roi_calls_per_frame`>0、`rknn_core_mask_applied`。
+- [x] P2/P3：盒上转换 + 基准 + 留出帧 ONNX 一致性（表见 docs）。定案 SCRFD 1280×736 INT8（48ms，
+      53/53 匹配）+ YOLOX 640×384 FP16（78ms，91/91）；YOLOX INT8 丢 8/91 人弃用；ArcFace 保持 FP16。
+      已部署（21:35），`static inputs: person (384, 640) face (736, 1280)`。
+- [x] 登记照被 INT8 远景模型拒绝（`detection_score_low`）→ 新增 `rknn_enrollment_face_detection_model`，
+      登记指回 FP16 640²，登记门槛不变；已部署（`search (736,1280) / enrollment (640,640)`）。
+- [ ] **现场读数（新模型）**：用户重新登记后坐姿对比 `best_observed_similarity`（旧模型 0.537）。
+- [ ] 运维：请管理员放开 `/dev/rga`，之后 `mppvideodec format=BGR` 可省掉全部 CPU 色彩转换。
+
+## 复盘
+
+- 1 FPS 的根因不在推理而在采集：`videoconvert` 在 4K 上 1.18 fps；NPU 三个模型合计每帧 ~190ms。
+- 「坐着只露头 / 行人」识别差的共同约束是 640² 静态 SCRFD 对 4K 帧的 6 倍降采样（76px 脸 → 12.7px），
+  不是阈值；下一步是输入形状与 INT8，不是调 similarity。
+- systemd 的 `EnvironmentFile=` 无论书写顺序都覆盖 `Environment=`，unit 里放在其后的重复块不起作用；已删除。
+
+# RK3588 RTSP 绿帧与预览延迟修复（2026-09-14）
+
+- [x] 增加 GStreamer 稳定缓冲配置，修复 H.265 绿帧
+- [x] 增加 NV12 帧桥接，绕过 4K `videoconvert` BGR 瓶颈
+- [x] 将最新帧预览从推理线程解耦，并补充预览延迟指标
+- [x] 补齐本地测试、部署配置和重启后的现场验证
+- [x] 在 RK3588 上重启服务、重新登记目标并完成页面流验收（VLC 同屏视觉对比仍需人工完成）
+
+## 现场结果
+
+- 盒端生效配置：`gstreamer / nv12 / tcp / 500ms / drop=false`。
+- `/readyz`：person、face detection、face recognition 均为 `RKNN_NPU`。
+- 页面 MJPEG 连续 12 秒收到 70 帧，`bad_jpegs=0`、`green_frames=0`，约 5.66 FPS。
+- 推理循环从原先约 1 FPS 提升到约 3.6–5 FPS；页面帧龄 P95 约 175ms。
+
+# RK3588 寻人现场识别优化（2026-09-14）
+
+- [x] 现场验证坐姿/近距离链路：`person_relaxed`、`face_fallback` 均实际生效，近距离普通脸成功确认。
+- [x] 定位当前瓶颈：平均处理约 `2.84fps`、丢帧约 `57.8%`、`face_embed` P95 约 `173ms`，ROI 仅运行 `1` 次。
+- [ ] 保持全帧人脸检测为寻人广撒网主通道；ROI 只能作为独立补充通道，不能替代全帧检测或因 ROI 饿死全帧。
+- [ ] RK3588 单目标寻人先以 `roi_max_tracks_per_pass=1` 做现场 A/B，不提高全局循环频率、不降低相似度门槛。
+- [ ] 将全帧检测、人体跟踪和 ArcFace 识别的预算解耦，在保住全帧召回的前提下降低识别阻塞。
+- [ ] 若 ROI 仍不足，再评估 CMC/ArcFace RKNN 路径的耗时，以及静态 SCRFD 1280 模型的召回/延迟回归。
+- [ ] 只验证寻人服务；登机口变更逻辑不在本轮范围。
+
 # RK3588 原生部署适配（eis100，2026-09-10）
 
 ## 本轮清单

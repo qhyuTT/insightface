@@ -41,6 +41,13 @@ class ConversionSpec:
     mean_values: list[list[float]]
     std_values: list[list[float]]
     output_name: str
+    # The toolkit reads calibration images as RGB.  YOLOX consumes raw BGR at
+    # runtime, so its calibration set must be swapped back; the face models take
+    # RGB and must not be.
+    quant_rgb2bgr: bool = False
+    # Calibration list for this spec (``--quantize``); one file per input shape,
+    # because the images must already be letterboxed exactly as the runtime does.
+    dataset: Path | None = None
 
 
 def main() -> int:
@@ -62,6 +69,8 @@ def main() -> int:
         "target_platform": args.platform,
         "quantized": args.quantize,
         "calibration_dataset": str(args.dataset) if args.dataset else None,
+        "scrfd_size": list(args.scrfd_size),
+        "yolox_size": list(args.yolox_size),
         "models": [],
     }
     for spec in specs:
@@ -94,7 +103,34 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="build INT8 models; requires --dataset with representative images",
     )
-    parser.add_argument("--dataset", type=Path, default=None)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=None,
+        help="calibration list used for every model unless a per-model list is given",
+    )
+    parser.add_argument("--scrfd-dataset", type=Path, default=None)
+    parser.add_argument("--yolox-dataset", type=Path, default=None)
+    parser.add_argument(
+        "--scrfd-size",
+        type=_parse_size,
+        default=(640, 640),
+        help="static SCRFD input as WxH, multiples of 32 (default 640x640). A 16:9 "
+        "camera wastes 44%% of a square input on padding; 1280x736 sees a 4K face at "
+        "twice the pixels of 640x640 for 2.3x the compute",
+    )
+    parser.add_argument(
+        "--yolox-size",
+        type=_parse_size,
+        default=(416, 416),
+        help="static YOLOX input as WxH, multiples of 32 (default 416x416)",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="",
+        help="appended to output file names, e.g. '_int8'; sizes other than the "
+        "defaults are always encoded in the name",
+    )
     parser.add_argument(
         "--only",
         choices=("all", "yolox", "face"),
@@ -102,39 +138,70 @@ def parse_args() -> argparse.Namespace:
         help="convert one model family while iterating",
     )
     args = parser.parse_args()
-    if args.quantize and args.dataset is None:
-        parser.error("--quantize requires --dataset")
-    if args.dataset is not None and not args.dataset.is_file():
-        parser.error(f"calibration dataset does not exist: {args.dataset}")
+    for name in ("dataset", "scrfd_dataset", "yolox_dataset"):
+        value = getattr(args, name)
+        if value is not None and not value.is_file():
+            parser.error(f"calibration dataset does not exist: {value}")
+    if args.quantize:
+        needs_face = args.only in ("all", "face") and (args.scrfd_dataset or args.dataset) is None
+        needs_yolox = args.only in ("all", "yolox") and (args.yolox_dataset or args.dataset) is None
+        if needs_face or needs_yolox:
+            parser.error("--quantize requires --dataset or a per-model --scrfd-dataset/--yolox-dataset")
     return args
+
+
+def _parse_size(value: str) -> tuple[int, int]:
+    try:
+        width_text, height_text = value.lower().split("x")
+        width, height = int(width_text), int(height_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected WxH, got {value!r}") from exc
+    if width % 32 or height % 32 or width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("width and height must be positive multiples of 32")
+    return width, height
+
+
+def _sized_name(stem: str, size: tuple[int, int], default: tuple[int, int], suffix: str) -> str:
+    label = "" if size == default else f"_{size[0]}x{size[1]}"
+    return f"{stem}{label}{suffix}.rknn"
 
 
 def build_specs(args: argparse.Namespace) -> list[ConversionSpec]:
     face_root = args.insightface_root.expanduser() / "models" / "buffalo_l"
+    suffix = args.suffix
     specs: list[ConversionSpec] = []
     if args.only in ("all", "yolox"):
+        width, height = args.yolox_size
         specs.append(
             ConversionSpec(
                 name="yolox_tiny",
                 source=args.yolox,
                 input_name="images",
-                input_size=(1, 3, 416, 416),
+                input_size=(1, 3, height, width),
                 mean_values=[[0.0, 0.0, 0.0]],
                 std_values=[[1.0, 1.0, 1.0]],
-                output_name="yolox_tiny.rknn",
+                output_name=_sized_name("yolox_tiny", args.yolox_size, (416, 416), suffix),
+                quant_rgb2bgr=True,
+                dataset=args.yolox_dataset or args.dataset,
             )
         )
     if args.only in ("all", "face"):
+        width, height = args.scrfd_size
         specs.extend(
             [
                 ConversionSpec(
-                    name="scrfd_10g_640",
+                    name="scrfd_10g",
                     source=face_root / "det_10g.onnx",
                     input_name="input.1",
-                    input_size=(1, 3, 640, 640),
+                    input_size=(1, 3, height, width),
                     mean_values=[[127.5, 127.5, 127.5]],
                     std_values=[[128.0, 128.0, 128.0]],
-                    output_name="scrfd_10g_640.rknn",
+                    output_name=(
+                        f"scrfd_10g_640{suffix}.rknn"
+                        if args.scrfd_size == (640, 640)
+                        else f"scrfd_10g_{width}x{height}{suffix}.rknn"
+                    ),
+                    dataset=args.scrfd_dataset or args.dataset,
                 ),
                 ConversionSpec(
                     name="w600k_r50",
@@ -144,6 +211,9 @@ def build_specs(args: argparse.Namespace) -> list[ConversionSpec]:
                     mean_values=[[127.5, 127.5, 127.5]],
                     std_values=[[127.5, 127.5, 127.5]],
                     output_name="w600k_r50.rknn",
+                    # ArcFace stays FP16: an INT8 embedding shifts every similarity
+                    # and would silently invalidate the thresholds.
+                    dataset=None,
                 ),
             ]
         )
@@ -155,12 +225,14 @@ def convert_one(rknn_factory: Any, spec: ConversionSpec, args: argparse.Namespac
         raise SystemExit(f"source ONNX model does not exist: {spec.source}")
     output = args.output_dir / spec.output_name
     print(f"converting {spec.name}: {spec.source} -> {output}")
+    quantize = bool(args.quantize) and spec.dataset is not None
     rknn = rknn_factory(verbose=False)
     try:
         check(rknn.config(
             mean_values=spec.mean_values,
             std_values=spec.std_values,
             target_platform=args.platform,
+            quant_img_RGB2BGR=spec.quant_rgb2bgr,
         ), "rknn.config")
         check(
             rknn.load_onnx(
@@ -172,8 +244,8 @@ def convert_one(rknn_factory: Any, spec: ConversionSpec, args: argparse.Namespac
         )
         check(
             rknn.build(
-                do_quantization=bool(args.quantize),
-                dataset=str(args.dataset) if args.dataset else None,
+                do_quantization=quantize,
+                dataset=str(spec.dataset) if quantize else None,
             ),
             "rknn.build",
         )
@@ -190,6 +262,8 @@ def convert_one(rknn_factory: Any, spec: ConversionSpec, args: argparse.Namespac
         "input_size": list(spec.input_size),
         "mean_values": spec.mean_values,
         "std_values": spec.std_values,
+        "quantized": quantize,
+        "calibration_dataset": str(spec.dataset) if quantize else None,
     }
     print(f"converted {spec.name}: {record['output_sha256']}")
     return record

@@ -64,7 +64,17 @@ MOTION_ESTIMATE_WIDTH = 320
 # fabricated shift is worse for association than no shift at all.
 MOTION_MIN_RESPONSE = 0.05
 SENSITIVE_CLEANUP_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
+PREVIEW_STOP_TIMEOUT_SECONDS = 3.0
 logger = logging.getLogger(__name__)
+
+
+def _static_input_label(backend: object, *, attribute: str = "static_input_hw") -> str | None:
+    """``"WxH"`` for a backend with a fixed input graph, else ``None``."""
+    shape = getattr(backend, attribute, None)
+    if shape is None:
+        return None
+    height, width = shape
+    return f"{int(width)}x{int(height)}"
 
 
 def _provider_is_accelerated(provider: object) -> bool:
@@ -72,6 +82,25 @@ def _provider_is_accelerated(provider: object) -> bool:
 
     value = str(provider).upper()
     return any(token in value for token in ("CUDA", "TENSORRT", "RKNN", "NPU"))
+
+
+def _select_staggered_stage(
+    now: float, next_person_at: float, next_face_at: float
+) -> tuple[bool, bool]:
+    """Choose at most one overdue full-frame stage, earliest deadline first."""
+    person_due = now >= next_person_at
+    face_due = now >= next_face_at
+    if not (person_due and face_due):
+        return person_due, face_due
+    return (True, False) if next_person_at <= next_face_at else (False, True)
+
+
+def _advance_stage_deadline(deadline: float, period: float, now: float) -> float:
+    """Advance to the first future cadence slot without bursting missed work."""
+    if deadline > now:
+        return deadline
+    missed = int((now - deadline) // period) + 1
+    return deadline + missed * period
 
 
 class EventHub:
@@ -277,6 +306,13 @@ class SearchSession:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._reader: LatestFrameReader | None = None
+        self._preview_stop = threading.Event()
+        self._preview_thread: threading.Thread | None = None
+        self._preview_lock = threading.Lock()
+        self._preview_tracks: list[Track] = []
+        self._preview_faces: list[FaceObservation] = []
+        self._preview_debug_faces: list[tuple[FaceObservation, str, float | None]] = []
+        self._preview_track_states: dict[int, tuple[str, float]] = {}
         # A failed queue flush is retained for the next idempotent cleanup pass;
         # dropping the only reference after an exception would turn a transient
         # reader failure into a permanent buffer leak.
@@ -309,6 +345,7 @@ class SearchSession:
         # Loop credit for opportunistic stages. Cheap frames bank headroom, an
         # expensive optional pass spends it. See _roi_fits_budget.
         self._budget_credit = 0.0
+        self._last_budget_settle_at = self.metrics.started_at
         self._motion_hanning: np.ndarray | None = None
         self._debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._finished = threading.Event()
@@ -341,6 +378,74 @@ class SearchSession:
             target=self._run, name=f"search-{self.search_id[:8]}", daemon=True
         )
         self._worker.start()
+
+    def _start_preview_thread(self, reader: LatestFrameReader) -> None:
+        if self.settings.preview_hz <= 0 or self._preview_thread is not None:
+            return
+        self._preview_stop.clear()
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop,
+            args=(reader,),
+            name=f"preview-{self.search_id[:8]}",
+            daemon=True,
+        )
+        self._preview_thread.start()
+
+    def _stop_preview_thread(self) -> None:
+        self._preview_stop.set()
+        thread = self._preview_thread
+        if thread is None:
+            return
+        if thread is not threading.current_thread():
+            thread.join(timeout=PREVIEW_STOP_TIMEOUT_SECONDS)
+        if not thread.is_alive():
+            self._preview_thread = None
+
+    def _preview_loop(self, reader: LatestFrameReader) -> None:
+        """Publish fresh camera frames independently of the inference cadence."""
+        last_frame_id = -1
+        while not self._preview_stop.is_set() and not self._stop.is_set():
+            started = time.monotonic()
+            if getattr(self.preview, "has_subscribers", False):
+                latest_reader = getattr(reader, "latest", None)
+                latest = latest_reader() if latest_reader is not None else None
+                if latest is not None and latest.frame_id != last_frame_id:
+                    with self._preview_lock:
+                        tracks = list(self._preview_tracks)
+                        faces = list(self._preview_faces)
+                        debug_faces = list(self._preview_debug_faces)
+                        track_states = dict(self._preview_track_states)
+                    self._publish_preview(
+                        latest.frame,
+                        tracks,
+                        faces,
+                        captured_at=latest.captured_at,
+                        debug_faces=debug_faces,
+                        track_states=track_states,
+                    )
+                    last_frame_id = latest.frame_id
+            interval = 1.0 / max(self.settings.preview_hz, 0.1)
+            self._preview_stop.wait(max(0.01, interval - (time.monotonic() - started)))
+
+    def _update_preview_snapshot(
+        self, tracks: list[Track], faces: list[FaceObservation]
+    ) -> None:
+        """Copy lightweight overlay state while retaining the latest frame by reference."""
+        with self._preview_lock:
+            self._preview_tracks = [
+                Track(track.track_id, np.asarray(track.bbox, dtype=np.float32).copy(), track.score)
+                for track in tracks
+            ]
+            self._preview_faces = list(faces)
+            self._preview_debug_faces = list(self._debug_faces)
+            self._preview_track_states = dict(self._track_states)
+
+    def _clear_preview_snapshot(self) -> None:
+        with self._preview_lock:
+            self._preview_tracks.clear()
+            self._preview_faces.clear()
+            self._preview_debug_faces.clear()
+            self._preview_track_states.clear()
 
     def _stop_reader_once(self, reader: object) -> None:
         """Stop one reader at most once after a successful call.
@@ -377,6 +482,12 @@ class SearchSession:
         self._transition(SearchStatus.STOPPING, None)
         with self._lock:
             reader = self._reader
+        try:
+            self._stop_preview_thread()
+            self._clear_preview_snapshot()
+        except Exception as exc:  # noqa: BLE001 - preview cleanup is best effort
+            logger.warning("preview worker stop request failed: %s", type(exc).__name__)
+
         if reader is not None:
             try:
                 self._stop_reader_once(reader)
@@ -728,6 +839,7 @@ class SearchSession:
             except Exception as exc:  # noqa: BLE001 - cleanup is best effort
                 cleanup_failed("face tracker", exc)
             self._budget_credit = 0.0
+            self._last_budget_settle_at = time.monotonic()
             self._motion_hanning = None
             try:
                 self.source = _sanitize_source(read_attr("source", None, "source discovery"))  # type: ignore[arg-type]
@@ -756,6 +868,12 @@ class SearchSession:
                     except Exception as placeholder_exc:  # noqa: BLE001
                         cleanup_failed("source sanitization placeholder", placeholder_exc)
             worker_for_retry = self._worker
+
+        try:
+            self._stop_preview_thread()
+            self._clear_preview_snapshot()
+        except Exception as exc:  # noqa: BLE001 - preview cleanup is best effort
+            cleanup_failed("preview worker", exc)
 
         if reader is not None:
             reader_cleanup_failed = False
@@ -1050,6 +1168,7 @@ class SearchSession:
                 if face_is_accelerated
                 else settings.face_detection_hz_cpu
             ),
+            "stagger_full_frame_detection": settings.stagger_full_frame_detection,
             "roi_face_detection_hz": (
                 settings.roi_face_detection_hz_cuda
                 if face_is_accelerated
@@ -1058,6 +1177,33 @@ class SearchSession:
             "target_loop_hz": settings.target_loop_hz,
             "min_processed_fps": settings.min_processed_fps,
             "preview_hz": settings.preview_hz,
+            "video_backend": settings.video_backend,
+            "rtsp_transport": settings.rtsp_transport,
+            "gstreamer_latency_ms": settings.gstreamer_latency_ms,
+            "gstreamer_drop_on_latency": settings.gstreamer_drop_on_latency,
+            "gstreamer_output_format": settings.gstreamer_output_format,
+            "gstreamer_nv12_converter_requested": settings.gstreamer_nv12_converter,
+            "gstreamer_nv12_converter_active": getattr(
+                self._reader, "conversion_provider", "not_started"
+            ),
+            "gstreamer_nv12_converter_fallback_reason": getattr(
+                self._reader, "conversion_fallback_reason", None
+            ),
+            "gstreamer_rtsp_codec": settings.gstreamer_rtsp_codec,
+            # Static NPU graphs ignore the ONNX-style scale settings below.  Report
+            # the shape the converted model really runs at, so an env var that took
+            # no effect (say, 1280 against a 640 model) is visible on the panel
+            # instead of being discovered from a recall that never improved.
+            "person_detection_static_input": _static_input_label(self.person_detector),
+            "face_detection_static_input": _static_input_label(self.face_backend),
+            "enrollment_detection_static_input": _static_input_label(
+                self.face_backend, attribute="enrollment_static_input_hw"
+            ),
+            "rknn_core_mask": settings.rknn_core_mask,
+            "rknn_core_mask_applied": {
+                "person": getattr(self.person_detector, "core_mask_applied", None),
+                "face": getattr(self.face_backend, "core_mask_applied", None),
+            },
             "face_detection_size": settings.face_detection_size or "auto(128+640)",
             "full_frame_detection_scales": list(
                 settings.full_frame_detection_scales(is_cuda=face_is_cuda)
@@ -1164,8 +1310,9 @@ class SearchSession:
         tracks: list[Track] = []
         last_person_at = -1e9
         last_face_at = -1e9
+        next_person_at: float | None = None
+        next_face_at: float | None = None
         last_roi_face_at = -1e9
-        last_preview_at = -1e9
         face_detection_provider = getattr(
             self.face_backend, "detection_provider_name", self.face_backend.provider_name
         )
@@ -1198,6 +1345,7 @@ class SearchSession:
         try:
             if attach_reader:
                 reader.start()
+                self._start_preview_thread(reader)
             else:
                 # A concurrent stop/cleanup claimed the reader slot before the
                 # worker could attach it.  Do not start a detached capture
@@ -1233,8 +1381,9 @@ class SearchSession:
                     # fresh frame.
                     last_person_at = -1e9
                     last_face_at = -1e9
+                    next_person_at = None
+                    next_face_at = None
                     last_roi_face_at = -1e9
-                    last_preview_at = -1e9
                     face_pass_index = 0
                 started = time.monotonic()
                 now = packet.captured_at
@@ -1245,7 +1394,20 @@ class SearchSession:
                 # observation identity so the common no-ROI path does not run the
                 # same Hungarian/greedy matcher twice in one frame.
                 association_cache: dict[int, tuple[int, str]] = {}
-                if now - last_person_at >= 1.0 / max(person_hz, 0.1):
+                person_period = 1.0 / max(person_hz, 0.1)
+                face_period = 1.0 / max(face_hz, 0.1)
+                if self.settings.stagger_full_frame_detection:
+                    if next_person_at is None:
+                        next_person_at = now
+                    if next_face_at is None:
+                        next_face_at = now
+                    person_due, face_due = _select_staggered_stage(
+                        now, next_person_at, next_face_at
+                    )
+                else:
+                    person_due = now - last_person_at >= person_period
+                    face_due = now - last_face_at >= face_period
+                if person_due:
                     stage_started = time.monotonic()
                     detections = self.person_detector.detect(packet.frame)
                     motion, previous_motion_gray = self._estimate_camera_motion(
@@ -1254,8 +1416,12 @@ class SearchSession:
                     tracks = self._tracker.update(detections, motion=motion)
                     self._record_stage("person", stage_started)
                     last_person_at = now
+                    if self.settings.stagger_full_frame_detection:
+                        next_person_at = _advance_stage_deadline(
+                            next_person_at, person_period, now
+                        )
                 faces = []
-                if now - last_face_at >= 1.0 / max(face_hz, 0.1):
+                if face_due:
                     deep = face_pass_index % deep_scan_every_n == 0
                     face_pass_index += 1
                     stage_started = time.monotonic()
@@ -1272,6 +1438,8 @@ class SearchSession:
                         self._record_stage("face_full_deep", stage_started)
                     self._record_face_source("full_frame", len(faces))
                     last_face_at = now
+                    if self.settings.stagger_full_frame_detection:
+                        next_face_at = _advance_stage_deadline(next_face_at, face_period, now)
                     roi_clock = time.monotonic()
                     roi_tracks = self._tracks_needing_roi_face_pass(
                         faces, tracks, association_cache=association_cache
@@ -1558,17 +1726,10 @@ class SearchSession:
                         ):
                             track_states[track_id] = (state_value, similarity)
                 self._track_states = track_states
+                self._update_preview_snapshot(all_tracks, faces)
                 if not self._active_targets:
                     self._transition(SearchStatus.COMPLETED, None, publish=False)
                     break
-                preview_hz = self.settings.preview_hz
-                preview_clock = time.monotonic()
-                if (
-                    preview_hz > 0
-                    and preview_clock - last_preview_at >= 1.0 / preview_hz
-                    and self._publish_preview(packet.frame, all_tracks, faces)
-                ):
-                    last_preview_at = preview_clock
                 frame_cost = time.monotonic() - started
                 self._settle_budget_credit(frame_cost)
                 with self._lock:
@@ -1581,6 +1742,7 @@ class SearchSession:
             self._transition(SearchStatus.FAILED, _safe_error(exc), publish=False)
         finally:
             try:
+                self._stop_preview_thread()
                 try:
                     self._stop_reader_once(reader)
                 except Exception:  # noqa: BLE001 - cleanup must continue if capture teardown fails
@@ -1615,15 +1777,27 @@ class SearchSession:
                     self._finished.set()
 
     def _publish_preview(
-        self, frame: np.ndarray, tracks: list[Track], faces: list[FaceObservation]
+        self,
+        frame: np.ndarray,
+        tracks: list[Track],
+        faces: list[FaceObservation],
+        *,
+        captured_at: float | None = None,
+        debug_faces: list[tuple[FaceObservation, str, float | None]] | None = None,
+        track_states: dict[int, tuple[str, float]] | None = None,
     ) -> bool:
         """Encode an annotated preview. Returns False when the work was skipped.
 
         Nobody watching means no copy and no JPEG encode — this runs on the worker
         thread, so an unwatched preview was pure inference tax.
         """
-        if not self.preview.has_subscribers:
+        if not getattr(self.preview, "has_subscribers", False):
             return False
+        encode_started = time.monotonic()
+        debug_storage = getattr(self, "_debug_faces", []) if debug_faces is None else debug_faces
+        state_storage = (
+            getattr(self, "_track_states", {}) if track_states is None else track_states
+        )
         # Downscale before annotating: a 1440p copy + q82 encode per frame costs
         # more than some inference stages.
         height, width = frame.shape[:2]
@@ -1638,7 +1812,7 @@ class SearchSession:
             canvas = frame.copy()
         for track in tracks:
             x1, y1, x2, y2 = (int(value * scale) for value in track.bbox)
-            state, similarity = self._track_states.get(track.track_id, ("tracking", 0.0))
+            state, similarity = state_storage.get(track.track_id, ("tracking", 0.0))
             if state == "confirmed":
                 color, label = (60, 220, 95), f"FOUND  {similarity:.2f}"
             elif state == "shadow":
@@ -1666,7 +1840,7 @@ class SearchSession:
             color = (232, 232, 232) if face.accepted else (70, 70, 230)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 1)
             if self.source.debug_preview:
-                debug = next((item for item in self._debug_faces if item[0] is face), None)
+                debug = next((item for item in debug_storage if item[0] is face), None)
                 reasons = "ok" if face.accepted else ",".join(face.rejection_reasons)
                 mode = debug[1] if debug else "rejected"
                 similarity = "" if debug is None or debug[2] is None else f" sim={debug[2]:.2f}"
@@ -1684,7 +1858,26 @@ class SearchSession:
         ok, encoded = cv2.imencode(".jpg", canvas, [cv2.IMWRITE_JPEG_QUALITY, 82])
         if ok:
             self.preview.publish(encoded.tobytes())
+            metrics = getattr(self, "metrics", None)
+            if metrics is not None:
+                lock = getattr(self, "_lock", None)
+                if lock is None:
+                    SearchSession._record_preview_metrics(metrics, captured_at, encode_started)
+                else:
+                    with lock:
+                        SearchSession._record_preview_metrics(metrics, captured_at, encode_started)
         return True
+
+    @staticmethod
+    def _record_preview_metrics(
+        metrics: SearchMetrics, captured_at: float | None, encode_started: float
+    ) -> None:
+        published_at = time.monotonic()
+        metrics.preview_frames += 1
+        metrics.preview_published_at.append(published_at)
+        if captured_at is not None:
+            metrics.preview_frame_ages_ms.append(max(0.0, published_at - captured_at) * 1000.0)
+        metrics.preview_encode_latencies_ms.append((published_at - encode_started) * 1000.0)
 
     def _handle_decisions(
         self,
@@ -2285,14 +2478,20 @@ class SearchSession:
             return False
         return True
 
-    def _settle_budget_credit(self, frame_cost_seconds: float) -> None:
+    def _settle_budget_credit(
+        self, frame_cost_seconds: float, *, settled_at: float | None = None
+    ) -> None:
         """Refill the loop credit for this frame and charge what the frame cost.
 
         Debt is capped as well as credit: one catastrophic pass must not starve
         the optional stage for an unbounded stretch afterwards.
         """
-        refill = 1.0 / self.settings.target_loop_hz
-        cap = refill * self.settings.budget_credit_max_frames
+        settled_at = time.monotonic() if settled_at is None else settled_at
+        period = 1.0 / self.settings.target_loop_hz
+        previous = getattr(self, "_last_budget_settle_at", settled_at - period)
+        refill = min(period, max(0.0, settled_at - previous))
+        self._last_budget_settle_at = settled_at
+        cap = period * self.settings.budget_credit_max_frames
         self._budget_credit = float(
             np.clip(self._budget_credit + refill - frame_cost_seconds, -cap, cap)
         )
@@ -2595,6 +2794,7 @@ class SearchSession:
             _wipe_array(face.landmarks)
         self._debug_faces.clear()
         self._track_states.clear()
+        self._clear_preview_snapshot()
         self._shadow_tracks.clear()
         self._roi_misses.clear()
         self._roi_skips.clear()
@@ -2602,6 +2802,7 @@ class SearchSession:
         self._roi_last_pass = {}
         self._roi_schedule_counter = 0
         self._budget_credit = 0.0
+        self._last_budget_settle_at = time.monotonic()
         self._motion_hanning = None
         with self._lock:
             for state in self._target_status.values():

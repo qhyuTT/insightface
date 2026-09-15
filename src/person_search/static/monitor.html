@@ -82,7 +82,7 @@
     @keyframes scan { to { top: 100%; } }
     .result-banner { position: absolute; left: 18px; top: 18px; padding: 10px 13px; background: rgba(7,17,15,.87); border-left: 4px solid var(--signal); font: 700 12px Menlo, monospace; letter-spacing: .08em; }
     .result-banner.found { color: var(--found); border-color: var(--found); }
-    .meta { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--line); }
+    .meta { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid var(--line); }
     .metric { padding: 15px 18px; border-right: 1px solid var(--line); }
     .metric:last-child { border: 0; }
     .metric small { display: block; color: var(--muted); font: 9px Menlo, monospace; letter-spacing: .1em; margin-bottom: 5px; }
@@ -156,6 +156,7 @@
           <div class="meta">
             <div class="metric"><small>SEARCH STATUS</small><strong id="statusMetric">IDLE</strong></div>
             <div class="metric"><small>PROCESSED FPS</small><strong id="fpsMetric">0.0</strong></div>
+            <div class="metric"><small>PREVIEW FPS</small><strong id="previewFpsMetric">0.0</strong></div>
             <div class="metric"><small>P95 LATENCY</small><strong id="latencyMetric">0 ms</strong></div>
             <div class="metric"><small>BEST SIMILARITY</small><strong id="similarityMetric">—</strong></div>
           </div>
@@ -279,6 +280,8 @@
       $('throughputDiag').textContent = [
         `源流 ${num(body.source_fps)}fps`,
         `处理 ${num(body.processed_fps)}fps`,
+        `预览 ${num(body.preview_fps)}fps`,
+        `帧龄P95 ${num(body.preview_frame_age_p95_ms, 0)}ms`,
         `丢帧 ${num((body.drop_rate || 0) * 100, 0)}%`,
         `端到端 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
         `分辨率 ${body.frame_width || 0}×${body.frame_height || 0}`,
@@ -341,7 +344,9 @@
         `目标循环 ${num(config.target_loop_hz)}Hz`,
         `下限 ${num(config.min_processed_fps)}fps`,
         `预览 ${num(config.preview_hz)}Hz`,
-        `det ${config.face_detection_size ?? '?'} / roi ${config.roi_face_detection_size ?? '?'}`,
+        `视频 ${config.video_backend ?? '?'} / ${config.gstreamer_output_format ?? '?'} / 转换 ${config.gstreamer_nv12_converter_active ?? '?'}`,
+        `RTSP ${config.rtsp_transport ?? '?'} / ${config.gstreamer_latency_ms ?? '?'}ms / ${config.gstreamer_drop_on_latency ? 'drop' : '保留'}`,
+        `det ${config.face_detection_static_input ?? config.face_detection_size ?? '?'} / person ${config.person_detection_static_input ?? '-'} / roi ${config.roi_face_detection_size ?? '?'}`,
       ].join('  /  ');
 
       $('configGatesDiag').textContent = [
@@ -518,7 +523,7 @@
       try {
         const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
         if (response.ok) {
-          setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
+          setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('previewFpsMetric').textContent = body.preview_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
           renderDiagnostics(body);
           // Far-face policies suppress candidate events, so the confirmed-decision
           // metric stays empty. Fall back to the best value actually observed.

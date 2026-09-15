@@ -46,7 +46,7 @@ _ARC_FACE_DST = np.asarray(
     dtype=np.float32,
 )
 
-ModelFactory = Callable[[Path, Path | None], RknnModel]
+ModelFactory = Callable[..., RknnModel]
 
 
 class RknnYoloXDetector:
@@ -72,6 +72,15 @@ class RknnYoloXDetector:
     def provider_name(self) -> str:
         return "uninitialized" if self._model is None else self._model.provider_name
 
+    @property
+    def static_input_hw(self) -> tuple[int, int] | None:
+        """The converted model's fixed (height, width); ``None`` until loaded."""
+        return self._input_hw
+
+    @property
+    def core_mask_applied(self) -> bool | None:
+        return None if self._model is None else bool(getattr(self._model, "core_mask_applied", False))
+
     def ensure_ready(self) -> None:
         if self._model is not None and self._model.is_ready:
             return
@@ -84,7 +93,11 @@ class RknnYoloXDetector:
                     "PERSON_SEARCH_RKNN_YOLOX_MODEL is required when "
                     "PERSON_SEARCH_INFERENCE_BACKEND=rknn"
                 )
-            model = self._model_factory(model_path, self.settings.rknn_runtime_library)
+            model = self._model_factory(
+                model_path,
+                self.settings.rknn_runtime_library,
+                core_mask=self.settings.rknn_core_mask,
+            )
             try:
                 model.ensure_ready()
                 input_hw = _image_input_hw(model.input_attrs[0])
@@ -181,8 +194,10 @@ class RknnFaceBackend:
         self.embedding_contract: EmbeddingContract | None = None
         self._model_factory = model_factory
         self._detector: RknnModel | None = None
+        self._enrollment_detector: RknnModel | None = None
         self._recognizer: RknnModel | None = None
         self._detector_hw: tuple[int, int] | None = None
+        self._enrollment_detector_hw: tuple[int, int] | None = None
         self._recognizer_hw: tuple[int, int] | None = None
         self._initialization_lock = threading.Lock()
 
@@ -201,16 +216,37 @@ class RknnFaceBackend:
                     "PERSON_SEARCH_INFERENCE_BACKEND=rknn"
                 )
             detector = self._model_factory(
-                detection_path, self.settings.rknn_runtime_library
+                detection_path,
+                self.settings.rknn_runtime_library,
+                core_mask=self.settings.rknn_core_mask,
             )
             recognizer = self._model_factory(
-                recognition_path, self.settings.rknn_runtime_library
+                recognition_path,
+                self.settings.rknn_runtime_library,
+                core_mask=self.settings.rknn_core_mask,
             )
+            enrollment_path = self.settings.rknn_enrollment_face_detection_model
+            enrollment_detector: RknnModel | None = None
+            enrollment_hw: tuple[int, int] | None = None
+            if enrollment_path is not None and Path(enrollment_path) != Path(detection_path):
+                enrollment_detector = self._model_factory(
+                    enrollment_path,
+                    self.settings.rknn_runtime_library,
+                    core_mask=self.settings.rknn_core_mask,
+                )
             try:
                 detector.ensure_ready()
                 recognizer.ensure_ready()
                 detector_hw = _image_input_hw(detector.input_attrs[0])
                 recognizer_hw = _image_input_hw(recognizer.input_attrs[0])
+                if enrollment_detector is not None:
+                    enrollment_detector.ensure_ready()
+                    enrollment_hw = _image_input_hw(enrollment_detector.input_attrs[0])
+                    if len(enrollment_detector.output_attrs) != (
+                        len(_SCRFD_STRIDES) * _SCRFD_OUTPUTS_PER_STRIDE
+                    ):
+                        raise ValueError("enrollment SCRFD RKNN model must expose 9 outputs")
+                    self._validate_scrfd_outputs(enrollment_detector, enrollment_hw)
                 if len(detector.output_attrs) != len(_SCRFD_STRIDES) * _SCRFD_OUTPUTS_PER_STRIDE:
                     raise ValueError(
                         "SCRFD RKNN model must expose 9 outputs in "
@@ -232,15 +268,21 @@ class RknnFaceBackend:
             except ModelUnavailableError:
                 detector.close()
                 recognizer.close()
+                if enrollment_detector is not None:
+                    enrollment_detector.close()
                 raise
             except Exception as exc:
                 detector.close()
                 recognizer.close()
+                if enrollment_detector is not None:
+                    enrollment_detector.close()
                 raise ModelUnavailableError(f"invalid RKNN face models: {exc}") from exc
 
             self._detector = detector
+            self._enrollment_detector = enrollment_detector
             self._recognizer = recognizer
             self._detector_hw = detector_hw
+            self._enrollment_detector_hw = enrollment_hw
             self._recognizer_hw = recognizer_hw
             self.detection_provider_name = detector.provider_name
             self.recognition_provider_name = recognizer.provider_name
@@ -267,6 +309,28 @@ class RknnFaceBackend:
             and self.embedding_contract is not None
         )
 
+    @property
+    def static_input_hw(self) -> tuple[int, int] | None:
+        """The converted detector's fixed (height, width); ``None`` until loaded.
+
+        The RKNN graph is static, so ``detection_size`` arguments are ignored;
+        this is the shape the full-frame pass actually runs at.
+        """
+        return self._detector_hw
+
+    @property
+    def enrollment_static_input_hw(self) -> tuple[int, int] | None:
+        """Shape of the enrollment detector when it is a separate graph."""
+        return self._enrollment_detector_hw
+
+    @property
+    def core_mask_applied(self) -> bool | None:
+        if self._detector is None or self._recognizer is None:
+            return None
+        return bool(getattr(self._detector, "core_mask_applied", False)) and bool(
+            getattr(self._recognizer, "core_mask_applied", False)
+        )
+
     def detect_faces(
         self,
         frame: np.ndarray,
@@ -281,6 +345,11 @@ class RknnFaceBackend:
         self.ensure_ready()
         detector = self._detector
         detector_hw = self._detector_hw
+        if enrollment and self._enrollment_detector is not None:
+            # Close-up photos get the graph validated for close-ups; the far-scene
+            # search graph is never asked to judge an enrollment portrait.
+            detector = self._enrollment_detector
+            detector_hw = self._enrollment_detector_hw
         if detector is None or detector_hw is None:
             raise ModelUnavailableError("RKNN face detector initialization did not complete")
         boxes, landmarks, scores = self._detect_candidates(frame, detector, detector_hw)
@@ -349,11 +418,15 @@ class RknnFaceBackend:
     def close(self) -> None:
         if self._detector is not None:
             self._detector.close()
+        if self._enrollment_detector is not None:
+            self._enrollment_detector.close()
         if self._recognizer is not None:
             self._recognizer.close()
         self._detector = None
+        self._enrollment_detector = None
         self._recognizer = None
         self._detector_hw = None
+        self._enrollment_detector_hw = None
         self._recognizer_hw = None
         self.embedding_contract = None
 
@@ -512,17 +585,63 @@ def _norm_crop(
     height, width = input_hw
     if (height, width) != (112, 112):
         raise ValueError(f"ArcFace alignment only supports 112x112, got {input_hw}")
-    transform, _ = cv2.estimateAffinePartial2D(
-        points,
-        _ARC_FACE_DST,
-        method=cv2.LMEDS,
-    )
+    transform = _similarity_transform(points, _ARC_FACE_DST)
     if transform is None or not np.isfinite(transform).all():
         raise ValueError("could not estimate ArcFace similarity transform")
     crop = cv2.warpAffine(frame, transform, (width, height), borderValue=0)
     if crop.size == 0 or crop.shape[:2] != (height, width):
         raise ValueError("ArcFace alignment returned an invalid crop")
     return crop
+
+
+def _similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+    """Least-squares 2-D similarity from ``src`` to ``dst`` (Umeyama, PAMI 1991).
+
+    This is what ``skimage.transform.SimilarityTransform.estimate`` computes and
+    therefore what InsightFace's ``norm_crop`` -- and the ONNX backend -- align
+    ArcFace crops with; the network was trained on crops produced this way.  The
+    previous ``cv2.estimateAffinePartial2D(method=LMEDS)`` minimises the *median*
+    residual, so with five landmarks it may fit three and ignore two.  On sharp,
+    well-detected faces the two agree; on the noisy landmarks of a far face they
+    do not, and that is exactly where every point of similarity is needed.
+
+    Returns the 2x3 affine matrix for ``cv2.warpAffine``, or ``None`` when the
+    points are degenerate.
+    """
+    source = np.asarray(src, dtype=np.float64)
+    target = np.asarray(dst, dtype=np.float64)
+    count, dim = source.shape
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_demean = source - source_mean
+    target_demean = target - target_mean
+    covariance = target_demean.T @ source_demean / count
+    reflection = np.ones(dim)
+    if np.linalg.det(covariance) < 0:
+        reflection[dim - 1] = -1
+    u, singular, vt = np.linalg.svd(covariance)
+    tolerance = singular.max() * max(covariance.shape) * np.finfo(float).eps
+    rank = int(np.count_nonzero(singular > tolerance))
+    if rank == 0:
+        return None
+    rotation = np.eye(dim)
+    if rank == dim - 1:
+        if np.linalg.det(u) * np.linalg.det(vt) > 0:
+            rotation = u @ vt
+        else:
+            flipped = reflection.copy()
+            flipped[dim - 1] = -1
+            rotation = u @ np.diag(flipped) @ vt
+    else:
+        rotation = u @ np.diag(reflection) @ vt
+    variance = source_demean.var(axis=0).sum()
+    if variance <= 0:
+        return None
+    scale = float(singular @ reflection) / variance
+    transform = np.empty((dim, dim + 1), dtype=np.float64)
+    transform[:, :dim] = scale * rotation
+    transform[:, dim] = target_mean - scale * (rotation @ source_mean)
+    return transform.astype(np.float32)
 
 
 def _validate_frame(frame: np.ndarray) -> None:

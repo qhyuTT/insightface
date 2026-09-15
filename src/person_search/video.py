@@ -47,6 +47,10 @@ class LatestFrameReader:
         self._thread: threading.Thread | None = None
         self._lifecycle_lock = threading.Lock()
         self._source_epoch = 0
+        self._latest_lock = threading.Lock()
+        self._latest_packet: FramePacket | None = None
+        self._conversion_provider = "not_started"
+        self._conversion_fallback_reason: str | None = None
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -71,6 +75,19 @@ class LatestFrameReader:
         except queue.Empty:
             return None
 
+    def latest(self) -> FramePacket | None:
+        """Return the freshest decoded packet without consuming the work queue."""
+        with self._latest_lock:
+            return self._latest_packet
+
+    @property
+    def conversion_provider(self) -> str:
+        return self._conversion_provider
+
+    @property
+    def conversion_fallback_reason(self) -> str | None:
+        return self._conversion_fallback_reason
+
     def stop(self) -> None:
         self._stop.set()
         with self._lifecycle_lock:
@@ -88,7 +105,9 @@ class LatestFrameReader:
             try:
                 self.frames.get_nowait()
             except queue.Empty:
-                return
+                break
+        with self._latest_lock:
+            self._latest_packet = None
 
     def _capture_loop(self) -> None:
         capture: cv2.VideoCapture | GStreamerCapture | None = None
@@ -101,6 +120,7 @@ class LatestFrameReader:
                     if capture is not None:
                         capture.release()
                     capture = self._open()
+                    self._update_conversion_status(capture)
                     if not capture.isOpened():
                         if not announced_lost:
                             self._source_epoch += 1
@@ -128,11 +148,15 @@ class LatestFrameReader:
                         break
                     capture.release()
                     capture = None
+                    with self._latest_lock:
+                        self._latest_packet = None
                     if not announced_lost:
                         self._source_epoch += 1
                         self.on_status(SearchStatus.SOURCE_LOST, "video source read failed")
                         announced_lost = True
                     continue
+
+                self._update_conversion_status(capture)
 
                 if skip_decode:
                     # Evict the stalest frame so the next iteration has room and
@@ -155,6 +179,8 @@ class LatestFrameReader:
                     frame=frame,
                     source_epoch=self._source_epoch,
                 )
+                with self._latest_lock:
+                    self._latest_packet = packet
                 frame_id += 1
                 try:
                     self.frames.put_nowait(packet)
@@ -164,6 +190,13 @@ class LatestFrameReader:
             if capture is not None:
                 capture.release()
             self.ended.set()
+
+    def _update_conversion_status(self, capture: object) -> None:
+        self._conversion_provider = str(
+            getattr(capture, "conversion_provider", "not_applicable")
+        )
+        reason = getattr(capture, "conversion_fallback_reason", None)
+        self._conversion_fallback_reason = str(reason) if reason else None
 
     def _open(self) -> cv2.VideoCapture | GStreamerCapture:
         if self.source.type == SourceType.CAMERA:

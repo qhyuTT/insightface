@@ -363,6 +363,9 @@ class SearchView(BaseModel):
     source_fps: float = 0.0
     frame_width: int = 0
     frame_height: int = 0
+    preview_fps: float = 0.0
+    preview_frame_age_p95_ms: float = 0.0
+    preview_encode_p95_latency_ms: float = 0.0
     roi_calls_per_frame: float = 0.0
     drop_rate: float = 0.0
     end_to_end_p95_latency_ms: float = 0.0
@@ -533,6 +536,10 @@ class SearchMetrics:
     stage_call_counts: dict[str, int] = field(default_factory=dict)
     frame_width: int = 0
     frame_height: int = 0
+    preview_frames: int = 0
+    preview_published_at: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
+    preview_frame_ages_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
+    preview_encode_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     roi_calls: int = 0
     budget_skips: dict[str, int] = field(default_factory=dict)
     end_to_end_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
@@ -561,6 +568,9 @@ class SearchMetrics:
             "time_to_confirm_seconds",
             "track_dwell_seconds",
             "track_sampling_hz",
+            "preview_published_at",
+            "preview_frame_ages_ms",
+            "preview_encode_latencies_ms",
         ):
             values = getattr(self, name)
             if not isinstance(values, BoundedFloatSeries):
@@ -571,12 +581,14 @@ class SearchMetrics:
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = 0.0
+        now = 0.0
         if not self.started_at:
             fps = 0.0
         else:
             import time
 
-            elapsed = max(time.monotonic() - self.started_at, 1e-6)
+            now = time.monotonic()
+            elapsed = max(now - self.started_at, 1e-6)
             fps = self.frame_count / elapsed
         p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
         stage_p95_latency_ms = {
@@ -591,6 +603,14 @@ class SearchMetrics:
         )
         arrived = self.dropped_frames + self.frame_count
         drop_rate = self.dropped_frames / arrived if arrived else 0.0
+        preview_samples = self.preview_published_at
+        if len(preview_samples) >= 2:
+            preview_window_start = max(preview_samples[0], now - 10.0)
+            preview_window = [item for item in preview_samples if item >= preview_window_start]
+            preview_elapsed = preview_window[-1] - preview_window[0] if len(preview_window) >= 2 else 0.0
+            preview_fps = (len(preview_window) - 1) / preview_elapsed if preview_elapsed > 0 else 0.0
+        else:
+            preview_fps = 0.0
         return {
             "processed_fps": fps,
             "p95_latency_ms": p95,
@@ -612,6 +632,11 @@ class SearchMetrics:
             "source_fps": arrived / elapsed if elapsed else 0.0,
             "frame_width": self.frame_width,
             "frame_height": self.frame_height,
+            "preview_fps": preview_fps,
+            "preview_frame_age_p95_ms": _percentile(self.preview_frame_ages_ms, 95),
+            "preview_encode_p95_latency_ms": _percentile(
+                self.preview_encode_latencies_ms, 95
+            ),
             "roi_calls_per_frame": (
                 self.roi_calls / self.frame_count if self.frame_count else 0.0
             ),

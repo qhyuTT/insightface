@@ -125,7 +125,9 @@ ssh "${ssh_target}" "
 "
 
 if [[ "${start_service}" == "1" ]]; then
-  ssh "${ssh_target}" "systemctl --user enable --now person-search-rk3588.service"
+  # ``enable --now`` does not restart an already-running unit after its source
+  # or environment changed.  Explicit restart is required for a real rollout.
+  ssh "${ssh_target}" "systemctl --user enable person-search-rk3588.service && systemctl --user restart person-search-rk3588.service"
   echo "waiting for native service on ${ssh_target}:18080"
   for _ in {1..20}; do
     if ssh "${ssh_target}" "curl --fail --silent http://127.0.0.1:18080/healthz"; then

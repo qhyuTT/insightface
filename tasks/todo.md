@@ -1190,3 +1190,27 @@ RPP生命周期描述匹配源码和Compose。此次文档验收不重复运行�
 推送前复核：456项pytest通过（7条既有依赖告警），全仓Ruff通过，diff检查通过；暂存17个文本文件，未包含私有配置、模型、媒体、包体或签名材料，新增行敏感模式检查无命中。
 
 远程同步结果：swcaresRobot main已推送6b69e7c，insightface eis100已推送b73678a；git ls-remote核对远程分支与本地提交一致，两仓库工作区均干净、领先/落后均0。当前记录以独立文档提交同步。
+
+## 2026-10-15 框时序与确认诊断
+
+- [x] 补齐活动 SearchView 缺失的采样率、未确认门和确认耗时字段，并核对单/双源口径。
+- [x] 将预览叠框绑定来源帧和 epoch，限制过期框，保持预览最新帧与 AI 队列独立。
+- [x] 增加针对性回归，运行 pytest、Ruff、diff 检查；核对现场配置和活动状态后验证候选镜像。
+- [x] 取得一次同人走过的脱敏终态：正式确认，耗时1.451s，轨迹采样4.82Hz。
+- [ ] 取得异人走过的负样本及用户对实时框的主观观察；单次正样本不代表总体召回/误报验收。
+
+验证：本地 `uv run pytest -q` 457项通过（7条既有告警），`uv run ruff check .`、
+`git diff --check`、监控页 `node --check` 通过。现场旧镜像与本地基线三文件SHA256一致；
+候选仅覆盖domain/service/monitor，隔离合成活动会话四态路由均HTTP200且新诊断字段可读。
+用户手动结束任务后发布 `box-confirm-20261015-v1`（镜像ID
+`sha256:b9a7b79c2df47dcca8304e51988108fa2ea94795b812979b3306a9f539281360`）。
+现场Compose核对保留12个bind mount、13个设备映射、host network/IPC、cpuset 4-7，运行环境
+只变更build revision；上线后healthy/restart=0、healthz/readyz/active/monitor均200、
+三provider仍为RKNN_NPU/RPP_BF16/RKNN_NPU，近期日志无Traceback/ERROR/500。
+原镜像 `rpp-native-input-20261015-v1` 与现场 `swcares-box-confirm-release.py rollback`
+保留。用户重启任务后的单次真实正样本：1920×1080、decoded 648 / processed 496，
+终态completed、found_count=1、confirmed_result_count=1。人脸观测28次中20次<48px，
+8次通过质量门，4次相似度越过阈值，7次严格人体关联；最终3/3证据、最佳相似度0.653
+（需0.55）、确认耗时1.451s、轨迹采样4.82Hz，未确认门为空。预览叠框龄P95 307.9ms，
+过期跳过17帧，预览帧龄P95 72.9ms、编码P95 25.9ms。此为一次正样本，无同画面旧版
+A/B，也无负样本和人工框精度检查，不能断言总体业务效果提升。

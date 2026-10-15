@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from person_search.config import Settings
-from person_search.domain import SourceConfig
+from person_search.domain import SearchMetrics, SourceConfig, Track
 from person_search.service import SearchSession
 from person_search.video import LatestFrameReader
 
@@ -138,6 +138,44 @@ def test_preview_never_republishes_one_frame(monkeypatch):
     session._publish_preview = lambda frame, *_args, **_kwargs: published.append(frame) or True
     SearchSession._preview_loop(session, reader)
     assert published == [0]
+
+
+def test_preview_keeps_new_frames_but_suppresses_stale_or_wrong_epoch_boxes(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr("person_search.service.time.monotonic", lambda: clock.now)
+    session = _preview_session(clock)
+    session._lock = threading.RLock()
+    session.metrics = SearchMetrics()
+    session._preview_tracks = [Track(7, np.array([1, 1, 3, 3], np.float32), 0.9)]
+    session._preview_frame_id = 0
+    session._preview_source_epoch = 0
+    session._preview_captured_at = 0.0
+    reader = _ScheduledReader(clock, [0.0, 0.2, 0.45])
+    published = []
+
+    def encode(frame, tracks, *_args, **_kwargs):
+        published.append((frame, len(tracks)))
+        if len(published) == 3:
+            session._preview_stop.set()
+        return True
+
+    session._publish_preview = encode
+    SearchSession._preview_loop(session, reader)
+    assert published == [(0, 1), (1, 1), (2, 0)]
+    assert session.metrics.preview_overlay_stale_frames == 1
+    assert list(session.metrics.preview_overlay_ages_ms) == pytest.approx([0.0, 200.0])
+
+    session._preview_source_epoch = 0
+    session._preview_captured_at = 0.45
+    session._preview_frame_id = 2
+    session._preview_stop = _ClockEvent(clock)
+    reader.latest = lambda: SimpleNamespace(frame_id=3, captured_at=0.5, source_epoch=1, frame=3)
+    reader.wait_for_new_latest = lambda *_args, **_kwargs: reader.latest()
+    session._publish_preview = lambda frame, tracks, *_args, **_kwargs: (
+        published.append((frame, len(tracks))), session._preview_stop.set(), True
+    )[-1]
+    SearchSession._preview_loop(session, reader)
+    assert published[-1] == (3, 0)
 
 
 def test_no_subscriber_does_not_encode_or_wait_on_source(monkeypatch):

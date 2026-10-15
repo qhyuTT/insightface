@@ -65,6 +65,9 @@ MOTION_ESTIMATE_WIDTH = 320
 MOTION_MIN_RESPONSE = 0.05
 SENSITIVE_CLEANUP_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 PREVIEW_STOP_TIMEOUT_SECONDS = 3.0
+# AI boxes belong to an older decoded frame. Showing them indefinitely on the
+# latest preview makes a walking person appear to leave their own box behind.
+PREVIEW_OVERLAY_MAX_AGE_SECONDS = 0.4
 logger = logging.getLogger(__name__)
 
 
@@ -314,6 +317,9 @@ class SearchSession:
         self._preview_faces: list[FaceObservation] = []
         self._preview_debug_faces: list[tuple[FaceObservation, str, float | None]] = []
         self._preview_track_states: dict[int, tuple[str, float]] = {}
+        self._preview_frame_id = -1
+        self._preview_source_epoch = -1
+        self._preview_captured_at: float | None = None
         # A failed queue flush is retained for the next idempotent cleanup pass;
         # dropping the only reference after an exception would turn a transient
         # reader failure into a permanent buffer leak.
@@ -442,6 +448,28 @@ class SearchSession:
                 faces = list(self._preview_faces)
                 debug_faces = list(self._preview_debug_faces)
                 track_states = dict(self._preview_track_states)
+                overlay_frame_id = getattr(self, "_preview_frame_id", -1)
+                overlay_source_epoch = getattr(self, "_preview_source_epoch", -1)
+                overlay_captured_at = getattr(self, "_preview_captured_at", None)
+            overlay_age = (
+                latest.captured_at - overlay_captured_at
+                if overlay_captured_at is not None
+                else None
+            )
+            overlay_valid = (
+                overlay_age is not None
+                and 0 <= overlay_age <= PREVIEW_OVERLAY_MAX_AGE_SECONDS
+                and overlay_source_epoch == getattr(latest, "source_epoch", 0)
+                and overlay_frame_id <= latest.frame_id
+            )
+            if not overlay_valid:
+                if tracks or faces:
+                    with self._lock:
+                        self.metrics.preview_overlay_stale_frames += 1
+                tracks, faces, debug_faces, track_states = [], [], [], {}
+            elif tracks or faces:
+                with self._lock:
+                    self.metrics.preview_overlay_ages_ms.append(overlay_age * 1000.0)
             if self._publish_preview(
                 latest.frame,
                 tracks,
@@ -456,7 +484,8 @@ class SearchSession:
             next_start = started + interval
 
     def _update_preview_snapshot(
-        self, tracks: list[Track], faces: list[FaceObservation]
+        self, tracks: list[Track], faces: list[FaceObservation],
+        *, frame_id: int, source_epoch: int, captured_at: float,
     ) -> None:
         """Copy lightweight overlay state while retaining the latest frame by reference."""
         with self._preview_lock:
@@ -467,6 +496,9 @@ class SearchSession:
             self._preview_faces = list(faces)
             self._preview_debug_faces = list(self._debug_faces)
             self._preview_track_states = dict(self._track_states)
+            self._preview_frame_id = frame_id
+            self._preview_source_epoch = source_epoch
+            self._preview_captured_at = captured_at
 
     def _clear_preview_snapshot(self) -> None:
         with self._preview_lock:
@@ -474,6 +506,9 @@ class SearchSession:
             self._preview_faces.clear()
             self._preview_debug_faces.clear()
             self._preview_track_states.clear()
+            self._preview_frame_id = -1
+            self._preview_source_epoch = -1
+            self._preview_captured_at = None
 
     def _stop_reader_once(self, reader: object) -> None:
         """Stop one reader at most once after a successful call.
@@ -1230,6 +1265,7 @@ class SearchSession:
             "target_loop_hz": settings.target_loop_hz,
             "min_processed_fps": settings.min_processed_fps,
             "preview_hz": settings.preview_hz,
+            "preview_overlay_max_age_ms": PREVIEW_OVERLAY_MAX_AGE_SECONDS * 1000.0,
             "video_backend": settings.video_backend,
             "rtsp_transport": settings.rtsp_transport,
             "gstreamer_latency_ms": settings.gstreamer_latency_ms,
@@ -1787,7 +1823,12 @@ class SearchSession:
                         ):
                             track_states[track_id] = (state_value, similarity)
                 self._track_states = track_states
-                self._update_preview_snapshot(all_tracks, faces)
+                self._update_preview_snapshot(
+                    all_tracks, faces,
+                    frame_id=packet.frame_id,
+                    source_epoch=source_epoch,
+                    captured_at=packet.captured_at,
+                )
                 if not self._active_targets:
                     self._transition(SearchStatus.COMPLETED, None, publish=False)
                     break
@@ -3131,6 +3172,7 @@ class MultiSourceSearchSession:
                             "processed_frames", "source_fps", "decode_fps", "decoded_frames",
                             "frame_width", "frame_height", "preview_fps", "p95_latency_ms",
                             "preview_frame_age_p95_ms", "preview_encode_p95_latency_ms",
+                            "preview_overlay_age_p95_ms", "preview_overlay_stale_frames",
                             "end_to_end_p95_latency_ms", "latency_scope", "dropped_frames",
                             "drop_rate", "queue_length", "queue_capacity",
                             "last_decoded_frame_age_ms", "capture_p50_latency_ms",
@@ -3140,6 +3182,9 @@ class MultiSourceSearchSession:
                             "face_observations", "accepted_faces", "small_faces",
                             "unassociated_faces", "rejection_counts", "association_counts",
                             "face_size_counts", "face_source_counts", "match_stage_counts",
+                            "achieved_sampling_hz", "confirmed_tracks",
+                            "time_to_confirm_p50_seconds", "time_to_confirm_p95_seconds",
+                            "track_dwell_p50_seconds", "unconfirmed_gate_counts",
                             "roi_calls_per_frame", "roi_batch_count", "embedding_batch_count",
                             "faces_dropped_by_budget", "embedding_failures",
                             "embedding_output_failures", "budget_skips",
@@ -3156,6 +3201,9 @@ class MultiSourceSearchSession:
             decoded_frames=sum(view.decoded_frames for view in views.values()),
             processed_frames=sum(view.processed_frames for view in views.values()),
             preview_fps=sum(view.preview_fps for view in views.values()),
+            preview_overlay_stale_frames=sum(
+                view.preview_overlay_stale_frames for view in views.values()
+            ),
             queue_length=sum(view.queue_length for view in views.values()),
             queue_capacity=sum(view.queue_capacity for view in views.values()),
             latency_scope="per_source",
@@ -3163,6 +3211,7 @@ class MultiSourceSearchSession:
             end_to_end_p95_latency_ms=0.0,
             preview_frame_age_p95_ms=0.0,
             preview_encode_p95_latency_ms=0.0,
+            preview_overlay_age_p95_ms=0.0,
             capture_p50_latency_ms=0.0,
             capture_p95_latency_ms=0.0,
             capture_max_latency_ms=0.0,
@@ -3176,6 +3225,10 @@ class MultiSourceSearchSession:
             camera_motion_px_p95=0.0,
             blur_variance_p50=0.0,
             blur_variance_p95=0.0,
+            achieved_sampling_hz=0.0,
+            time_to_confirm_p50_seconds=0.0,
+            time_to_confirm_p95_seconds=0.0,
+            track_dwell_p50_seconds=0.0,
             effective_hz={
                 stage: sum(view.effective_hz.get(stage, 0.0) for view in views.values())
                 for stage in {stage for view in views.values() for stage in view.effective_hz}
@@ -3183,10 +3236,10 @@ class MultiSourceSearchSession:
         )
         for key in ("face_observations", "accepted_faces", "small_faces", "unassociated_faces",
                     "roi_batch_count", "embedding_batch_count", "faces_dropped_by_budget",
-                    "embedding_failures", "embedding_output_failures"):
+                    "embedding_failures", "embedding_output_failures", "confirmed_tracks"):
             data[key] = sum(getattr(view, key) for view in views.values())
         for key in ("rejection_counts", "association_counts", "face_size_counts", "face_source_counts",
-                    "match_stage_counts", "budget_skips"):
+                    "match_stage_counts", "budget_skips", "unconfirmed_gate_counts"):
             keys = {item for view in views.values() for item in getattr(view, key)}
             data[key] = {item: sum(getattr(view, key).get(item, 0) for view in views.values()) for item in keys}
         arrived = data["decoded_frames"] or (
@@ -3194,7 +3247,6 @@ class MultiSourceSearchSession:
         )
         data["drop_rate"] = data["dropped_frames"] / arrived if arrived else 0.0
         data["roi_calls_per_frame"] = 0.0
-        data["achieved_sampling_hz"] = 0.0
         if found_view is not None:
             data["targets"] = found_view.targets
             data["found_count"] = found_view.found_count

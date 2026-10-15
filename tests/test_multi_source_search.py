@@ -49,6 +49,17 @@ def test_two_sources_share_one_search_but_not_tracking_state(monkeypatch) -> Non
     assert first.source != second.source
     assert first._tracker is not second._tracker
     assert first._confirmations[target_id] is not second._confirmations[target_id]
+    first.metrics.track_sampling_hz.append(2.0)
+    second.metrics.track_sampling_hz.append(4.0)
+    first.metrics.unconfirmed_gate_counts["insufficient_samples"] = 1
+    second.metrics.unconfirmed_gate_counts["aggregate_low"] = 2
+    diagnostics = session.view()
+    assert [item["achieved_sampling_hz"] for item in diagnostics.sources] == [2.0, 4.0]
+    assert diagnostics.achieved_sampling_hz == 0.0  # A per-source rate cannot be summed.
+    assert diagnostics.unconfirmed_gate_counts == {
+        "insufficient_samples": 1,
+        "aggregate_low": 2,
+    }
     assert session.preview_for("source-2") is second.preview
     with pytest.raises(PersonSearchError, match="source not found"):
         session.preview_for("source-3")

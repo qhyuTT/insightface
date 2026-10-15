@@ -345,7 +345,7 @@
         `${stage} P50/P95/max ${Number(item.stage_p50_latency_ms?.[stage] || 0).toFixed(0)}/${Number(p95).toFixed(0)}/${Number(item.stage_max_latency_ms?.[stage] || 0).toFixed(0)}ms n=${item.stage_sample_counts?.[stage] || 0}`
       ).join(' / ');
       $('stageTimingDiag').textContent = diagnostics.latency_scope === 'per_source'
-        ? (diagnostics.sources || []).map(item => `${item.source_id}: ${stageSummary(item) || '尚无样本'}`).join(' | ')
+        ? (diagnostics.sources || []).map(item => `${item.source_id}: ${stageSummary(item) || '尚无样本'} / 叠框龄P95 ${Number(item.preview_overlay_age_p95_ms || 0).toFixed(0)}ms 过期跳过 ${item.preview_overlay_stale_frames || 0}`).join(' | ')
         : [stageSummary(diagnostics) || countText(latency), countText(rates)].join('  |  ');
       renderRuntimeConditions(diagnostics);
     }
@@ -356,6 +356,9 @@
         `BGR采集 ${num(body.decode_fps ?? body.source_fps)}fps`,
         `处理 ${num(body.processed_fps)}fps`,
         `预览 ${num(body.preview_fps)}fps`,
+        body.latency_scope === 'per_source'
+          ? '叠框龄见各视频源'
+          : `叠框龄P95 ${num(body.preview_overlay_age_p95_ms, 0)}ms / 过期跳过 ${body.preview_overlay_stale_frames || 0}`,
         body.latency_scope === 'per_source' ? '延迟见各视频源' : `解码后→JPEG发布P95 ${num(body.preview_frame_age_p95_ms, 0)}ms`,
         `丢帧 ${num((body.drop_rate || 0) * 100, 0)}%`,
         body.latency_scope === 'per_source' ? '不含机器人/网络/浏览器延迟' : `解码后→AI完成P95 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
@@ -370,35 +373,46 @@
       // the minimum observation interval, contributes nothing to the window. Where
       // no track has yet been sampled twice there is no rate to report, and the
       // loop rate is named as the estimate it is rather than passed off as measured.
-      const achieved = Number(body.achieved_sampling_hz || 0);
-      const measured = achieved > 0;
-      const actual = measured ? achieved : Number(body.processed_fps || 0);
-      const needed = Number(config.required_sampling_hz || 0);
-      const neededSmall = Number(config.small_face_required_sampling_hz || 0);
-      const verdict = (required) => {
-        if (!required) return 'n/a';
-        const ratio = actual / required;
-        return `${num(ratio, 1)}×${ratio < 1 ? ' 不足' : ''}`;
+      const samplingLine = (item) => {
+        const itemConfig = item.effective_config || config;
+        const achieved = Number(item.achieved_sampling_hz || 0);
+        const measured = achieved > 0;
+        const actual = measured ? achieved : Number(item.processed_fps || 0);
+        const needed = Number(itemConfig.required_sampling_hz || 0);
+        const neededSmall = Number(itemConfig.small_face_required_sampling_hz || 0);
+        const verdict = (required) => {
+          if (!required) return 'n/a';
+          const ratio = actual / required;
+          return `${num(ratio, 1)}×${ratio < 1 ? ' 不足' : ''}`;
+        };
+        return [
+          `实际 ${num(actual, 2)}Hz${measured ? '' : '(估:循环率)'}`,
+          `≥${itemConfig.preferred_search_face_px ?? '?'}px 需 ${num(needed, 2)}Hz → ${verdict(needed)}`,
+          `小脸需 ${num(neededSmall, 2)}Hz → ${verdict(neededSmall)}`,
+          `预算跳过 ${countText(item.budget_skips)}`,
+        ].join('  /  ');
       };
-      $('samplingDiag').textContent = [
-        `实际 ${num(actual, 2)}Hz${measured ? '' : '(估:循环率)'}`,
-        `≥${config.preferred_search_face_px ?? '?'}px 需 ${num(needed, 2)}Hz → ${verdict(needed)}`,
-        `小脸需 ${num(neededSmall, 2)}Hz → ${verdict(neededSmall)}`,
-        `预算跳过 ${countText(body.budget_skips)}`,
-      ].join('  /  ');
+      $('samplingDiag').textContent = body.latency_scope === 'per_source'
+        ? (body.sources || []).map(item => `${item.source_id}: ${samplingLine(item)}`).join(' | ')
+        : samplingLine(body);
 
       // Time-to-confirm and the gate that stopped the tracks which never made it.
       // Together these separate "not sampled enough" from "never scored enough",
       // which every other counter reports identically.
-      const confirmedTracks = Number(body.confirmed_tracks || 0);
-      $('confirmLatencyDiag').textContent = confirmedTracks
-        ? [
-            `中位 ${num(body.time_to_confirm_p50_seconds, 2)}s`,
-            `p95 ${num(body.time_to_confirm_p95_seconds, 2)}s`,
-            `已确认轨迹 ${confirmedTracks}`,
-            `停留中位 ${num(body.track_dwell_p50_seconds, 2)}s`,
-          ].join('  /  ')
-        : `尚无确认  /  停留中位 ${num(body.track_dwell_p50_seconds, 2)}s`;
+      const confirmLine = (item) => {
+        const confirmedTracks = Number(item.confirmed_tracks || 0);
+        return confirmedTracks
+          ? [
+              `中位 ${num(item.time_to_confirm_p50_seconds, 2)}s`,
+              `p95 ${num(item.time_to_confirm_p95_seconds, 2)}s`,
+              `已确认轨迹 ${confirmedTracks}`,
+              `停留中位 ${num(item.track_dwell_p50_seconds, 2)}s`,
+            ].join('  /  ')
+          : `尚无确认  /  停留中位 ${num(item.track_dwell_p50_seconds, 2)}s`;
+      };
+      $('confirmLatencyDiag').textContent = body.latency_scope === 'per_source'
+        ? (body.sources || []).map(item => `${item.source_id}: ${confirmLine(item)}`).join(' | ')
+        : confirmLine(body);
 
       const gateLabels = {
         insufficient_samples: '帧数不足',
@@ -406,11 +420,15 @@
         votes_low: '达标票不足',
         aggregate_low: '聚合不足',
       };
-      const gates = body.unconfirmed_gate_counts || {};
-      const gateEntries = Object.entries(gates);
-      $('blockerDiag').textContent = gateEntries.length
-        ? gateEntries.map(([key, value]) => `${gateLabels[key] || key} ${value}`).join('  /  ')
-        : '尚无样本';
+      const blockerLine = (item) => {
+        const gateEntries = Object.entries(item.unconfirmed_gate_counts || {});
+        return gateEntries.length
+          ? gateEntries.map(([key, value]) => `${gateLabels[key] || key} ${value}`).join('  /  ')
+          : '尚无样本';
+      };
+      $('blockerDiag').textContent = body.latency_scope === 'per_source'
+        ? (body.sources || []).map(item => `${item.source_id}: ${blockerLine(item)}`).join(' | ')
+        : blockerLine(body);
 
       $('configRatesDiag').textContent = [
         `person ${num(config.person_detection_hz)}Hz`,

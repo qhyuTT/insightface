@@ -378,6 +378,14 @@ class SearchView(BaseModel):
     face_size_counts: dict[str, int] = Field(default_factory=dict)
     face_source_counts: dict[str, int] = Field(default_factory=dict)
     match_stage_counts: dict[str, int] = Field(default_factory=dict)
+    # These are produced by SearchMetrics and consumed by the monitor. Keep them
+    # in the response model or Pydantic silently drops the most useful verdicts.
+    achieved_sampling_hz: float = 0.0
+    confirmed_tracks: int = 0
+    time_to_confirm_p50_seconds: float = 0.0
+    time_to_confirm_p95_seconds: float = 0.0
+    track_dwell_p50_seconds: float = 0.0
+    unconfirmed_gate_counts: dict[str, int] = Field(default_factory=dict)
     stage_p95_latency_ms: dict[str, float] = Field(default_factory=dict)
     effective_hz: dict[str, float] = Field(default_factory=dict)
     source_fps: float = 0.0
@@ -400,6 +408,8 @@ class SearchView(BaseModel):
     preview_fps: float = 0.0
     preview_frame_age_p95_ms: float = 0.0
     preview_encode_p95_latency_ms: float = 0.0
+    preview_overlay_age_p95_ms: float = 0.0
+    preview_overlay_stale_frames: int = 0
     roi_calls_per_frame: float = 0.0
     drop_rate: float = 0.0
     end_to_end_p95_latency_ms: float = 0.0
@@ -577,6 +587,8 @@ class SearchMetrics:
     preview_published_at: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_frame_ages_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_encode_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
+    preview_overlay_ages_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
+    preview_overlay_stale_frames: int = 0
     roi_calls: int = 0
     budget_skips: dict[str, int] = field(default_factory=dict)
     end_to_end_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
@@ -609,6 +621,7 @@ class SearchMetrics:
             "preview_published_at",
             "preview_frame_ages_ms",
             "preview_encode_latencies_ms",
+            "preview_overlay_ages_ms",
         ):
             values = getattr(self, name)
             if not isinstance(values, BoundedFloatSeries):
@@ -685,6 +698,8 @@ class SearchMetrics:
             "preview_encode_p95_latency_ms": _percentile(
                 self.preview_encode_latencies_ms, 95
             ),
+            "preview_overlay_age_p95_ms": _percentile(self.preview_overlay_ages_ms, 95),
+            "preview_overlay_stale_frames": self.preview_overlay_stale_frames,
             "roi_calls_per_frame": (
                 self.roi_calls / self.frame_count if self.frame_count else 0.0
             ),

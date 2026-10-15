@@ -20,6 +20,10 @@ def test_search_metrics_snapshot_serializes_diagnostics(monkeypatch) -> None:
         face_size_counts={"gte80": 2, "48_63": 4},
         face_source_counts={"roi": 3, "full_frame": 5},
         match_stage_counts={"confirmed": 1, "quality_accepted": 6},
+        track_sampling_hz=[2.5, 3.5],
+        unconfirmed_gate_counts={"insufficient_samples": 2},
+        time_to_confirm_seconds=[0.8],
+        track_dwell_seconds=[1.2],
         stage_latencies_ms={
             "face": [10.0, 20.0, 30.0],
             "person": [5.0, 15.0],
@@ -35,6 +39,16 @@ def test_search_metrics_snapshot_serializes_diagnostics(monkeypatch) -> None:
     assert snapshot["face_size_counts"] == {"48_63": 4, "gte80": 2}
     assert snapshot["face_source_counts"] == {"full_frame": 5, "roi": 3}
     assert snapshot["match_stage_counts"] == {"confirmed": 1, "quality_accepted": 6}
+    view = SearchView(
+        search_id="search-1",
+        status=SearchStatus.RUNNING,
+        source=SourceConfig(type="camera", device_index=0),
+        **snapshot,
+    )
+    assert view.achieved_sampling_hz == pytest.approx(3.0)
+    assert view.unconfirmed_gate_counts == {"insufficient_samples": 2}
+    assert view.confirmed_tracks == 1
+    assert view.time_to_confirm_p50_seconds == pytest.approx(0.8)
     assert snapshot["stage_p95_latency_ms"] == {
         "face": pytest.approx(29.0),
         "person": pytest.approx(14.5),

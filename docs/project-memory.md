@@ -75,6 +75,32 @@ zeros/random/ones 三组纯合成输入，九个输出均逐值一致，max_abs_
 HTTP200。最终线上 healthy/restart=0，healthz/readyz/active 均 200，近期日志无 traceback/500。
 不能据此声称双路/4K/长时稳定性或业务误报漏报验收通过。
 
+## 2026-10-15 框时序与确认诊断候选
+
+活动单路快照为1920×1080/约15 FPS，处理约12.8 FPS，人体/全帧人脸检测各约3.8–3.9Hz。
+当时累计1416次人脸观测中1087次短边小于48px；这是该会话累计分布，不能归因到某一次
+目标走过。预览把最新视频帧与上一轮AI框异步叠加，可能造成可见框滞后；原始检测框坐标
+是否偏移仍待同帧验证。内部 `SearchMetrics` 已算轨迹采样率、未确认门和确认耗时，但
+`SearchView` 缺字段会丢弃这些数值，监控页因此无法有效区分卡点。
+
+用户结束活动任务后已发布 `box-confirm-20261015-v1`，镜像ID为
+`sha256:b9a7b79c2df47dcca8304e51988108fa2ea94795b812979b3306a9f539281360`。
+仅覆盖 `domain.py`、`service.py`、`monitor.html`：补齐诊断字段，预览框绑定
+`source_epoch/frame_id/captured_at`，超400ms或跨epoch不继续画旧框；采集最新帧和AI队列
+仍独立。单/双源诊断口径已回归。现场使用原Compose验证挂载、设备、host network/IPC、
+cpuset和运行环境，只有build revision变化。上线后healthy/restart=0、healthz/readyz/
+active/monitor均200，provider仍为RKNN_NPU/RPP_BF16/RKNN_NPU，近期无Traceback/ERROR/500。
+旧镜像 `rpp-native-input-20261015-v1` 与现场
+`swcares-box-confirm-release.py rollback` 保留。真实走过结果与未决验证见下；
+仍需人工观察实时框，并补异人负样本。
+
+上线后第一例用户重启的单路真实任务已正式确认：1920×1080，decoded 648 / processed 496，
+终态 completed、found_count=1；该轨迹3/3证据、最佳相似度0.653（普通档需0.55）、
+实际采样4.82Hz，首次证据至确认1.451s。全任务28次人脸观测中20次<48px、8次质量通过，
+不能把这些累计值当成目标走过期间的逐帧分布。预览叠框龄P95 307.9ms，因过期跳过17帧；
+预览帧龄P95 72.9ms、编码P95 25.9ms。单例达到1.5s目标，但未与旧版同画面对照，
+缺异人负样本和人工框精度观察，不能宣称总体召回、误报或原始框精度已改善。
+
 ## 运行位置、发布与回滚快照
 
 - 盒子地址：`192.168.30.184`（Wi-Fi）与 `192.168.17.215`；HTTPS 外部入口端口 18443。

@@ -971,3 +971,220 @@ bundle 通道完成。`insightface-release-0564295` 目录留在服务器上（�
 
 上线：perfpreview-20261014-v1 running/healthy、restarts0、readyz与六项能力通过；预览15Hz。
 旧镜像及原Compose目录保留，runtime.env/模型/SDK未变。等待重新登记和双路上游实测。
+
+## 2026-10-15 海康 1080p NV12 padding 导致无预览
+
+- [x] 核对 ZLM 接收与 InsightFace 状态，定位 `source_lost` 的直接错误
+- [x] 从实际硬件解码 sample 读取 VideoMeta，确认 stride/offset 与 caps 默认布局不同
+- [x] 按真实布局打包 NV12，补充合成 padding、越界与 metadata 优先级回归
+- [x] 在盒端独立验证修复后帧，再备份并更新 helper，验证活动搜索和 MJPEG 恢复
+
+ZLM 已收到海康 H.265 / 1920×1080 / 15 fps，约 2 Mbps；解码器每约 10 秒以 rc=4 退出，
+错误 `unexpected NV12 payload size: 3732480 != 3110400`。实际 VideoMeta 为 stride=[2304,2304]，
+Y offset=0、UV offset=2488320；caps VideoInfo 却给出紧凑 stride1920、UV offset2073600。
+本轮不修改机器人、不降画质、不重启识别/媒体容器，禁止保存或输出真实视频帧/人脸照片。
+
+修复优先读取 per-buffer GstVideoMeta，缺失时才回退 caps VideoInfo，按两平面 stride/offset
+拷贝有效行，保持紧凑 NV12 快路径与 PSN1 协议；不通过总长度猜布局、不直接截断 UV。
+34 项新合成布局回归与 38 项 RK3588 原测试合计 72 项通过，ruff 与 diff 检查通过。
+最终 helper SHA-256 `cee8cbc3c171dd02e54d251800e272163373dca4307ecc7b50c998e1628fd06a`。
+
+盒端候选文件独立读取 10 帧真实硬件解码 sample，全部打包为 1920×1080 / 3110400 字节，
+打包平均 16.172 ms、最大 30.856 ms（仅此次 10 帧样本，不作为长期性能承诺）。确认原 helper
+SHA-256 `897e5052b256fce7a0934b781d2bcd8f5771a8c34bd84f0c2fe06bb08c5e292b` 与本地 HEAD 一致后，
+备份至盒端 `/home/EIS100RK3588/apps/person-search-hotfixes/20261015-nv12-layout`，
+原子替换运行容器的 `/app/scripts/rk3588_gstreamer_capture.py`，校验值与最终源码一致。
+
+未重启容器，原活动搜索自行重试后状态恢复 `running`：1920×1080、decode_fps=13.7、
+decoded_frames=603、processed_frames=416，最新帧年龄约 23 ms。MJPEG HTTP=200，
+5.01 秒接收 3620864 字节、观察到 55 个 JPEG 分段头；全部数据在内存统计后丢弃，未保存图片。
+浏览器页面已请用户刷新确认；本轮未改 Nginx/Android/摄像头配置，未重建容器镜像，未提交或推送此仓。
+运行容器重启会保留文件，但从旧镜像重新创建会丢失修复，后续镜像构建必须包含本次源码改动。
+
+## 2026-10-15 单路海康预览卡顿分段定位
+
+- [x] 核对 ZLM 资源、封装配置与识别端实时吞吐/帧龄
+- [x] 对比 ZLM 本地压缩帧输出、硬解输出及 MJPEG 实际到达间隔
+- [x] 复核预览调度与 CPU 开销，按证据确定瓶颈和最小优化方案
+- [x] 记录验证结果及仍未覆盖的公网/浏览器端限制
+
+初始快照：ZLM CPU 6.52%，识别 CPU 162.79%；decode13.8fps、preview10fps，
+preview encode p95 54.64ms。HLS 开启但未据此认定背压或擅自关闭；不保存真实媒体帧。
+
+同一流并行只读探测（额外两个本地 RTSP 读者，持续约 32 秒，前 2 秒预热后统计）：
+
+| 环节 | 实测 FPS | 帧到达间隔 P95 / 最大 | >200ms 间隔 |
+| --- | --- | --- | --- |
+| ZLM 本地 RTSP 压缩访问单元，尚未解码 | 15.007 | 121.595 / 185.079 ms | 0/450 |
+| 同源独立硬解 NV12，不映射/复制图像 | 14.974 | 122.247 / 183.520 ms | 0/449 |
+| 识别服务本地 MJPEG HTTP | 9.854 | 203.964 / 289.590 ms | 18/316 |
+
+MJPEG 32.072 秒内 317 个分段头、19530941 字节，约 4.87 Mbps；对比媒体接收
+233336～264001 bytes/s（约 1.87～2.11 Mbps）。真实压缩/解码图像及 JPEG 只在内存使用后
+丢弃，未保存；仅输出数值/格式元数据。额外读者测试结束后 readerCount 回到 1。
+18 次状态采样均 running，ZLM 媒体帧差分约 14.62～16.01fps，应用 decode13.4～14.1fps，
+preview9.2～10.4fps、编码/resize/叠框/指标合计 P95 约 69～74ms。额外硬解探测会增加负载，
+但探测前预览已约 10fps，故不能把本次数字当无探测长期性能承诺。
+
+本窗口不支持 ZLM 收流/硬解吞吐不足为主要原因；卡顿在应用采集后处理/预览生成阶段
+更明显。`service.py` 的独立预览线程读取 latest，不消费 AI 队列；15Hz 是轮询上限，
+无新帧也空等一周期，超预算仍至少 sleep10ms。当前默认 960×540、JPEG quality82，
+预览帧龄从 BGR 读取后计时，不含 jitterbuffer500ms，不能称真正端到端延迟。
+最小后续方案是为 latest 增加有界 Condition 等待，按开始时刻限频、超预算不额外睡眠，
+并测真实编码/拷贝阶段成本；本轮只定位，未改调度业务代码/画质/HLS/音频或重启容器。
+尚未测浏览器真实收包与公网瞬时拥塞，也未证明偶发上游中断彻底消失。
+
+ZLM 自带管理页 `/webassist/` 没有独立账号密码，使用 URL secret 参数；只向用户说明
+盒端配置文件位置，未输出/保存 API 密钥，未降低外层认证。
+
+## 2026-10-15 预览调度修复与媒体管理入口认证
+
+- [x] 查实用户实际 `/mediaserver/` 入口的两层认证，定位现有媒体账号，不修改认证
+- [x] 修复 latest 轮询空等及超预算额外等待，补充生命周期/限频/新帧回归
+- [x] 本地测试与静态检查，盒端独立实际流对照后选择最小部署方式
+- [x] 验证上线预览吞吐/间隔、保留回滚并记录剩余限制
+
+媒体入口实际是 Nginx Basic Auth，realm="ZLMediaKit administration"，代理到盒内3000；
+与自带6680/webassist不可混淆。只读检查现有保护文件后，用media账户经私有CA严格校验
+请求用户给出的完整HTTPS入口，返回200；账号密码仅直接告知用户，不记录到仓库、不重置认证。
+
+调度新增Condition有界等待latest，不消费AI队列；按编码开始时刻限15Hz，超预算不额外sleep，
+取最新帧且不补历史帧。stop/EOF/clear唤醒，无订阅不编码，空返回不忙循环。
+15项调度回归与全量436项测试通过（7条既有依赖弃用告警），限定Ruff和diff检查通过。
+同一路真实海康相邻25秒窗口、独立进程复用真实reader/preview方法、无新推理context对照：
+旧调度12.012fps、间隔P95 145.975ms/最大198.883ms；新调度13.766fps、P95 107.196ms/
+最大152.605ms。解码分别14.9/15.0fps，进程CPU48.72%/47.81%，发布帧龄P95
+76.857ms→71.218ms。场景和JPEG大小随时间变化，该对照不是完全相同图像回放，也不是主服务已上线。
+固定video SHA256 b707fc2d0742bcc9a40f7ebe21b9071793994d844cefcb4a99292c6cbbf86060，
+service SHA256 6673d418f15c1a0e0852156fe17865a4ce3c5794c865382cc7b702d9bd2d52cc。
+镜像overlay补充COPY硬解helper，以持久包含已验证的NV12布局修复。
+
+电脑严格TLS+现有Basic Auth经18443入口32.413秒只统计MJPEG分段：8.494fps、3.35Mbps，
+帧到达间隔P95 477.183ms、最大1595.460ms，7次>500ms。尚需同时取盒内对照，不能将异时段
+观测直接断言为网络根因；不保存真实帧/JPEG，凭据仅在受控进程内存中使用。
+
+用户明确允许中断识别并切换。通过调度端一次POST正常结束任务，返回completed且cleanup_pending=false，
+确认调度与识别均空闲后，仅重建识别容器。实际发布使用当前已部署Compose副本，逐项比较
+12个bind mount、13个设备映射、host网络/IPC、4-7 CPU及安全设置；运行环境只改变构建版本标记。
+保护的runtime.env仅在内存读取并由匿名memfd交给Compose，不改变权限，不写明文副本/日志。
+新镜像 `person-search-rk3588-rpp:preview-scheduling-20261015-v1`，
+ID `sha256:551be906fa7cad108635024c5410e1aa16fab6e0fec05a1dc84d980139fd511b`；
+容器healthy、restart0，readyz=ready，三个provider保持RKNN_NPU/RPP_BF16/RKNN_NPU，六项能力存在。
+发布目录 `/home/EIS100RK3588/apps/person-search-hotfixes/20261015-preview-scheduling/build/deploy`。
+回滚镜像 `person-search-rk3588-rpp:preview-before-20261015-nv12` 保留旧调度且包含NV12修复，
+ID前缀c3b61f1cb220；避免回滚到未修stride的旧镜像再次无画面。原镜像与发布目录保留。
+
+同窗口旧服务盒内MJPEG9.872fps、P95间隔193.394ms/最大327.359ms；电脑经18443只5.458fps，
+P95 508.024ms/最大952.392ms，13次>500ms。电脑192.168.31.206/23访问17.215走utun1024/
+198.18.0.1，访问盒子Wi-Fi30.184走en0。Nginx /v1 已关闭proxy buffering/request buffering且
+tcp_nodelay开启，未据此乱改。证书SAN包含30.184、17.215及公网地址，已提供可严格TLS访问的
+Wi-Fi入口供用户复测。独立静态资源两路径并发下载分别3.215/4.377Mbps（合计共享网络），
+不得将其当各自独占带宽上限；额外客户端也会争用带宽，后续真实浏览器验收应限制订阅者数量。
+主服务全量识别与浏览器新任务尚待用户重新发起后采证；不把独立预览对照误称上线真实会话改善。
+
+上线后用户启动会话暴露500：本地HEAD的service诊断读取rpp_release_gil/
+rpp_engine_cache_enabled，但旧基础镜像Settings未包含字段。此前只做import/ready验收未执行活动
+view，是本次打包兼容验证遗漏；不得将该500归因摄像头或网络。逐模块AST检查列出仅这两个
+缺字段，改为保守False回退，不升级SDK/后端或启用GIL优化。增加旧Settings缺两字段回归，
+全量437项通过、Ruff/diff通过。实际旧镜像Settings执行_effective_config成功，真实运行镜像内
+合成初始化/运行/断流/停止四态SearchSession.view和JSON序列化全通过（不创建模型/摄像头上下文）。
+
+用户500报障在已授权修复范围内执行v2受控重建；当时调度已无活动任务，识别active视图500，
+仅本次已诊断错误使用显式recover-500标记，Uvicorn正常lifespan清理内部会话，未强杀设备。
+当前镜像 `person-search-rk3588-rpp:preview-scheduling-20261015-v2`，
+ID `sha256:08cc98ed8e3ff5427f129bf5f39e11fc502aaa818c91c229cf2f7dc95f00aeb4`，
+service SHA256 `bfd450efb2426ae1df17a56f720b7b601a742d234e4511597398c54b6456cf13`。
+healthz/active已200（active=null），readyz=ready、三个provider保持原硬件。
+原v1不可再用于发布，performance.env与发布脚本已指向v2，回滚镜像仍为含NV12修复的旧调度。
+补充镜像内ASGI验收：不接入生产manager、不创建摄像头/模型，用合成活动会话请求healthz、
+active、按ID查询和按request_id查询四条真实路由均HTTP200；线上容器healthy/restart0。
+当前等待用户重新登记/发起真实任务，500恢复已验证，主服务新预览的实测及浏览器卡顿验收未完成。
+
+## 2026-10-15 盒端卡顿续查（用户184入口仍卡）
+
+- [x] 同窗口采样ZLM压缩帧、MPP独立硬解与主服务采集/预览的停顿分布
+- [x] 核对硬解实际插件、帧PTS/缓存、NV12桥接与主进程GIL/推理等待
+- [x] 用无额外网络预览负载的受控实验确定阻塞位置，修复后再验收
+
+用户确认经Wi-Fi184:18443入口同样PPT，不能再将TUN/17入口作为主因。机器人已完成
+转发解耦和持续推流窗口验证，但这不是所有间歇故障已排除；本轮重点盒端分段实测。
+
+同窗口ZLM压缩帧15.027fps、独立NV12解码14.929fps、主服务MJPEG10.947fps；前两者最大
+间隔267/276ms，未见持续超载/断流。受控合成SCRFD完整推理A/B/A表明SDK input copy
+占用GIL约67–115ms；只替换stream等待没有消除停顿。独立11,304,960B合成输入传输对照：
+Python绑定P50 90/107ms，native pinned P50 17.765ms，回读字节完全一致；5ms心跳最长
+停顿从153/135ms降到21.783ms。未使用或保存真人帧/身份数据，不变模型参数。
+
+- [x] 分离输入拷贝、执行与输出拷贝，确认主要GIL阻塞来自SDK输入绑定
+- [x] 为显式release_gil模式接入复用pinned buffer及CDLL输入拷贝，测试ABI/失败隔离/生命周期
+- [x] 实机完整模型输出一致性及心跳A/B/A验证
+- [x] 构建配套Settings/backend的镜像，空闲切换并验证活动路由与真实预览
+
+
+native pinned-input实现保留默认关闭，仅盒端显式启用；输入CDLL memcpy+rtMemcpy(kind=1)，
+与enqueue/native stream sync同受全局RLock保护，成功同步后擦除staging，正常close按context→
+stream→staging擦除/free→设备/engine/runtime释放；未知拷贝/执行/同步故障强引用隔离至进程退出。
+补充64位ABI/size_t上溢/数据一致性/非法输入/关闭幂等/失败隔离/stream销毁失败顺序测试。
+全量456项通过（7条既有告警），限定Ruff/diff通过。
+
+额外诊断进程曾被驱动拒绝创建设备；主服务始终healthy/ready。空闲时停止主服务，独占验证
+成功；不据此断言硬件损坏。相同SCRFD图/权重、zeros/random/ones三组纯合成输入，九输出
+逐值一致(max_abs_error=0)。A/B/A每轮20次@4Hz：旧输入拷贝P50 91.244/91.000ms，
+新18.773ms；完整推理P50 123.289/123.568→61.886ms；5ms心跳最大136.998/131.688→
+17.163ms，>50ms停顿20/20→0。该实验尚不能代替真实活动视频的帧率/流畅度验收。
+
+受控发布镜像person-search-rk3588-rpp:rpp-native-input-20261015-v1，ID
+sha256:bb03d35f7314f95c060bbb7b375b87b8538653c5e55b927cee49508dcee65d97。
+基于已上线v2只覆盖config/rpp_backends/hybrid_backends，12 bind mounts/13设备/host network和
+IPC/4-7 cpuset/安全参数均逐项保持；环境仅改build revision和显式RPP_RELEASE_GIL=true。
+发布配置在原hotfix目录build/deploy-rpp-input，rollback.env指向preview-scheduling-20261015-v2
+且显式关闭GIL模式；不修改保护runtime.env、不保存明文凭据。原文件/镜像仍保留。
+readyz确认三provider不变。用户已重启活动任务，正在完成真实预览和活动接口验收。
+
+
+上线真实活动会话同窗口32秒：ZLM压缩输出14.981fps、独立NV12解码14.972fps，间隔最大
+146.921/146.862ms，均0次>200ms。主服务盒内MJPEG13.937fps（448帧），间隔P95
+106.091ms/最大154.023ms、0次>200ms/500ms；相对前一真实任务窗口10.947fps/最大
+264.997ms有改善，但不是相同画面回放。主服务解码14.9–15.2fps，预览13.6–14.2fps，
+JPEG编码P95约26ms（此前约78ms），预览帧龄P95约77ms。第二窗口实际插件枚举确认
+mppvideodec，采样成功；不把decodebin工厂名误认为软件解码。
+
+电脑经192.168.30.184:18443严格TLS（保留17.215证书主机名验证，未关闭证书验证）
+32.148秒，HTTP200，441帧，13.778fps/6.823Mbps；到达间隔P50 63.727/P95
+201.539ms/最大303.715ms，24次>200ms、0次>500ms。该测量增加一个HTTPS订阅者，
+不能当作网络独占容量测试，也不代表浏览器渲染实测；端到端仍有短时抖动，未宣称绝不卡顿。
+同窗口服务解码约15fps、预览13.4–14.4fps，实际rpp_mode=native_stream_sync。
+
+实际新镜像内隔离ASGI检查（独立假backend/合成零值输入、不触碰生产manager/摄像头/模型）：
+initializing/running/source_lost/stopping四态，healthz、active、按ID和request_id查询共16次
+HTTP200，effective_config明确RPP_RELEASE_GIL=true。无额外httpx依赖安装，纯ASGI调用。
+真实线上healthz/readyz/active持续正常。模型输出一致性和性能均有实证，主观浏览器观感尚待
+用户查看；不把当前15fps摄像头说成可以达到30/60fps。此次改动在InsightFace，未再改Android。
+
+## 2026-10-15 项目记忆与技术方案交付
+
+- [x] 将本轮根因、发布/回滚与指标口径整理为可持续读取的项目记忆
+- [x] 新建项目AGENTS.md并关联记忆、经验和当前技术方案
+- [x] 整理当前RK3588单路海康技术方案，区分实现、现场证据与后续规划
+- [x] 校对源码/配置/文档链接及敏感信息，修正README入口和过期现场描述
+
+
+交付AGENTS.md、docs/project-memory.md、docs/technical-solution-20261015.md，并更新README
+当前基线入口和1080p单路实测描述。项目记忆保存用户单路优先偏好、边界、四类修复、严格测试
+口径、镜像与回滚索引；AGENTS要求相关后续任务先读取记忆。技术方案包含架构图、硬件分工、
+数据与会话流程、确认策略、原生输入优化、预览/API/安全、发布与验收和后续规划。
+文档链接/围栏/凭据模式检查及git diff --check通过；独立只读复核确认模型/API/默认与现场覆盖/
+RPP生命周期描述匹配源码和Compose。此次文档验收不重复运行未变动的业务测试。
+
+
+## 2026-10-15 两仓库提交与远程同步
+
+- [x] 核对当前分支、远程与全部改动，明确机器人main/识别eis100的提交边界
+- [x] 复核测试、静态检查和敏感信息，准备已授权的源码、测试与文档提交
+- [ ] 分别推送并核对远程提交号、上游状态与工作区
+
+用户明确要求将swcaresRobot和insightface当前代码push到各自远程。机器人实现已经在main，
+仅本轮跨仓库排查记录待提交；识别提交NV12布局、预览调度、旧Settings兼容、RPP原生输入
+优化及对应测试和项目文档。不包含私有配置、模型媒体素材或签名材料。
+
+推送前复核：456项pytest通过（7条既有依赖告警），全仓Ruff通过，diff检查通过；暂存17个文本文件，未包含私有配置、模型、媒体、包体或签名材料，新增行敏感模式检查无命中。

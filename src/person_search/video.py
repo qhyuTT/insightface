@@ -51,6 +51,7 @@ class LatestFrameReader:
         self._active_capture: cv2.VideoCapture | GStreamerCapture | None = None
         self._source_epoch = 0
         self._latest_lock = threading.Lock()
+        self._latest_condition = threading.Condition(self._latest_lock)
         self._latest_packet: FramePacket | None = None
         self._conversion_provider = "not_started"
         self._conversion_fallback_reason: str | None = None
@@ -97,6 +98,27 @@ class LatestFrameReader:
         """Return the freshest decoded packet without consuming the work queue."""
         with self._latest_lock:
             return self._latest_packet
+
+    def wait_for_new_latest(
+        self, after_frame_id: int, timeout: float = 0.1
+    ) -> FramePacket | None:
+        """Wait for a fresh preview frame without consuming the AI work queue."""
+        with self._latest_condition:
+            self._latest_condition.wait_for(
+                lambda: (
+                    self._stop.is_set()
+                    or self.ended.is_set()
+                    or (
+                        self._latest_packet is not None
+                        and self._latest_packet.frame_id != after_frame_id
+                    )
+                ),
+                timeout=timeout,
+            )
+            packet = self._latest_packet
+            if self._stop.is_set() or packet is None or packet.frame_id == after_frame_id:
+                return None
+            return packet
 
     def metrics_snapshot(self) -> dict[str, int | float | None]:
         """Measure successful BGR reads, not sensor or raw RTP frame rates."""
@@ -145,6 +167,8 @@ class LatestFrameReader:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._latest_condition:
+            self._latest_condition.notify_all()
         with self._capture_lock:
             capture = self._active_capture
         interrupt = getattr(capture, "interrupt", None)
@@ -167,8 +191,9 @@ class LatestFrameReader:
             except queue.Empty:
                 break
             self.on_drop()
-        with self._latest_lock:
+        with self._latest_condition:
             self._latest_packet = None
+            self._latest_condition.notify_all()
 
     def _capture_loop(self) -> None:
         capture: cv2.VideoCapture | GStreamerCapture | None = None
@@ -236,14 +261,17 @@ class LatestFrameReader:
                     frame=frame,
                     source_epoch=self._source_epoch,
                 )
-                with self._latest_lock:
+                with self._latest_condition:
                     self._latest_packet = packet
+                    self._latest_condition.notify_all()
                 frame_id += 1
                 self._enqueue_latest(packet)
         finally:
             if capture is not None:
                 self._release_capture(capture)
             self.ended.set()
+            with self._latest_condition:
+                self._latest_condition.notify_all()
 
     def _publish_capture(self, capture: cv2.VideoCapture | GStreamerCapture) -> None:
         with self._capture_lock:

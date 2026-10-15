@@ -361,7 +361,8 @@ def test_rpp_provider_metadata_is_not_claimed_before_real_readiness() -> None:
     assert backend.enrollment_static_input_hw == (640, 640)
 
 
-def _execution_fixture(monkeypatch, *, release_gil=True, enqueue=True, sync_status=0):
+def _execution_fixture(monkeypatch, *, release_gil=True, enqueue=True, sync_status=0,
+                       copy_failure=False, destroy_failure=False):
     import person_search.rpp_backends as rpp
 
     events = []
@@ -376,6 +377,8 @@ def _execution_fixture(monkeypatch, *, release_gil=True, enqueue=True, sync_stat
 
         def StreamDestroy(self):
             events.append("destroy_stream")
+            if destroy_failure:
+                raise RuntimeError("destroy failed")
 
     class NativeSync:
         def __call__(self, pointer):
@@ -389,6 +392,26 @@ def _execution_fixture(monkeypatch, *, release_gil=True, enqueue=True, sync_stat
     native_sync = NativeSync()
     library = types.SimpleNamespace(rtStreamSynchronize=native_sync)
     monkeypatch.setattr(rpp.ctypes, "CDLL", lambda name: library)
+
+    class NativeInput:
+        def __init__(self, size):
+            assert size == 48
+
+        def copy_from_numpy(self, array, device_handle):
+            assert rpp._RPP_EXECUTION_LOCK._is_owned()
+            assert array.nbytes == 48 and device_handle > 0
+            events.append("h2d")
+            if copy_failure:
+                raise ModelUnavailableError("RPP native input copy failed: 7")
+
+        def clear(self):
+            assert rpp._RPP_EXECUTION_LOCK._is_owned()
+            events.append("clear_input")
+
+        def close(self):
+            events.append("free_input")
+
+    monkeypatch.setattr(rpp, "_RppNativeInput", NativeInput)
 
     class Context:
         def execute(self, count, bindings):
@@ -462,9 +485,9 @@ def test_rpp_async_wait_preserves_output_and_lock_and_cleanup_order(monkeypatch)
     assert engine.execution_wait_mode == "native_stream_sync"
     assert sync.argtypes == [ctypes.c_void_p] and sync.restype is ctypes.c_int
     actual = engine.run(np.zeros(engine.input_shape, dtype=np.float32))
-    assert events == ["create_stream", "h2d", "enqueue", "sync", "d2h"]
+    assert events == ["create_stream", "h2d", "enqueue", "sync", "clear_input", "d2h"]
     engine.close()
-    assert events[-2:] == ["destroy_context", "destroy_stream"]
+    assert events[-3:] == ["destroy_context", "destroy_stream", "free_input"]
     engine.close()
     assert events.count("destroy_stream") == 1
     with pytest.raises(ModelUnavailableError, match="closed or failed"):
@@ -602,3 +625,36 @@ def test_hybrid_engine_factory_receives_settings_rpp_flags(tmp_path, monkeypatch
     assert all(item["release_gil"] is True for item in seen)
     assert all(item["engine_cache_enabled"] is True for item in seen)
     assert backend.detection_execution_wait_mode == "native_stream_sync"
+
+
+def test_rpp_native_copy_failure_quarantines_all_resources(monkeypatch):
+    import person_search.rpp_backends as rpp
+
+    engine, events, _ = _execution_fixture(monkeypatch, copy_failure=True)
+    try:
+        with pytest.raises(ModelUnavailableError, match="input copy failed"):
+            engine.run(np.zeros(engine.input_shape, dtype=np.float32))
+        assert events == ["create_stream", "h2d"]
+        assert engine in rpp._RPP_QUARANTINED_ENGINES
+        engine.close()
+        assert events == ["create_stream", "h2d"]
+        assert engine._native_input is not None
+        assert engine._context is not None and engine._devices
+    finally:
+        rpp._RPP_QUARANTINED_ENGINES.remove(engine)
+
+
+def test_rpp_stream_destroy_failure_retains_input_and_device_memory(monkeypatch):
+    import person_search.rpp_backends as rpp
+
+    engine, events, _ = _execution_fixture(monkeypatch, destroy_failure=True)
+    try:
+        with pytest.raises(RuntimeError, match="destroy failed"):
+            engine.close()
+        assert engine in rpp._RPP_QUARANTINED_ENGINES
+        assert events == ["create_stream", "destroy_context", "destroy_stream"]
+        assert engine._native_input is not None and engine._devices
+        engine.close()
+        assert events.count("destroy_stream") == 1
+    finally:
+        rpp._RPP_QUARANTINED_ENGINES.remove(engine)

@@ -17,10 +17,117 @@ from __future__ import annotations
 import argparse
 import struct
 import sys
+from collections.abc import Sequence
+from typing import Any
 
 _HEADER = struct.Struct("!4sIIII")
 _BGR_MAGIC = b"PSF1"
 _NV12_MAGIC = b"PSN1"
+
+
+def pack_nv12(
+    data: bytes | bytearray | memoryview,
+    width: int,
+    height: int,
+    strides: Sequence[int],
+    offsets: Sequence[int],
+) -> bytes:
+    """Pack visible Y/UV rows using the decoder's declared layout, never its size.
+
+    MPP allocations can include both row padding and extra rows before UV. The
+    wire format has neither, so copying the first width * height * 3/2 bytes is
+    only valid after verifying both strides and both plane offsets.
+    """
+    if (
+        type(width) is not int
+        or type(height) is not int
+        or width <= 0
+        or height <= 0
+        or width % 2
+        or height % 2
+        or width * height * 3 // 2 > 0xFFFFFFFF
+    ):
+        raise ValueError("NV12 dimensions must be positive even integers fitting the frame header")
+    if len(strides) < 2 or len(offsets) < 2:
+        raise ValueError("NV12 requires two plane strides and offsets")
+    view = memoryview(data).cast("B")
+    ranges = []
+    for stride, offset, rows in zip(strides[:2], offsets[:2], (height, height // 2)):
+        if type(stride) is not int or stride < width:
+            raise ValueError("NV12 plane stride is smaller than the visible width")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("NV12 plane offset must be a nonnegative integer")
+        end = offset + (rows - 1) * stride + width
+        if end > view.nbytes:
+            raise ValueError(
+                f"NV12 plane exceeds mapped buffer: offset={offset} stride={stride} "
+                f"rows={rows} width={width} size={view.nbytes}"
+            )
+        ranges.append((offset, end))
+    if ranges[0][0] < ranges[1][1] and ranges[1][0] < ranges[0][1]:
+        raise ValueError("NV12 plane regions overlap")
+
+    y_size = width * height
+    expected_size = y_size * 3 // 2
+    if tuple(strides[:2]) == (width, width) and tuple(offsets[:2]) == (0, y_size):
+        # bytes(bytes) retains the original object for the ordinary packed path.
+        return bytes(data) if view.nbytes == expected_size else bytes(view[:expected_size])
+
+    # Join buffer views into the final bytes allocation once; constructing a
+    # bytearray and then bytes would copy the entire decoded frame twice.
+    pieces = []
+    for stride, offset, rows in zip(strides[:2], offsets[:2], (height, height // 2)):
+        if stride == width:
+            pieces.append(view[offset : offset + width * rows])
+        else:
+            for row in range(rows):
+                start = offset + row * stride
+                pieces.append(view[start : start + width])
+    return b"".join(pieces)
+
+
+def pack_sample_nv12(sample: Any, gst: Any, gst_video: Any) -> tuple[int, int, bytes]:
+    """Resolve per-buffer video metadata before the default caps layout."""
+    caps = sample.get_caps()
+    if caps is None or not caps.is_fixed() or caps.get_size() != 1:
+        raise ValueError("NV12 sample must have one fixed video caps structure")
+    structure = caps.get_structure(0)
+    if structure.get_name() != "video/x-raw" or structure.get_value("format") != "NV12":
+        raise ValueError("NV12 sample has an unsupported video format")
+    width = structure.get_value("width")
+    height = structure.get_value("height")
+    buffer = sample.get_buffer()
+    if buffer is None:
+        raise ValueError("NV12 sample has no buffer")
+    meta = gst_video.buffer_get_video_meta(buffer)
+    if meta is not None:
+        if (
+            meta.format != gst_video.VideoFormat.NV12
+            or meta.width != width
+            or meta.height != height
+            or meta.n_planes != 2
+        ):
+            raise ValueError("NV12 video metadata does not match the negotiated format/dimensions")
+        strides, offsets = meta.stride, meta.offset
+    else:
+        # new_from_caps is available since GStreamer 1.20; boxes on 1.16 use
+        # the mutable VideoInfo constructor and from_caps instead.
+        if hasattr(gst_video.VideoInfo, "new_from_caps"):
+            info = gst_video.VideoInfo.new_from_caps(caps)
+        else:
+            info = gst_video.VideoInfo()
+            if not info.from_caps(caps):
+                info = None
+        if info is None or info.finfo.format != gst_video.VideoFormat.NV12:
+            raise ValueError("NV12 caps could not describe a valid video layout")
+        strides, offsets = info.stride, info.offset
+    mapped, map_info = buffer.map(gst.MapFlags.READ)
+    if not mapped:
+        raise ValueError("GStreamer NV12 buffer could not be mapped")
+    try:
+        return width, height, pack_nv12(map_info.data, width, height, strides, offsets)
+    finally:
+        buffer.unmap(map_info)
 
 
 def main() -> int:
@@ -86,7 +193,8 @@ def stream_nv12(
         import gi
 
         gi.require_version("Gst", "1.0")
-        from gi.repository import Gst
+        gi.require_version("GstVideo", "1.0")
+        from gi.repository import Gst, GstVideo
     except (ImportError, ValueError) as exc:
         print(f"GStreamer GI is required for NV12 output: {exc}", file=sys.stderr)
         return 5
@@ -115,24 +223,10 @@ def stream_nv12(
             if sample is None:
                 print("GStreamer NV12 pipeline returned no sample", file=sys.stderr)
                 return 3
-            structure = sample.get_caps().get_structure(0)
-            width = int(structure.get_value("width"))
-            height = int(structure.get_value("height"))
-            expected_size = width * height * 3 // 2
-            buffer = sample.get_buffer()
-            mapped, map_info = buffer.map(Gst.MapFlags.READ)
-            if not mapped:
-                print("GStreamer NV12 buffer could not be mapped", file=sys.stderr)
-                return 4
             try:
-                payload = bytes(map_info.data)
-            finally:
-                buffer.unmap(map_info)
-            if len(payload) != expected_size:
-                print(
-                    f"unexpected NV12 payload size: {len(payload)} != {expected_size}",
-                    file=sys.stderr,
-                )
+                width, height, payload = pack_sample_nv12(sample, Gst, GstVideo)
+            except (TypeError, ValueError, OverflowError) as exc:
+                print(f"invalid NV12 buffer layout: {exc}", file=sys.stderr)
                 return 4
             _write_frame(_NV12_MAGIC, width, height, 1, payload)
     except BrokenPipeError:

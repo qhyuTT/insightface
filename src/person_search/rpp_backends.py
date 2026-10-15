@@ -80,6 +80,83 @@ class _RppNativeStream:
         self.stream.StreamDestroy()
 
 
+class _RppNativeInput:
+    """Reusable pinned staging memory; CDLL copies release the Python GIL.
+
+    The execution engine serializes access and retains this allocation if a
+    native operation fails with an unknown DMA lifetime.
+    """
+
+    def __init__(self, byte_count: int):
+        if not 0 < byte_count <= ctypes.c_size_t(-1).value:
+            raise ValueError("invalid RPP input byte count")
+        self._byte_count = byte_count
+        self._closed = False
+        self._pointer = ctypes.c_void_p()
+        try:
+            self._library = ctypes.CDLL("liburpp.so.2")
+            self._libc = ctypes.CDLL("libc.so.6")
+            self._allocate = self._library.rtMallocHost
+            self._allocate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+            self._allocate.restype = ctypes.c_int
+            self._free = self._library.rtFreeHost
+            self._free.argtypes = [ctypes.c_void_p]
+            self._free.restype = ctypes.c_int
+            self._copy = self._library.rtMemcpy
+            self._copy.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+            ]
+            self._copy.restype = ctypes.c_int
+            self._memcpy = self._libc.memcpy
+            self._memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            self._memcpy.restype = ctypes.c_void_p
+            self._memset = self._libc.memset
+            self._memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+            self._memset.restype = ctypes.c_void_p
+            status = int(self._allocate(ctypes.byref(self._pointer), byte_count))
+            if status != 0 or not self._pointer.value:
+                raise ModelUnavailableError(f"RPP pinned input allocation failed: {status}")
+        except ModelUnavailableError:
+            raise
+        except Exception as exc:
+            raise ModelUnavailableError("RPP native input transfer is unsupported") from exc
+
+    def copy_from_numpy(self, array: np.ndarray, device_handle: int) -> None:
+        if self._closed:
+            raise ModelUnavailableError("RPP pinned input is closed")
+        if (
+            array.dtype != np.float32
+            or not array.flags.c_contiguous
+            or array.nbytes != self._byte_count
+        ):
+            raise ValueError("RPP input must be contiguous float32 of the allocated size")
+        if not 0 < device_handle < 1 << (ctypes.sizeof(ctypes.c_void_p) * 8):
+            raise ValueError("invalid RPP input device pointer")
+        self._memcpy(self._pointer, ctypes.c_void_p(array.ctypes.data), self._byte_count)
+        # rpp_runtime.h: rtMemcpyHostToDevice = 1. This copy completes before
+        # enqueue, and staging remains owned until stream synchronization.
+        status = int(self._copy(
+            ctypes.c_void_p(device_handle), self._pointer, self._byte_count, 1,
+        ))
+        if status != 0:
+            raise ModelUnavailableError(f"RPP native input copy failed: {status}")
+
+    def clear(self) -> None:
+        if self._closed:
+            raise ModelUnavailableError("RPP pinned input is closed")
+        self._memset(self._pointer, 0, self._byte_count)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.clear()
+        self._closed = True
+        status = int(self._free(self._pointer))
+        if status != 0:
+            raise ModelUnavailableError(f"RPP pinned input release failed: {status}")
+        self._pointer = ctypes.c_void_p()
+
+
 class _InferenceEngine(Protocol):
     input_shape: tuple[int, ...]
     output_shapes: Mapping[str, tuple[int, ...]]
@@ -285,6 +362,7 @@ class _RppExecutionEngine:
         self._owners: tuple[object, ...] = owners
         self._context = engine.createExecutionContext()
         self._native_stream: _RppNativeStream | None = None
+        self._native_input: _RppNativeInput | None = None
         self._execution_failed = False
         self._closed = False
         self._input_shape = input_shape
@@ -341,7 +419,14 @@ class _RppExecutionEngine:
         if release_gil_requested:
             if not callable(getattr(self._context, "enqueue", None)):
                 raise ModelUnavailableError("RPP GIL-releasing execution requires SDK enqueue")
-            self._native_stream = _RppNativeStream(pyrt)
+            try:
+                self._native_stream = _RppNativeStream(pyrt)
+                self._native_input = _RppNativeInput(
+                    int(np.prod(input_shape)) * np.dtype(np.float32).itemsize
+                )
+            except Exception:
+                self.close()
+                raise
 
     @property
     def input_shape(self) -> tuple[int, ...]:
@@ -367,15 +452,17 @@ class _RppExecutionEngine:
         with _RPP_EXECUTION_LOCK:
             if self._closed or self._execution_failed:
                 raise ModelUnavailableError("RPP execution engine is closed or failed")
-            self._devices[input_index].copy_from_numpy(array)
             if self._native_stream is None:
+                self._devices[input_index].copy_from_numpy(array)
                 if not self._context.execute(1, self._bindings):
                     raise ModelUnavailableError("RPP execution failed")
             else:
                 try:
+                    self._native_input.copy_from_numpy(array, self._bindings[input_index])
                     if not self._context.enqueue(1, self._bindings, self._native_stream.stream):
                         raise ModelUnavailableError("RPP enqueue failed")
                     self._native_stream.synchronize()
+                    self._native_input.clear()
                 except Exception as exc:
                     self._execution_failed = True
                     _RPP_QUARANTINED_ENGINES.append(self)
@@ -403,9 +490,17 @@ class _RppExecutionEngine:
                 logger.error("retaining failed RPP execution resources until process exit")
                 return
             self._context = None
-            if self._native_stream is not None:
-                self._native_stream.close()
-                self._native_stream = None
+            try:
+                if self._native_stream is not None:
+                    self._native_stream.close()
+                    self._native_stream = None
+                if self._native_input is not None:
+                    self._native_input.close()
+                    self._native_input = None
+            except Exception:
+                self._execution_failed = True
+                _RPP_QUARANTINED_ENGINES.append(self)
+                raise
             self._hosts.clear()
             self._devices.clear()
             self._engine = None

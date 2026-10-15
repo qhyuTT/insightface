@@ -405,28 +405,55 @@ class SearchSession:
     def _preview_loop(self, reader: LatestFrameReader) -> None:
         """Publish fresh camera frames independently of the inference cadence."""
         last_frame_id = -1
+        interval = 1.0 / max(self.settings.preview_hz, 0.1)
+        next_start = 0.0
+        wait_latest = getattr(reader, "wait_for_new_latest", None)
         while not self._preview_stop.is_set() and not self._stop.is_set():
-            started = time.monotonic()
-            if getattr(self.preview, "has_subscribers", False):
+            if not getattr(self.preview, "has_subscribers", False):
+                self._preview_stop.wait(0.1)
+                continue
+            delay = next_start - time.monotonic()
+            if delay > 0:
+                self._preview_stop.wait(min(delay, 0.1))
+                continue
+            wait_started = time.monotonic()
+            if wait_latest is not None:
+                latest = wait_latest(last_frame_id, timeout=0.1)
+            else:
+                # Lightweight injected readers may not implement preview waits.
                 latest_reader = getattr(reader, "latest", None)
                 latest = latest_reader() if latest_reader is not None else None
-                if latest is not None and latest.frame_id != last_frame_id:
-                    with self._preview_lock:
-                        tracks = list(self._preview_tracks)
-                        faces = list(self._preview_faces)
-                        debug_faces = list(self._preview_debug_faces)
-                        track_states = dict(self._preview_track_states)
-                    self._publish_preview(
-                        latest.frame,
-                        tracks,
-                        faces,
-                        captured_at=latest.captured_at,
-                        debug_faces=debug_faces,
-                        track_states=track_states,
-                    )
-                    last_frame_id = latest.frame_id
-            interval = 1.0 / max(self.settings.preview_hz, 0.1)
-            self._preview_stop.wait(max(0.01, interval - (time.monotonic() - started)))
+            if self._preview_stop.is_set() or self._stop.is_set():
+                return
+            if latest is None or latest.frame_id == last_frame_id:
+                ended = getattr(reader, "ended", None)
+                if ended is not None and ended.is_set():
+                    return
+                # A stopped reader or an injected nonblocking reader can return
+                # None immediately. Keep this idle path bounded without adding
+                # any sleep to successful or over-budget encodes.
+                idle_delay = 0.1 - (time.monotonic() - wait_started)
+                if idle_delay > 0:
+                    self._preview_stop.wait(idle_delay)
+                continue
+            started = time.monotonic()
+            with self._preview_lock:
+                tracks = list(self._preview_tracks)
+                faces = list(self._preview_faces)
+                debug_faces = list(self._preview_debug_faces)
+                track_states = dict(self._preview_track_states)
+            if self._publish_preview(
+                latest.frame,
+                tracks,
+                faces,
+                captured_at=latest.captured_at,
+                debug_faces=debug_faces,
+                track_states=track_states,
+            ):
+                last_frame_id = latest.frame_id
+            # Limit encode starts, not encode completion + an extra interval.
+            # An over-budget encode needs no extra sleep or catch-up frames.
+            next_start = started + interval
 
     def _update_preview_snapshot(
         self, tracks: list[Track], faces: list[FaceObservation]
@@ -1233,8 +1260,8 @@ class SearchSession:
             # The RPP wait mode decides whether SDK synchronization releases the
             # GIL; report the resolved value so the panel cannot claim a mode the
             # engine is not using.
-            "rpp_release_gil": settings.rpp_release_gil,
-            "rpp_engine_cache_enabled": settings.rpp_engine_cache_enabled,
+            "rpp_release_gil": getattr(settings, "rpp_release_gil", False),
+            "rpp_engine_cache_enabled": getattr(settings, "rpp_engine_cache_enabled", False),
             "rpp_detection_execution_wait_mode": getattr(
                 self.face_backend, "detection_execution_wait_mode", "not_applicable"
             ),

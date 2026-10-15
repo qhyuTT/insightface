@@ -4,6 +4,8 @@ ARG BASE_IMAGE=person-search-rk3588-rpp:streamcontract-20261014
 FROM ${BASE_IMAGE}
 ARG VCS_REF=unknown
 COPY src/person_search/video.py src/person_search/domain.py src/person_search/service.py src/person_search/rga.py /app/src/person_search/
+COPY src/person_search/config.py src/person_search/rpp_backends.py src/person_search/hybrid_backends.py /app/src/person_search/
 COPY src/person_search/static/monitor.html /app/src/person_search/static/monitor.html
+COPY scripts/rk3588_gstreamer_capture.py /app/scripts/rk3588_gstreamer_capture.py
 ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}
 LABEL org.opencontainers.image.revision="${VCS_REF}"

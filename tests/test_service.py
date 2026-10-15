@@ -1808,8 +1808,15 @@ def test_detect_then_embed_matches_analyze() -> None:
     np.testing.assert_array_equal(combined[0].embedding, direct[0].embedding)
 
 
-def test_effective_config_reports_the_resolved_rates_and_gates() -> None:
-    manager = SearchManager(Settings(), FakeFaceBackend([make_face()]), FakePersonDetector())
+@pytest.mark.parametrize("legacy_settings", [False, True])
+def test_effective_config_reports_the_resolved_rates_and_gates(legacy_settings: bool) -> None:
+    settings = Settings()
+    if legacy_settings:
+        # An overlay can run against the validated runtime's older Settings.
+        # Optional diagnostics must not break every active-search response.
+        del settings.rpp_release_gil
+        del settings.rpp_engine_cache_enabled
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
     target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "Alice")
     search = manager.start_search(
         target.target_id, SourceConfig(type="camera", device_index=0)

@@ -1,3 +1,186 @@
+# `.215` 双路优化实施与验收（2026-10-14 续，计划 v2）
+
+## 已生效（本轮逐项核对）
+- [x] 生产切到 `perfpreview-20261014-v1`；`video/domain/service/rga/monitor` 五文件与工作树 SHA256 一致；容器 healthy、restart 0、`readyz` 就绪；provider 保持 RPP_BF16 / RKNN_NPU / RKNN_NPU，embedding contract 未变；回滚镜像 `streamcontract-20261014` 保留
+- [x] 断流退避生效：40 分钟仅 7 次 `capture frame timed out`，时间戳间隔 4/7/9s（对照：同口径此前 60 分钟 401 次、helper 每 5 秒重启一轮）
+- [x] 逐源指标已接线：`sources[]` 含 `capture_p50/p95/max_latency_ms`、`last_decoded_frame_age_ms`、`queue_length/capacity`、`stage_p50/p95/max`、`stage_sample_counts`、`effective_hz`；顶层按设计只聚合计数/速率（`latency_scope=per_source`）
+- [x] 丢帧计数自洽：双路采样 `drop_rate≈0.39`，与 decode/processed 一致；AI 队列始终有界（≤2）
+- [x] 本地基线：`uv run pytest` rc=0（进度 100%，无失败）、`uv run ruff check .` 全绿；新增回归覆盖 RGA 低亮度 clamp、auto 转换器择优、逐源指标与速率求和、断流退避/epoch、阶段窗口过期
+- [x] RGA 低亮度修复已部署（Y<16 clamp 到 16）
+- [x] RPP 开关从裸环境变量搬进 `Settings`（`rpp_release_gil` / `rpp_engine_cache_enabled`），后端显式传入引擎工厂，面板经 `effective_config` 自证 `rpp_release_gil` / `rpp_engine_cache_enabled` / `rpp_detection_execution_wait_mode`；新增回归覆盖「显式参数优先于环境变量」与「hybrid 工厂收到 Settings 标志」
+- [x] 核对盒上 SDK 前置：`liburpp.so.2` 导出 `T rtStreamCreate/Destroy/Synchronize`（共 11 个 `rtStream*`）；容器入口脚本已 export `PYTHONPATH/LD_LIBRARY_PATH=/usr/local/rpp/lib`（`docker exec` 里 import 不到 pyrt 是探测方式问题，非缺陷）
+- [x] 本轮本地基线：`uv run pytest` rc=0、`ruff` 全绿（含新增三项回归）；实测 4K 亮场 RGA 16.21ms < OpenCV 18.48ms、暗场 25.38ms > 18.50ms → 暗场自动回落 CPU 合理
+
+## 盒上实测（RPP 原生流与 NPU `load` 口径，2026-10-14 17:xx）
+- [x] `liburpp.so.2` 导出 `rtStreamSynchronize` 等 11 个 `rtStream*`；容器入口脚本用自算 `LIBDIR` 注入 `LD_LIBRARY_PATH`（只给 `PYTHONPATH` 时 pyrt 因缺 `libpython3.11.so.1.0` 导入失败，属探测方式问题非缺陷）
+- [x] 用**本地未部署版** `rpp_backends.py` 临时 `docker cp` 进容器冒烟，跑完立即还原：还原哈希 `e8c73231a092…` 与改动前一致（共两次）
+- [x] `sync_execute` 与 `native_stream_sync` 输出 **max_abs_diff = 0.0**；单线程 60 次 p50/p95：sync **91.64/117.19ms**、stream **95.03/124.53ms**（单线程释放 GIL 无收益，+3~6% 开销）
+- [x] **双线程对照（并发一个 CPU 密集线程，模拟双路）**：release_gil 关 40 次 4488.2ms（112.2ms/次）+ 并发 `cv2.resize` 25.1Hz；开 4091.3ms（102.28ms/次）+ 42.5Hz → RPP 吞吐 **+9%**、并发 CPU 工作 **+1.7×**。`run()` 仍全程持 `_RPP_EXECUTION_LOCK`，两次 RPP 调用依旧串行，收益来自设备等待期间让出 GIL（修正上一版"两路仍串行故收益待定"的措辞）
+- [x] 同输入对照：RKNN SCRFD(1280×736 int8) p50/p95 = **54.71/57.40ms**，比 RPP(BF16) 91.64/117.19ms 快约 1.7×（精度不同，改路由前必须同输入端到端 A/B）
+- [x] NPU `load` 口径判**不可用**：空闲 + RPP 负载 + RKNN 负载约 4 分钟、30+ 次采样恒为 `100@950000000Hz`，而 GPU 同名属性空闲报 `0@300MHz`
+
+## 调度端断流看护（2026-10-14 18:xx，`airport-robot-dispatch`）
+- [x] 定位根因：机器人 `maxDurationSeconds` 与 publish token 寿命都写死 **1800s**，而寻人任务可跑 3 小时 → "任务启动时一次性下发"在 30 分钟后必然静默断流，且**没有任何组件会重发**
+- [x] 核对机器人侧语义：`RobotVideoStreamController.start()` 的 fingerprint 含 `publishUrl`(token) 与时长；不满足 allAlreadyRunning 时先 `stopAllLocked()` 再只重建命令列出的源 → **看护必须重发任务的全部源**，只补缺失源会把健康那一路一起停掉
+- [x] 实现（`app/services.py`）：抽出 `_video_stream_command()` 与首次启动共用（避免 token/载荷口径漂移）；新增 `start_video_stream_watchdog()` + 周期 `_video_stream_watchdog_tick()`（缺失源超 grace 后重发全部源；全部在线但在上限前 `lead` 秒内则预防性刷新）+ `_reissue_video_streams()`（持 `_video_stream_lock`、逐源换新 token、不阻塞等待、失败绝不触发首次启动的清理路径）+ `_online_source_ids()`（状态展示复用）；`app/main.py` lifespan 启动、`close()` 取消
+- [x] 新增 4 项设置：`video_stream_watchdog_interval_seconds=10`、`video_stream_watchdog_offline_grace_seconds=30`、`video_stream_watchdog_retry_backoff_seconds=20`、`video_stream_reissue_lead_seconds=300`
+- [x] 回归：新增 `tests/test_video_watchdog.py` 7 项（掉一路后重发全部源且 token 刷新 / grace 内不动作 / 媒体列表不可读不动作 / 到期前刷新 / 无活跃任务不动作 / 不抢在显式启动前 / 只启动一次且 close 取消）全绿；ruff 通过
+- [ ] 待现场：装新 APK 后做真实断流 + 跨 30 分钟阈值演练（并入终验 I）
+
+## 调度端看护已上线（2026-10-14 12:37Z 发布 / 12:44Z 补日志）
+- [x] 发布目录：`/home/EIS100RK3588/apps/airport-robot-dispatch/releases/20261014T1237Z-video-watchdog`，`current` 已切到它；`.env.production` 是指向 `shared/.env` 的 symlink，重建前后逐项核对**有效环境变量完全一致**（只有代码变化）
+- [x] 回滚点：镜像 `airport-robot-dispatch-box-backend:before-video-watchdog`（=旧 `latest` 87aeaf801592）保留；回滚 = `current` 切回旧 release + `docker tag before-video-watchdog latest` + `up -d --no-build`
+- [x] 部署验证：容器 healthy、`/health` = `{"status":"ok"}`、`alembic` 无操作、后台任务查询正常；容器内 `app/{services,config,main}.py` 哈希与本地逐字节一致
+- [x] 发布前用 diff 证明"盒上版本 == 我改动前的基线"：services.py 的 7 处、main.py 的 1 处全部是我的改动；config.py 除我的插入外仅 `video_publish_base_url` 默认值不同（被 `.env.production` 覆盖且机器人会重写主机名，属惰性差异）
+- [x] 新增启动日志并把级别定为 WARNING（本项目生产日志默认只出 WARNING+，INFO 不可见）：`Video stream watchdog started interval=... grace=... backoff=... lead=...`，用于证明看护真的在跑
+- [ ] 待你：起一次真实任务做断流演练（拔一路 / 等 30 分钟跨阈值），观察是否自动重发并恢复
+- [x] 最终部署验证（12:44Z 第二次重建）：容器内 `app/services.py` = 本地 `74a481180e04700a`；启动日志实测出现 `Video stream watchdog started interval=10.0s grace=30.0s backoff=20.0s lead=300.0s` → 看护任务确在运行；容器 healthy、`/health` ok、`watchdog tick failed` 计数 0
+- [x] Review 中发现自己改动的一个真实缺陷并修复（第三次重建）：原实现把 `TaskStatus.FINISHING` 也当作"活跃任务"，任务结束清理推流时，30s 宽限后看护可能把已结束任务的推流重新拉起；现限定为仅 `ACTIVE`（`_video_stream_watchdog_tick` 与 `_reissue_video_streams` 双 guard），并补回归 `test_watchdog_does_not_restart_streams_for_a_finishing_task`；dispatch 全量 **171 项通过**、ruff 通过
+- [x] 最终部署核验：容器内 `app/services.py` = 本地 `089e67381986c3f0`；启动标记实测再次出现；容器 healthy、restart 0；回滚镜像 `before-video-watchdog` 仍在
+- 说明：启动标记用 WARNING 级别是刻意的——应用无 logging 配置，root 停在 WARNING，INFO 在生产不可见；任何 tick 异常都会以 WARNING `Video stream watchdog tick failed` 每 10s 出现一次，可直接 grep 判断存活
+
+## 实测修正（收敛或推翻上一版结论）
+- [x] 「预览已达 15fps」是顶层求和口径：`PREVIEW_HZ=15` 只是上限，逐源实测中位数 4K **4.2fps**、720p **7.8–9.1fps**（顶层 10–15fps = 两路之和）
+- [x] 4K 采集 p95 ≈ **420ms**（385–435ms），720p ≈ 185ms；而 NV12→BGR 转换本身仅 11.3ms（`converter=opencv_selected`）→ 420ms 来自管道读/调度/占用，不是颜色转换
+- [x] 全帧人脸检测逐源实测 **1.0–3.9Hz（中位 2.0–2.7Hz）**，配置 4Hz + 错峰 → 距 8–12Hz 目标很远
+- [x] 帧龄尾部大：4K 中位 33–399ms、最大 7.2s；720p 最大 5.6s（断流窗口）
+- [x] 顶层 `queue_capacity` 是逐源求和（2+2=4），非配置冲突；逐源 `queue_capacity=2` 与 `frame_queue_size` 默认一致
+- [x] NPU `load` 口径未确认：空闲（无搜索、`rpp_server` 1.3% CPU）相隔 20s 两次均报 `100@950000000Hz` → 撤回「NPU 满载即瓶颈」
+- [x] ZLM 帧计数不能当解码率：计数差分 4K 15.5/s（声明 20fps）、720p 18.3/s（声明 15fps）
+
+## 待办（重排：双路长跑放到最后终验）
+- [ ] A RPP 双路吞吐验证（离线）：本地部分已完成（见下）；**仅剩盒上原生冒烟**（建流/同步/销毁 + `PERSON_SEARCH_RPP_RELEASE_GIL=true` 下一次真实 SCRFD run，不部署镜像）
+- [ ] A0 部署第 5 步前，先把 `deploy/Dockerfile.rk3588.performance` 的 `BASE_IMAGE` 改为 `perfpreview-20261014-v1`（沿用旧基镜像会静默回退预览提频/逐源指标/RGA 修复）
+- [ ] B 带宽决策（单路短测即可推进）：同一路分别测 4K 主码流 vs 子码流（`Channels/102`）的单源入站/处理/采集 p95，决定是否切子码流
+- [ ] C 指标口径收口：NPU/RGA `load` 受控基线（同一输入、有/无推理对照），确认口径后再引用
+- [ ] D 上游自愈（跨仓库，需授权）：机器人上报 phase/失败分类 + FAILED 按实例清理（需装新 APK）；调度按 `source_ids_from_media` 有界退避重发并重签 token
+- [ ] E 检测频率 A/B（单路短测可得比例）：`FACE_DETECTION_HZ_CUDA` 4 vs 6 vs 8 → 逐源 `effective_hz.face_full` 与 `achieved_sampling_hz`；精度回归
+- [ ] F 延迟预算 A/B（单路短测）：jitter 500 vs 300/150/100ms；相机 GOP 4s→1s；回归绿帧与远脸
+- [ ] G ZLM 冗余：确认无 HLS/音频消费者后关闭 `enable_hls`/`enable_audio`
+- [ ] H 真端到端实测（需现场配合，可延后）：画面内毫秒时间码比对预览画面
+- [ ] I **终验（最后做）**：真实双路连续 ≥10 分钟（争取 ≥2h），逐源全字段 + ZLM `bytesSpeed` + eth0 RX/TX 同步采；断流/恢复演练；H 的 E2E 结论
+- [ ] J 仅在 A–H 不达标时：WebRTC 预览、DMABUF/共享内存减少 4K 复制
+
+口径说明：单路 1–3 分钟短测只给比例与相对结论（记录窗口与配置），不能替代 I 的稳定性结论；I 需要用户开真实双路，已确认放到最后。
+
+现场结论：本轮把「已写未部署」这条前提消掉了——生产已在 `perfpreview-20261014-v1` 上运行审查过的五个文件，断流退避与逐源指标均已生效并有生产证据。真正的剩余瓶颈是三项：4K 采集 p95 ≈420ms（占住采集线程）、每路全帧检测仅 ≈2Hz（4Hz 配置加错峰）、以及网络预算（两路入站 ≈9–11 Mbps 对盒子公网 ≈9.8/10.2 Mbps，两路高帧率预览上行不可行）。NPU 与 ZLM 帧计数的口径都不可直接采信，相关结论已撤回或降级。机器人侧仍无自愈，需装新 APK 并由调度补看护。
+# `.215` 修复识别服务能力契约不兼容（2026-10-14）
+
+- [x] 复用调度容器已有的 `DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY`，安全写入识别服务 `runtime.env` 的 `PERSON_SEARCH_EVIDENCE_API_KEY`
+- [x] 增加容器健康检查：`/readyz` 就绪且 `/healthz` 声明调度端要求的全部 6 项能力；Compose 强制要求 runtime env 文件存在
+- [x] 完成能力测试、镜像更新和盒端重建；只检查密钥匹配结果，不输出密钥或散列
+- [x] 验证全部能力、识别 provider、健康状态和证据接口鉴权，记录部署前后状态与重启次数
+
+## 根因（现场只读核对）
+
+调度端 `REQUIRED_INSIGHTFACE_CAPABILITIES` 要求 `replace_active`、`active_search`、
+`search_timeout`、`request_lookup`、`event_replay`、`confirmed_evidence_v1`。盒端识别服务
+当前 `/healthz` 返回前五项；`confirmed_evidence_v1` 只有在设置
+`PERSON_SEARCH_EVIDENCE_API_KEY` 后才发布。识别容器没有该变量，调度容器已有
+`DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY`，且已配置证据加密密钥。不是缺少 API 实现：当前
+服务 OpenAPI 已有证据 GET/DELETE 路由，镜像代码会按配置发布能力。
+
+## 执行与验收
+
+- 调度服务的证据 API 密钥已配置；识别服务环境里原先没有对应变量。Compose 指定的
+  /ssd/person-search-rpp/runtime.env 当时也不存在，且 required: false 允许服务静默启动。
+- sync_rk3588_evidence_key.py 从调度容器读取现有密钥，不打印密钥，创建 root-owned、0600 的运行时文件。
+  盒端核对两个容器的密钥完全相同。
+- 新增 check_rk3588_contract.py，Compose 和 Dockerfile 健康检查同时核对 /readyz 与全部 6 项能力；
+  Compose 现在强制要求运行时环境文件存在。能力测试精确断言六项集合。
+- 盒端镜像 person-search-rk3588-rpp:streamcontract-20261014，revision 同名；容器 running/healthy，
+  restart count 为 0。健康检查通过；provider 为 RKNN_NPU、RPP_BF16、RKNN_NPU；/healthz 返回六项能力全量集合。
+- 证据 GET 和 DELETE 均验证：无密钥为 403；调度共享密钥通过鉴权，到未知会话资源后为 404。
+  过程只记录状态码和密钥匹配布尔值，不输出密钥或散列。
+- tests/test_api.py：14 passed。检查中发现监控页测试还锁定旧 Mac RTSP 地址，已将断言和 README
+  监控默认值更新为盒端 ZLMediaKit 两路地址。Ruff、Python 编译、git diff --check 和盒端 Compose 配置校验通过。
+- 本轮没有运行中的搜索会话；ZLMediaKit 此前核对为 0 路上游流。能力兼容已修复，真实流的识别与证据图片
+  端到端验收仍需上游推流和新寻人任务。
+
+# `.215` 双路流与内网监控（2026-10-14）
+
+- [x] 复现第一路 H.265 容器内 `failed to init mpp ctx`，确认同段视频宿主 MPP 可解
+- [x] 在隔离容器中验证设备树只读挂载 + `systempaths=unconfined` 可恢复 H.265 MPP 解码
+- [x] 定位断流后 GStreamer stdout 读取可能无限阻塞，给整帧读取加超时以触发原有重连循环
+- [ ] 现场验证断流后进入 `source_lost`，恢复推流后重新出帧
+- [x] 正式容器切到 `streamcontract-20261014`（包含前述 H.265 修复），`readyz` 就绪、设备树可读、第一路录制 H.265 样本可硬解
+- [ ] 上游重新推流并启动寻人后，验证第一路实时画面和处理 FPS、第二路识别、真实断流恢复
+- [x] 核对盒端 ZLMediaKit、识别容器、两路流及当前任务状态
+- [x] 定位第一路无帧原因，区分上游推流和识别拉流故障
+- [x] 监控页自动接回当前任务，并显示每路流的状态、FPS、分辨率和识别结果
+- [x] 部署页面并从内网 HTTPS 入口核对页面、API、WebSocket 和第二路 MJPEG 预览
+
+现场结论：先前两路均由 ZLMediaKit 接收；`ip-camera` 为 3840×2160 H.265，识别源 1 保持 0 FPS；`local-camera` 为 1280×720 H.264，识别源 2 约 10 FPS，曾出现目标确认（最佳相似度约 0.654）。第一路故障定位到旧容器缺少可读的 `/proc/device-tree/compatible`，新容器已在盒端用第一路录制数据解出 H.265 帧。10 月 14 日 11:03 上游两路推流同时断开，ZLMediaKit 的 `getMediaList` 当前返回空列表；新容器重建后旧内存会话失效，故实时出帧、识别和推流恢复验收等待新任务与上游推流。断流读取超时已用盒端沉默子进程核对：设 1 秒截止时间后按时返回并触发重连路径。
+
+# `.184` RPP 检测 + RKNN NPU 识别容器化
+
+本轮继续：完成 `ipc: host` 与 SDK 对象生命周期修复；恢复故障后的 RPP 驱动，再完成硬件 readiness 和同输入性能对比。
+
+## `.184` 切换到容器基线（2026-10-11）
+
+- [x] 确认 `18080` 由旧原生单视频流 `person-search-rk3588.service` 占用；其代码目录为 `/ssd/person-search`
+- [x] Compose 与镜像默认端口改为 `18080`，保留 `18081` 作为显式隔离测试端口
+- [x] 停止并禁用旧原生 unit，保留代码目录和 unit 文件
+- [x] 让 `mppdma-20261011` 容器接管 `18080`；健康检查通过、重启 0 次、monitor HTTP 200、仅 18080 监听
+- [ ] 重新登记目标，用真实 RTSP 完成单路/双路端到端 FPS、识别和断流验收
+
+> 下面记录的是切换前的 staging/性能测试时间线；其“18080 保持原生服务”状态已被本节的后续切换取代。端到端性能验收仍未通过。
+
+## Mac 摄像头 RTSP 盒端验收（2026-10-11）
+
+- [x] 确认 Mac RTSP 发布端输出 H.264 1280×720@30，并成功解出实际视频帧
+- [x] 记录 staging 搜索 85 个样本：持续 `INITIALIZING`、0 FPS、0×0；不把它误报为推理性能
+- [x] 定位 staging 容器缺少全部 `/dev/dma_heap/*`，而 184 主机 MPP 解码可工作
+- [x] Compose 映射 6 个 DMA heap 设备；停止搜索时主动中断 GStreamer helper
+- [x] 全量 pytest、Ruff、锁文件和 Compose 配置校验通过
+- [x] 仅重建 `.184:18081` staging；容器内显式 H.264 MPP helper 输出有效 `1280×720 NV12` 帧；服务 healthy、无重启、helper 已清零
+- [ ] 重新登记目标后采集真实视频端到端 FPS；生产 `.184:18080` 保持不动
+
+## 双路低分辨率评估（2026-10-11）
+
+- [x] 同盒同图测 1920×1080、1280×720 的 RKNN 与 RPP+RKNN 双检测延迟
+- [x] 按用户澄清改为一个寻人会话同时接两路视频：检查 API、采集、跟踪、确认和事件来源的现有边界
+- [x] 两个隔离执行单元组成一个对外会话：各自采集/跟踪/确认、共享目标/模型，任一路命中后收束；兼容单路 API
+- [x] 监控页支持第二个 RTSP 输入和双路预览；状态与命中事件标记 `source_id`
+- [x] 本地双路模拟采集、任一路命中、停止清理、来源脱敏、参数校验回归
+- [x] 双路镜像 `dual-20261011` 部署至 `.184:18081` staging；healthy、零重启，RPP_BF16/RKNN_NPU/RKNN_NPU readiness，通过双路/单路 API 结构烟测；`18080` 生产未动
+- [ ] 用两条真实 RTSP 验证断流/重连与端到端 FPS；对比 720p/1080p，确定生产配置
+
+- [x] 确认 `.184` RPP SDK/设备可用；同样本 RPP/ONNX SCRFD 检测框差 <1 px
+- [x] 对比 ArcFace：现有 RKNN（含 TTA）比 RPP 端到端路径更快；识别保留 RKNN
+- [x] 停止本轮旧版 `18081` staging 容器；确认原生 `18080` 健康且未切换
+- [x] 实现 `hybrid` 路由：SCRFD 搜索/登记走 RPP；ArcFace 和 YOLOX 走 RKNN NPU
+- [x] 强制 provider：face detection=`RPP_BF16`，face recognition/person detection=`RKNN_NPU`；禁止 CPU 推理回退
+- [x] 预生成并校验 SCRFD 1280×736 / 640×640 静态图，镜像只读挂载；容器不做 CPU 图优化
+- [x] 保持 `arcface-v1-rknn` embedding contract 与现有 `w600k_r50.rknn`，不改变登记特征语义
+- [x] ARM64 镜像排除 ONNX Runtime 推理依赖；挂载 RPP/RKNN 设备与主机采集运行库
+- [x] 全量测试、ruff、锁文件、Shell 语法、Compose 与 diff 校验通过；静态图已生成，镜像已构建
+- [x] 定位并修复容器与宿主 `rpp_server` 的 SysV 共享内存隔离：Compose 使用 `ipc: host`
+- [x] 保留 RPP Logger、模型/plan 数据至引擎释放；增加缓存加载生命周期回归测试
+- [x] 获授权后受控重启 `.184` 恢复 Oops 的 RPP 驱动；原有调度、媒体和 `18080` 服务均恢复健康
+- [x] 定位 BF16 plan 反序列化原生崩溃，默认禁用 plan 缓存；旧 plan 移至 staging 隔离目录保留
+- [x] 定位首次执行缺少 RPP `include/kernel` 配置，Compose 增加只读挂载
+- [x] 定位 RPP SDK 首次执行需 `gcc`/`ld` 编译设备 kernel，镜像补 ARM64 编译工具与 C headers
+- [x] 修复 fresh-build 路径释放无用 `pyrt.Runtime` 时的 SIGSEGV；最终镜像独立基准进程正常退出
+- [x] `.184` 隔离 `18081` 的 RPP 搜索/登记两图真实设备执行与 readiness；provider 为 RPP_BF16/RKNN_NPU/RKNN_NPU
+- [x] 同图人脸框约 1px 内一致；单图测速 RPP 搜索 95.36ms > RKNN 40.93ms，登记 100.09ms > 85.69ms
+- [x] 4K 升采样图双模型串/并行对比：混合 241.95/183.27ms，纯 RKNN 169.80/131.45ms；性能验收未过，不切换生产
+- [ ] 用真实 RTSP 视频源验证采集与整链吞吐；目前 staging 未提供该源，静态图不能代替现场验收
+- [x] 性能测试未支持自主切换；之后按用户明确要求将容器设为优化基线，性能验收仍未通过
+
+## 切换前盒端状态（历史）
+
+- 当时 `18080` `/readyz` 为 `ready`，三个原 provider 均为 `RKNN_NPU`，embedding contract 未变。
+- 当时 `18081` staging 镜像 `perf-20261011-rppfix4` healthy、重启次数为 0，但性能较纯 RKNN 路径慢；此状态已由下方明确授权的端口切换取代。
+- 宿主 `rpp_server` 已随重启恢复；重启后 SDK plan 加载和容器资源挂载分别暴露新问题，代码和 Compose 已修复，待两图真实执行确认。
+
+## 切换后盒端状态（2026-10-11）
+
+- 旧 `person-search-rk3588.service` 为 `inactive/disabled`；`/ssd/person-search` 和原 unit 文件均保留。
+- `person-search-rk3588-rpp:mppdma-20261011` 现在监听 `18080`，healthy、重启次数 0；provider 为 RPP_BF16/RKNN_NPU/RKNN_NPU。
+- `http://192.168.30.184:18080/monitor` 从盒端和 Mac 均返回 HTTP 200；`18081` 无监听，`/v1/searches/active` 为 `null`。
+- 容器重建会清空进程内登记；真实视频、双路吞吐和识别准确率尚未验收，不能声称性能已经提升。
+
 # RK3588 识别 10–15 FPS 实测与 RGA 加速（2026-09-15）
 
 - [x] 只读核对现网：三模型均为 `RKNN_NPU`、A76 affinity 生效、NV12 桥接生效，`target_loop_hz=4`
@@ -744,3 +927,47 @@ bundle 通道完成。`insightface-release-0564295` 目录留在服务器上（�
 - [ ] **transit 的误报代价没有测量**：检测分 0.65→0.55 和 median→top_k_mean 都是放宽，
       在候机厅多人场景下的假阳率未知。按 lessons 第五次要求，仍需 `--dump-similarities`
       跑正负素材定阈值。
+
+# 双路视频性能第一阶段审查（2026-10-14）
+
+- [x] 扫描盒端与机器人仓库，阅读既有部署记录和相关 lessons
+- [x] 还原拉流、缓存、AI、预览与指标调用链（并行只读审查）
+- [x] 只读核对 .215 运行版本、硬件路径和当前流状态
+- [x] 形成带代码证据的问题清单、检查命令、测试矩阵和最小修改计划
+- [x] 校验报告引用、命令与现有针对性测试；保留现有未提交修改
+
+本轮仅新增排查文档/检查工具和任务记录，不修改业务代码，不重启或切换设备服务。
+
+交付：`docs/dual-stream-performance-audit-20261014.md`（完整9节）、
+`scripts/collect_dual_stream_audit.py`（只读脱敏采集）、
+`docs/dual-stream-audit-20261014.samples.jsonl`（后续第一路断流的5个真实样本）。
+146项针对测试通过；采集脚本Ruff、JSON/隐私白名单及实际盒端执行通过。
+14:19正常双路约46秒采证，14:22第一路发布消失而第二路继续；未修改生产配置/重启服务。
+
+## 双路性能只读续查
+
+- [x] 复核当前流状态，定位14:21:49发布连接EOF的接入链证据
+- [x] 核查机器人keepalive/单路失败上报和盒端转发超时
+- [x] 补充报告：区分已确认中断与候选原因，提出最小验证项
+
+续查结论：14:33第一路仍失联，第二路持续；Nginx RTSPS SNI透传至7554，stream timeout为1h。
+机器人运行中FAILED没有上报/移除，相同fingerprint重试可误判已运行；已补报告R06–R08和P0-d。
+普通用户与sudo -n均无法读取Nginx error.log，未修改权限。
+续查验证：使用现有JDK17/Android SDK离线执行机器人四个推流相关测试类，17项全通过。
+现有测试不覆盖控制器运行后FAILED与同参数重试，后续最小修复必须补行为回归。
+
+# 双路性能最小优化实施（用户已授权）
+
+- [x] 采集持续更新latest，AI覆盖旧帧/取最新，准确计数和重连退避
+- [x] 每源完整滑窗指标/分阶段分位数，修前端标签与延迟范围
+- [x] 机器人FAILED状态可见性及同参数真实重试、行为回归
+- [x] 本地全量测试/静态检查，盒端同样本采集/预览梯度基准
+- [x] 构建可回退镜像，检查活动任务并受控部署/就绪验收
+- [ ] 记录优化前后实际吞吐/资源/延迟、尚未达到目标的限制
+
+优化验证：识别380项全量测试、机器人189项全量JVM测试+lint+debug assemble通过。
+盒端合成双路200ms慢AI对照：JPEG 4.91/4.91→14.48/14.75FPS，CPU127.51%→183.70%。
+用户已明确批准切换；perfpreview-20261014-v1已执行受控Compose重建，正在等硬件readiness。
+
+上线：perfpreview-20261014-v1 running/healthy、restarts0、readyz与六项能力通过；预览15Hz。
+旧镜像及原Compose目录保留，runtime.env/模型/SDK未变。等待重新登记和双路上游实测。

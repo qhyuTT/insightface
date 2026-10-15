@@ -7,7 +7,7 @@ from typing import Any, Self
 from urllib.parse import urlsplit
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 METRICS_SAMPLE_LIMIT = 1000
 
@@ -280,10 +280,28 @@ def _validate_file_uri(uri: str) -> str:
 
 class SearchCreate(BaseModel):
     target_id: str
-    source: SourceConfig
+    source: SourceConfig | None = None
+    sources: list[SourceConfig] | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
     replace_active: bool = False
     request_id: str | None = Field(default=None, max_length=128)
+
+    @field_validator("source")
+    @classmethod
+    def reject_explicit_null_source(cls, source: SourceConfig | None) -> SourceConfig:
+        if source is None:
+            raise ValueError("source must not be null")
+        return source
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> SearchCreate:
+        if (self.source is None) == (self.sources is None):
+            raise ValueError("provide either source or sources")
+        if self.sources is not None and len(self.sources) != 2:
+            raise ValueError("sources must contain exactly two video sources")
+        if self.sources is not None and self.sources[0] == self.sources[1]:
+            raise ValueError("sources must refer to different video sources")
+        return self
 
 
 class TargetSearchView(BaseModel):
@@ -336,6 +354,7 @@ class ConfirmedSearchResult(BaseModel):
     evidence_id: str | None = None
     evidence_expires_at_ms: int | None = None
     evidence_available: bool = False
+    source_id: str | None = None
 
 
 class SearchView(BaseModel):
@@ -344,6 +363,7 @@ class SearchView(BaseModel):
     target_name: str = "目标"
     status: SearchStatus
     source: SourceConfig
+    sources: list[dict[str, Any]] = Field(default_factory=list)
     provider: str | None = None
     embedding_contract_id: str | None = None
     processed_fps: float = 0.0
@@ -361,6 +381,20 @@ class SearchView(BaseModel):
     stage_p95_latency_ms: dict[str, float] = Field(default_factory=dict)
     effective_hz: dict[str, float] = Field(default_factory=dict)
     source_fps: float = 0.0
+    # source_fps is retained as an alias for successful decoded BGR reads.
+    decode_fps: float = 0.0
+    decoded_frames: int = 0
+    processed_frames: int = 0
+    capture_p50_latency_ms: float = 0.0
+    capture_p95_latency_ms: float = 0.0
+    capture_max_latency_ms: float = 0.0
+    queue_length: int = 0
+    queue_capacity: int = 0
+    last_decoded_frame_age_ms: float | None = None
+    stage_p50_latency_ms: dict[str, float] = Field(default_factory=dict)
+    stage_max_latency_ms: dict[str, float] = Field(default_factory=dict)
+    stage_sample_counts: dict[str, int] = Field(default_factory=dict)
+    latency_scope: str = "decoded_frame_to_completion"
     frame_width: int = 0
     frame_height: int = 0
     preview_fps: float = 0.0
@@ -427,6 +461,7 @@ class SearchEvent(BaseModel):
     evidence_id: str | None = None
     evidence_expires_at_ms: int | None = None
     evidence_available: bool | None = None
+    source_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -534,9 +569,11 @@ class SearchMetrics:
     match_stage_counts: dict[str, int] = field(default_factory=dict)
     stage_latencies_ms: BoundedStageSeries = field(default_factory=BoundedStageSeries)
     stage_call_counts: dict[str, int] = field(default_factory=dict)
+    stage_called_at: BoundedStageSeries = field(default_factory=BoundedStageSeries)
     frame_width: int = 0
     frame_height: int = 0
     preview_frames: int = 0
+    processed_at: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_published_at: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_frame_ages_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_encode_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
@@ -562,6 +599,7 @@ class SearchMetrics:
         """Wrap constructor-provided lists while preserving the old dataclass API."""
         for name in (
             "latencies_ms",
+            "processed_at",
             "end_to_end_latencies_ms",
             "camera_motion_px",
             "blur_variances",
@@ -575,6 +613,8 @@ class SearchMetrics:
             values = getattr(self, name)
             if not isinstance(values, BoundedFloatSeries):
                 setattr(self, name, BoundedFloatSeries(values))
+        if not isinstance(self.stage_called_at, BoundedStageSeries):
+            self.stage_called_at = BoundedStageSeries(self.stage_called_at)
         if not isinstance(self.stage_latencies_ms, BoundedStageSeries):
             self.stage_latencies_ms = BoundedStageSeries(self.stage_latencies_ms)
     unconfirmed_gate_counts: dict[str, int] = field(default_factory=dict)
@@ -589,7 +629,7 @@ class SearchMetrics:
 
             now = time.monotonic()
             elapsed = max(now - self.started_at, 1e-6)
-            fps = self.frame_count / elapsed
+            fps = _window_fps(self.processed_at, now, started_at=self.started_at) if self.processed_at else self.frame_count / elapsed
         p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
         stage_p95_latency_ms = {
             stage: float(np.percentile(latencies[-1000:], 95))
@@ -603,16 +643,10 @@ class SearchMetrics:
         )
         arrived = self.dropped_frames + self.frame_count
         drop_rate = self.dropped_frames / arrived if arrived else 0.0
-        preview_samples = self.preview_published_at
-        if len(preview_samples) >= 2:
-            preview_window_start = max(preview_samples[0], now - 10.0)
-            preview_window = [item for item in preview_samples if item >= preview_window_start]
-            preview_elapsed = preview_window[-1] - preview_window[0] if len(preview_window) >= 2 else 0.0
-            preview_fps = (len(preview_window) - 1) / preview_elapsed if preview_elapsed > 0 else 0.0
-        else:
-            preview_fps = 0.0
+        preview_fps = _window_fps(self.preview_published_at, now, started_at=self.started_at)
         return {
             "processed_fps": fps,
+            "processed_frames": self.frame_count,
             "p95_latency_ms": p95,
             "dropped_frames": self.dropped_frames,
             "face_observations": self.face_observations,
@@ -625,11 +659,25 @@ class SearchMetrics:
             "face_source_counts": dict(sorted(self.face_source_counts.items())),
             "match_stage_counts": dict(sorted(self.match_stage_counts.items())),
             "stage_p95_latency_ms": stage_p95_latency_ms,
+            "stage_p50_latency_ms": {
+                stage: _percentile(values, 50)
+                for stage, values in self.stage_latencies_ms.items() if values
+            },
+            "stage_max_latency_ms": {
+                stage: max(values) for stage, values in self.stage_latencies_ms.items() if values
+            },
+            "stage_sample_counts": {
+                stage: len(values) for stage, values in self.stage_latencies_ms.items() if values
+            },
             "effective_hz": {
-                stage: count / elapsed if elapsed else 0.0
+                stage: (
+                    _window_fps(self.stage_called_at[stage], now, started_at=self.started_at)
+                    if stage in self.stage_called_at
+                    else count / elapsed if elapsed else 0.0
+                )
                 for stage, count in sorted(self.stage_call_counts.items())
             },
-            "source_fps": arrived / elapsed if elapsed else 0.0,
+            "source_fps": 0.0,  # Filled from the reader; never infer reads from AI drops.
             "frame_width": self.frame_width,
             "frame_height": self.frame_height,
             "preview_fps": preview_fps,
@@ -665,3 +713,18 @@ class SearchMetrics:
 
 def _percentile(values: list[float], percentile: float) -> float:
     return float(np.percentile(values[-1000:], percentile)) if values else 0.0
+
+
+def _window_fps(
+    samples: list[float],
+    now: float,
+    window_seconds: float = 10.0,
+    *,
+    started_at: float | None = None,
+) -> float:
+    """Recent event rate over a fixed trailing window (falls to zero when idle)."""
+    if not samples:
+        return 0.0
+    origin = samples[0] if started_at is None else started_at
+    duration = min(window_seconds, max(now - origin, 1.0))
+    return sum(now - window_seconds <= item <= now for item in samples) / duration

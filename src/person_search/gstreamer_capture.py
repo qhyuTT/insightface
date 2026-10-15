@@ -10,7 +10,9 @@ existing ``LatestFrameReader`` the same ``read/grab/release`` surface as
 from __future__ import annotations
 
 import logging
+import os
 import re
+import select
 import struct
 import subprocess
 import threading
@@ -188,10 +190,28 @@ class GStreamerCapture:
     def release(self) -> None:
         self._close_process()
 
+    def interrupt(self) -> None:
+        """Terminate the helper so a reader blocked on stdout can exit promptly."""
+        process = self._process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=1.0)
+            except (OSError, subprocess.TimeoutExpired):
+                logger.debug("GStreamer capture helper did not exit after interrupt", exc_info=True)
+        except OSError:
+            logger.debug("failed to interrupt GStreamer capture helper", exc_info=True)
+
     def _read_packet(self) -> tuple[bytes, int, int, bytes] | None:
         if not self.isOpened() or self._stdout is None:
             return None
-        header = _read_exact(self._stdout, _FRAME_HEADER.size)
+        deadline = time.monotonic() + self.settings.rtsp_read_timeout_seconds
+        header = _read_exact(self._stdout, _FRAME_HEADER.size, deadline=deadline)
         if header is None:
             self._close_process()
             return None
@@ -213,7 +233,7 @@ class GStreamerCapture:
             logger.warning("invalid frame header from GStreamer helper")
             self._close_process()
             return None
-        payload = _read_exact(self._stdout, payload_size)
+        payload = _read_exact(self._stdout, payload_size, deadline=deadline)
         if payload is None:
             self._close_process()
             return None
@@ -307,11 +327,30 @@ def _resolve_helper(configured: Path) -> Path:
     return path
 
 
-def _read_exact(stream: BinaryIO, size: int) -> bytes | None:
+def _read_exact(stream: BinaryIO, size: int, *, deadline: float) -> bytes | None:
     chunks: list[bytes] = []
     remaining = size
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError):
+        # In-memory streams used by callers do not have a selectable descriptor.
+        fd = None
     while remaining:
-        chunk = stream.read(remaining)
+        if fd is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                logger.warning("GStreamer capture frame timed out; reconnecting source")
+                return None
+            try:
+                readable, _, _ = select.select([fd], [], [], timeout)
+                if not readable:
+                    logger.warning("GStreamer capture frame timed out; reconnecting source")
+                    return None
+                chunk = os.read(fd, remaining)
+            except (OSError, ValueError):
+                return None
+        else:
+            chunk = stream.read(remaining)
         if not chunk:
             return None
         chunks.append(chunk)

@@ -157,24 +157,27 @@ def create_app(
 
     @app.post("/v1/searches", response_model=SearchView, status_code=201)
     async def create_search(request: SearchCreate) -> SearchView:
-        if request.source.type == SourceType.FILE:
-            raise PersonSearchError(
-                "file sources are supported by person-search-eval, not the live API",
-                code="invalid_source",
-                status_code=422,
-            )
-        if request.source.type == SourceType.RTSP:
-            scheme = urlsplit(request.source.uri or "").scheme.lower()
-            if scheme not in {"rtsp", "rtsps"}:
+        selected_sources = request.sources or [request.source]
+        for selected_source in selected_sources:
+            assert selected_source is not None
+            if selected_source.type == SourceType.FILE:
                 raise PersonSearchError(
-                    "RTSP source URI must use rtsp:// or rtsps://",
+                    "file sources are supported by person-search-eval, not the live API",
                     code="invalid_source",
                     status_code=422,
                 )
+            if selected_source.type == SourceType.RTSP:
+                scheme = urlsplit(selected_source.uri or "").scheme.lower()
+                if scheme not in {"rtsp", "rtsps"}:
+                    raise PersonSearchError(
+                        "RTSP source URI must use rtsp:// or rtsps://",
+                        code="invalid_source",
+                        status_code=422,
+                    )
         return await asyncio.to_thread(
             manager.start_batch_search,
             [request.target_id],
-            request.source,
+            request.sources or request.source,
             request.timeout_seconds,
             request.replace_active,
             request.request_id,
@@ -213,27 +216,35 @@ def create_app(
                 status_code=422,
             )
         try:
-            request_source = SourceConfig.model_validate(source_data)
+            request_source = (
+                [SourceConfig.model_validate(item) for item in source_data]
+                if isinstance(source_data, list)
+                else SourceConfig.model_validate(source_data)
+            )
         except (
             Exception
         ) as exc:  # pydantic's detailed errors are not part of the public API contract
             raise PersonSearchError(
                 "invalid source", code="invalid_source", status_code=422
             ) from exc
-        if request_source.type == SourceType.FILE:
-            raise PersonSearchError(
-                "file sources are supported by person-search-eval, not the live API",
-                code="invalid_source",
-                status_code=422,
-            )
-        if request_source.type == SourceType.RTSP:
-            scheme = urlsplit(request_source.uri or "").scheme.lower()
-            if scheme not in {"rtsp", "rtsps"}:
+        selected_sources = request_source if isinstance(request_source, list) else [request_source]
+        if not selected_sources or len(selected_sources) > 2:
+            raise PersonSearchError("one or two sources are required", code="invalid_source", status_code=422)
+        for selected_source in selected_sources:
+            if selected_source.type == SourceType.FILE:
                 raise PersonSearchError(
-                    "RTSP source URI must use rtsp:// or rtsps://",
+                    "file sources are supported by person-search-eval, not the live API",
                     code="invalid_source",
                     status_code=422,
                 )
+            if selected_source.type == SourceType.RTSP:
+                scheme = urlsplit(selected_source.uri or "").scheme.lower()
+                if scheme not in {"rtsp", "rtsps"}:
+                    raise PersonSearchError(
+                        "RTSP source URI must use rtsp:// or rtsps://",
+                        code="invalid_source",
+                        status_code=422,
+                    )
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise PersonSearchError(
                 "timeout_seconds must be positive", code="invalid_timeout", status_code=422
@@ -382,23 +393,24 @@ def create_app(
         response_class=StreamingResponse,
         responses={200: {"content": {"multipart/x-mixed-replace": {}}}},
     )
-    async def preview_search(search_id: str) -> StreamingResponse:
+    async def preview_search(search_id: str, source_id: str = "source-1") -> StreamingResponse:
         session = manager.get_session(search_id)
+        preview = session.preview_for(source_id) if hasattr(session, "preview_for") else session.preview
 
         async def frames():
             seq = 0
             # The worker only pays the annotate + encode cost while a viewer is
             # registered, so the stream must bracket its own lifetime.
-            session.preview.subscribe()
+            preview.subscribe()
             try:
                 while True:
-                    seq, jpeg = await asyncio.to_thread(session.preview.after, seq, 1.0)
+                    seq, jpeg = await asyncio.to_thread(preview.after, seq, 1.0)
                     if jpeg is not None:
                         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
                     if session.status.value in {"completed", "timed_out", "stopped", "failed"} and jpeg is None:
                         return
             finally:
-                session.preview.unsubscribe()
+                preview.unsubscribe()
 
         return StreamingResponse(
             frames(),

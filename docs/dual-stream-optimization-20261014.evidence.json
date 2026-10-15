@@ -1,0 +1,77 @@
+{
+  "candidate_revision": "perfpreview-20261014-v1",
+  "benchmark_kind": "synthetic NV12 + AI sleep 200ms + server JPEG, no real RTSP/model/browser",
+  "duration_each_seconds": 12,
+  "runs": [
+    {
+      "reader": "old",
+      "preview_hz": 5,
+      "cpu_percent": 127.512,
+      "sources": [
+        {
+          "resolution": "4K",
+          "jpeg_fps": 4.9077,
+          "jpeg_age_p95_ms": 125.4,
+          "bgr_reads": 150,
+          "bgr_skips": 90
+        },
+        {
+          "resolution": "720p",
+          "jpeg_fps": 4.9081,
+          "jpeg_age_p95_ms": 89.22,
+          "bgr_reads": 121,
+          "bgr_skips": 59
+        }
+      ]
+    },
+    {
+      "reader": "new",
+      "preview_hz": 5,
+      "cpu_percent": 161.113,
+      "sources": [
+        {
+          "resolution": "4K",
+          "jpeg_fps": 4.9156,
+          "jpeg_age_p95_ms": 82.58,
+          "bgr_reads": 240,
+          "bgr_skips": 0
+        },
+        {
+          "resolution": "720p",
+          "jpeg_fps": 4.916,
+          "jpeg_age_p95_ms": 67.9,
+          "bgr_reads": 180,
+          "bgr_skips": 0
+        }
+      ]
+    },
+    {
+      "reader": "new",
+      "preview_hz": 15,
+      "cpu_percent": 183.698,
+      "sources": [
+        {
+          "resolution": "4K",
+          "jpeg_fps": 14.4775,
+          "jpeg_age_p95_ms": 69.0,
+          "bgr_reads": 240,
+          "bgr_skips": 0
+        },
+        {
+          "resolution": "720p",
+          "jpeg_fps": 14.7482,
+          "jpeg_age_p95_ms": 78.36,
+          "bgr_reads": 180,
+          "bgr_skips": 0
+        }
+      ]
+    }
+  ],
+  "source_sha256": {
+    "src/person_search/video.py": "e57af8596e5e6c5a2c97bb317fc6e04905bb0bee6811e7a262de59fb60505f04",
+    "src/person_search/domain.py": "c01636325a6ab06f99fb7cb00011b9786d226f0bc305af056ff6e70041783adf",
+    "src/person_search/service.py": "ef4fe6d076754e5c8c3a07e8d8a0cd80657fd1025f07b38de5a9f974b6834c47",
+    "src/person_search/rga.py": "e0a56d69c24299ec042ee2a728c466745b23c833b9a28fee56f245ff889623f1",
+    "src/person_search/static/monitor.html": "81ef426c8df5f35e33dc403581ae55f65de9f1369b35b894e23cf8bc4ff1f023"
+  }
+}

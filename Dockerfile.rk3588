@@ -1,0 +1,78 @@
+ARG BASE_IMAGE=ubuntu:20.04
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG UV_VERSION=0.13.0
+ARG VCS_REF=unknown
+
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    UV_INDEX_URL=${PIP_INDEX_URL} \
+    UV_HTTP_TIMEOUT=300 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_CACHE_DIR=/opt/uv/cache \
+    PYTHONUNBUFFERED=1 \
+    PATH=/app/.venv/bin:${PATH} \
+    PERSON_SEARCH_HOST=0.0.0.0 \
+    PERSON_SEARCH_PORT=18080 \
+    PERSON_SEARCH_INFERENCE_BACKEND=hybrid \
+    PERSON_SEARCH_PREFER_CUDA=false \
+    PERSON_SEARCH_INSIGHTFACE_ROOT=/models/.insightface \
+    PERSON_SEARCH_RPP_STATIC_MODEL_DIR=/models/rpp-static \
+    PERSON_SEARCH_RPP_ENGINE_CACHE_DIR=/models/rpp-cache
+
+# Python 3.8 is only for the RK3588 host's GStreamer/OpenCV bridge. The API and
+# RPP Python extension run in the separate uv-managed CPython 3.11 environment.
+RUN sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' \
+      /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      gstreamer1.0-tools \
+      libgl1 \
+      libglib2.0-0 \
+      libsm6 \
+      libxext6 \
+      libxrender1 \
+      python3-gst-1.0 \
+      python3-gi \
+      python3-pip \
+      python3.8 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" \
+      "uv==${UV_VERSION}" \
+    && uv python install 3.11.16
+
+# The RPP SDK compiles device-kernel objects with gcc/ld on first execution.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+COPY scripts/rk3588_gstreamer_capture.py ./scripts/rk3588_gstreamer_capture.py
+COPY scripts/rk3588_container_entrypoint.sh ./scripts/rk3588_container_entrypoint.sh
+COPY scripts/check_rk3588_contract.py ./scripts/check_rk3588_contract.py
+
+RUN uv sync --frozen --no-dev --extra inference-rpp-runtime --python 3.11.16 \
+    && chmod 0755 /app/scripts/rk3588_container_entrypoint.sh \
+    && mkdir -p /models/.insightface/models /models/rpp-static /models/rpp-cache
+
+ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}
+LABEL org.opencontainers.image.title="person-search-rk3588-rpp" \
+      org.opencontainers.image.revision="${VCS_REF}"
+
+EXPOSE 18080 18081
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+  CMD /app/.venv/bin/python /app/scripts/check_rk3588_contract.py
+
+ENTRYPOINT ["/app/scripts/rk3588_container_entrypoint.sh"]
+CMD ["person-search-api"]

@@ -1,0 +1,9 @@
+# Reuse the validated ARM64 runtime/SDK; only replace the audited performance
+# files. No dependency, model or device changes are made by this overlay.
+ARG BASE_IMAGE=person-search-rk3588-rpp:streamcontract-20261014
+FROM ${BASE_IMAGE}
+ARG VCS_REF=unknown
+COPY src/person_search/video.py src/person_search/domain.py src/person_search/service.py src/person_search/rga.py /app/src/person_search/
+COPY src/person_search/static/monitor.html /app/src/person_search/static/monitor.html
+ENV PERSON_SEARCH_BUILD_REVISION=${VCS_REF}
+LABEL org.opencontainers.image.revision="${VCS_REF}"

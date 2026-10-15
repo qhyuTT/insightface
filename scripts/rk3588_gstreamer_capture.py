@@ -18,8 +18,6 @@ import argparse
 import struct
 import sys
 
-import cv2
-
 _HEADER = struct.Struct("!4sIIII")
 _BGR_MAGIC = b"PSF1"
 _NV12_MAGIC = b"PSN1"
@@ -55,6 +53,8 @@ def main() -> int:
 def stream_bgr(
     uri: str, transport: str, latency_ms: int, codec: str, drop_on_latency: bool
 ) -> int:
+    import cv2
+
     pipeline = build_pipeline(uri, transport, latency_ms, codec, drop_on_latency, "bgr")
     capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
     if not capture.isOpened():

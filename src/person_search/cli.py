@@ -190,6 +190,12 @@ def run_offline(
 
         face_backend = RknnFaceBackend(settings)
         detector = RknnYoloXDetector(settings)
+    elif settings.inference_backend == "hybrid":
+        from .hybrid_backends import RppScrfdRknnFaceBackend
+        from .rknn_backends import RknnYoloXDetector
+
+        face_backend = RppScrfdRknnFaceBackend(settings)
+        detector = RknnYoloXDetector(settings)
     else:
         face_backend = InsightFaceBackend(settings)
         detector = YoloXOnnxDetector(settings)

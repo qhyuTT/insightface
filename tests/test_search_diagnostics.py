@@ -66,3 +66,35 @@ def test_search_view_diagnostic_fields_are_backward_compatible() -> None:
     assert target.evidence_count == 0
     assert target.required_evidence == 0
     assert target.last_rejection_reason is None
+
+
+def test_recent_rates_decay_and_stage_statistics_expose_sample_scope(monkeypatch) -> None:
+    monkeypatch.setattr('time.monotonic', lambda: 100.0)
+    metrics = SearchMetrics(started_at=1.0, frame_count=900,
+                            processed_at=[80.0, 91.0, 95.0],
+                            preview_published_at=[80.0, 91.0, 95.0],
+                            stage_latencies_ms={'face_full': [10.0, 20.0, 90.0]})
+    snapshot = metrics.snapshot()
+    assert snapshot['processed_fps'] == pytest.approx(0.2)
+    assert snapshot['preview_fps'] == pytest.approx(0.2)
+    assert snapshot['source_fps'] == 0.0
+    assert snapshot['stage_p50_latency_ms']['face_full'] == 20.0
+    assert snapshot['stage_max_latency_ms']['face_full'] == 90.0
+    assert snapshot['stage_sample_counts']['face_full'] == 3
+    monkeypatch.setattr('time.monotonic', lambda: 106.0)
+    assert metrics.snapshot()['processed_fps'] == 0.0
+    assert metrics.snapshot()['preview_fps'] == 0.0
+
+
+def test_stage_rates_use_recent_completions_and_expire_after_source_loss(monkeypatch) -> None:
+    from person_search.domain import _window_fps
+    monkeypatch.setattr('time.monotonic', lambda: 100.0)
+    metrics = SearchMetrics(started_at=0.0, stage_call_counts={'face_full': 200},
+                            stage_called_at={'face_full': [80.0, 91.0, 95.0]})
+    # A monotonic origin of zero is valid; do not substitute the first sample.
+    assert _window_fps([8.0, 9.0], 10.0, started_at=0.0) == pytest.approx(0.2)
+    # SearchMetrics uses started_at=0 as the legacy not-started sentinel.
+    metrics.started_at = 1.0
+    assert metrics.snapshot()['effective_hz']['face_full'] == pytest.approx(0.2)
+    monkeypatch.setattr('time.monotonic', lambda: 106.0)
+    assert metrics.snapshot()['effective_hz']['face_full'] == 0.0

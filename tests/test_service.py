@@ -1837,6 +1837,11 @@ def test_effective_config_reports_the_resolved_rates_and_gates() -> None:
     assert config["person_detection_static_input"] is None
     assert config["rknn_core_mask"] == 0
     assert config["rknn_core_mask_applied"] == {"person": None, "face": None}
+    # The RPP wait mode must be reported, never left to a bare env var: the panel
+    # has to say whether SDK synchronization releases the GIL.
+    assert config["rpp_release_gil"] is False
+    assert config["rpp_engine_cache_enabled"] is False
+    assert config["rpp_detection_execution_wait_mode"] == "not_applicable"
 
     manager.stop_search(search.search_id)
 

@@ -78,10 +78,10 @@ def _static_input_label(backend: object, *, attribute: str = "static_input_hw") 
 
 
 def _provider_is_accelerated(provider: object) -> bool:
-    """Select the high-rate budget branch for GPU and RK3588 NPU providers."""
+    """Select the high-rate budget branch for GPU, RPP, and RK3588 NPU."""
 
     value = str(provider).upper()
-    return any(token in value for token in ("CUDA", "TENSORRT", "RKNN", "NPU"))
+    return any(token in value for token in ("CUDA", "TENSORRT", "RKNN", "NPU", "RPP"))
 
 
 def _select_staggered_stage(
@@ -267,6 +267,7 @@ class SearchSession:
         self.status = SearchStatus.INITIALIZING
         self.error: str | None = None
         self.metrics = SearchMetrics()
+        self._capture_metrics: dict[str, Any] = {}
         self.events = EventHub()
         self.preview = PreviewHub()
         self._tracker = ByteTracker()
@@ -465,7 +466,10 @@ class SearchSession:
                     self._reader_stop_succeeded = True
                 return
             stop_reader()
+            snapshot_reader = getattr(reader, "metrics_snapshot", None)
+            capture_metrics = snapshot_reader() if callable(snapshot_reader) else {}
             with self._lock:
+                self._capture_metrics.update(capture_metrics)
                 self._reader_stop_succeeded = True
 
     @property
@@ -1099,9 +1103,31 @@ class SearchSession:
             self._schedule_evidence_cleanup_locked()
 
     def view(self) -> SearchView:
+        # Read outside the session lock to avoid reversing capture/session lock order.
+        reader = self._reader
+        snapshot_reader = getattr(reader, "metrics_snapshot", None)
+        capture_metrics = snapshot_reader() if callable(snapshot_reader) else {}
         with self._lock:
             self._cleanup_expired_evidence_locked()
             metrics = self.metrics.snapshot()
+            self._capture_metrics.update(capture_metrics)
+            metrics.update(self._capture_metrics)
+            if reader is None or self.status in {
+                SearchStatus.COMPLETED, SearchStatus.TIMED_OUT, SearchStatus.STOPPED, SearchStatus.FAILED
+            }:
+                metrics["decode_fps"] = 0.0
+                metrics["queue_length"] = 0
+                metrics["last_decoded_frame_age_ms"] = None
+            if self.status in {
+                SearchStatus.COMPLETED, SearchStatus.TIMED_OUT, SearchStatus.STOPPED, SearchStatus.FAILED
+            }:
+                metrics["processed_fps"] = 0.0
+                metrics["preview_fps"] = 0.0
+                metrics["effective_hz"] = {stage: 0.0 for stage in metrics["effective_hz"]}
+            metrics["source_fps"] = metrics.get("decode_fps", 0.0)
+            if "decoded_frames" in metrics:
+                decoded = metrics["decoded_frames"]
+                metrics["drop_rate"] = metrics["dropped_frames"] / decoded if decoded else 0.0
             target_views = [
                 TargetSearchView(
                     target_id=target_id,
@@ -1204,6 +1230,14 @@ class SearchSession:
                 "person": getattr(self.person_detector, "core_mask_applied", None),
                 "face": getattr(self.face_backend, "core_mask_applied", None),
             },
+            # The RPP wait mode decides whether SDK synchronization releases the
+            # GIL; report the resolved value so the panel cannot claim a mode the
+            # engine is not using.
+            "rpp_release_gil": settings.rpp_release_gil,
+            "rpp_engine_cache_enabled": settings.rpp_engine_cache_enabled,
+            "rpp_detection_execution_wait_mode": getattr(
+                self.face_backend, "detection_execution_wait_mode", "not_applicable"
+            ),
             "face_detection_size": settings.face_detection_size or "auto(128+640)",
             "full_frame_detection_scales": list(
                 settings.full_frame_detection_scales(is_cuda=face_is_cuda)
@@ -1734,6 +1768,7 @@ class SearchSession:
                 self._settle_budget_credit(frame_cost)
                 with self._lock:
                     self.metrics.frame_count += 1
+                    self.metrics.processed_at.append(time.monotonic())
                     self.metrics.latencies_ms.append(frame_cost * 1000.0)
                     self.metrics.end_to_end_latencies_ms.append(
                         (time.monotonic() - packet.captured_at) * 1000.0
@@ -2021,6 +2056,7 @@ class SearchSession:
         with self._lock:
             self.metrics.stage_latencies_ms.setdefault(stage, []).append(latency_ms)
             self.metrics.stage_call_counts[stage] = self.metrics.stage_call_counts.get(stage, 0) + 1
+            self.metrics.stage_called_at.setdefault(stage, []).append(time.monotonic())
 
     def _record_target_observations(
         self,
@@ -2873,6 +2909,311 @@ class SearchSession:
             )
 
 
+class MultiSourceSearchSession:
+    """One public search backed by two isolated camera pipelines.
+
+    Model objects are shared, while readers, trackers and confirmation windows
+    belong to each child. The RKNN/RPP backends serialize device access.
+    """
+
+    def __init__(
+        self,
+        *,
+        search_id: str,
+        targets: list[Target],
+        sources: list[SourceConfig],
+        settings: Settings,
+        face_backend: FaceBackend,
+        person_detector: PersonDetector,
+        on_finished: Callable[[str, list[str]], None],
+        timeout_seconds: float | None,
+        request_id: str | None,
+    ) -> None:
+        self.search_id = search_id
+        self.request_id = request_id
+        self.targets = targets
+        self.source = sources[0]
+        self.sources = sources
+        self.status = SearchStatus.INITIALIZING
+        self.error: str | None = None
+        self.events = EventHub()
+        self.finished = threading.Event()
+        self._finished_at: float | None = None
+        self._on_finished = on_finished
+        self._stop_requested = threading.Event()
+        self._children: dict[str, SearchSession] = {}
+        self._coordinator: threading.Thread | None = None
+        self._lock = threading.RLock()
+        try:
+            for index, source in enumerate(sources, 1):
+                source_id = f"source-{index}"
+                self._children[source_id] = SearchSession(
+                    search_id=search_id,
+                    target=targets[0],
+                    targets=targets,
+                    source=source,
+                    settings=settings,
+                    face_backend=face_backend,
+                    person_detector=person_detector,
+                    on_finished=lambda _search_id, _target_ids: None,
+                    timeout_seconds=timeout_seconds,
+                    request_id=request_id,
+                )
+        except Exception:
+            for child in self._children.values():
+                child.defer_sensitive_cleanup()
+            raise
+        self.targets = self._children["source-1"].targets
+        self.preview = self._children["source-1"].preview
+
+    def preview_for(self, source_id: str) -> PreviewHub:
+        child = self._children.get(source_id)
+        if child is None:
+            raise PersonSearchError("source not found", code="source_not_found", status_code=404)
+        return child.preview
+
+    def start(self) -> None:
+        started: list[SearchSession] = []
+        try:
+            for child in self._children.values():
+                child.start()
+                started.append(child)
+        except Exception:
+            for child in started:
+                try:
+                    child.stop()
+                except Exception:  # noqa: BLE001 - preserve original startup error
+                    child.defer_sensitive_cleanup()
+            raise
+        self.status = SearchStatus.RUNNING
+        self._coordinator = threading.Thread(
+            target=self._coordinate, name=f"search-group-{self.search_id[:8]}", daemon=True
+        )
+        self._coordinator.start()
+
+    def _forward_events(self, cursors: dict[str, int], found: bool) -> bool:
+        pending: list[tuple[str, dict[str, Any]]] = []
+        for source_id, child in self._children.items():
+            for event in child.events.after(cursors[source_id], timeout=0):
+                cursors[source_id] = event["seq"]
+                pending.append((source_id, event))
+        for source_id, event in sorted(pending, key=lambda item: item[1]["occurred_at"]):
+            event_type = event["type"]
+            if event_type in {"search_status", "all_found", "search_timeout"}:
+                continue
+            if event_type == "target_found" and found:
+                continue
+            payload = {**event["data"], "source_id": source_id}
+            self.events.publish(event_type, payload)
+            if event_type == "target_found":
+                found = True
+        return found
+
+    def _coordinate(self) -> None:
+        cursors = {source_id: 0 for source_id in self._children}
+        found = False
+        stopping_children: set[str] = set()
+        try:
+            while not all(child.finished.is_set() for child in self._children.values()):
+                found = self._forward_events(cursors, found)
+                if any(child.status == SearchStatus.COMPLETED for child in self._children.values()):
+                    for source_id, child in self._children.items():
+                        if (
+                            source_id not in stopping_children
+                            and not child.finished.is_set()
+                            and child.status != SearchStatus.COMPLETED
+                        ):
+                            stopping_children.add(source_id)
+                            try:
+                                child.stop()
+                            except SearchStopTimeoutError:
+                                child.defer_sensitive_cleanup()
+                self.finished.wait(0.05)
+            found = self._forward_events(cursors, found)
+            with self._lock:
+                statuses = {child.status for child in self._children.values()}
+                if self._stop_requested.is_set():
+                    self.status = SearchStatus.STOPPED
+                elif SearchStatus.COMPLETED in statuses:
+                    self.status = SearchStatus.COMPLETED
+                elif SearchStatus.TIMED_OUT in statuses:
+                    self.status = SearchStatus.TIMED_OUT
+                elif statuses == {SearchStatus.FAILED}:
+                    self.status = SearchStatus.FAILED
+                    self.error = "all video sources failed"
+                else:
+                    self.status = SearchStatus.STOPPED
+            self.events.publish(
+                "search_status",
+                {"search_id": self.search_id, "status": self.status.value, "error": self.error},
+            )
+            if self.status == SearchStatus.COMPLETED:
+                self.events.publish("all_found", {"search_id": self.search_id})
+        except Exception as exc:  # always release manager slot
+            logger.exception("multi-source coordinator failed")
+            self.status = SearchStatus.FAILED
+            self.error = _safe_error(exc)
+            for child in self._children.values():
+                if not child.finished.is_set():
+                    try:
+                        child.stop()
+                    except Exception:  # noqa: BLE001
+                        child.defer_sensitive_cleanup()
+            for child in self._children.values():
+                child.finished.wait()
+        finally:
+            self._finished_at = time.monotonic()
+            try:
+                self._on_finished(self.search_id, [target.target_id for target in self.targets])
+            finally:
+                self.finished.set()
+
+    def stop(self, timeout: float = STOP_WAIT_SECONDS) -> None:
+        self._stop_requested.set()
+        self.status = SearchStatus.STOPPING
+        errors: list[Exception] = []
+        for child in self._children.values():
+            if not child.finished.is_set():
+                try:
+                    child.stop(timeout=timeout)
+                except Exception as exc:  # noqa: BLE001 - stop the other camera too
+                    errors.append(exc)
+        self.clear_evidence()
+        if not self.finished.wait(timeout=timeout):
+            raise SearchStopTimeoutError("双路搜索线程未能在停止时限内退出")
+        if errors:
+            raise errors[0]
+
+    def view(self) -> SearchView:
+        views = {source_id: child.view() for source_id, child in self._children.items()}
+        first = views["source-1"]
+        found_view = next((view for view in views.values() if view.found_count), None)
+        data = first.model_dump()
+        data.update(
+            status=self.status,
+            error=self.error,
+            sources=[
+                {
+                    "source_id": source_id,
+                    "source": view.source.model_dump(),
+                    "status": view.status.value,
+                    **{
+                        key: getattr(view, key)
+                        for key in (
+                            "provider", "error", "effective_config", "processed_fps",
+                            "processed_frames", "source_fps", "decode_fps", "decoded_frames",
+                            "frame_width", "frame_height", "preview_fps", "p95_latency_ms",
+                            "preview_frame_age_p95_ms", "preview_encode_p95_latency_ms",
+                            "end_to_end_p95_latency_ms", "latency_scope", "dropped_frames",
+                            "drop_rate", "queue_length", "queue_capacity",
+                            "last_decoded_frame_age_ms", "capture_p50_latency_ms",
+                            "capture_p95_latency_ms", "capture_max_latency_ms",
+                            "stage_p50_latency_ms", "stage_p95_latency_ms",
+                            "stage_max_latency_ms", "stage_sample_counts", "effective_hz",
+                            "face_observations", "accepted_faces", "small_faces",
+                            "unassociated_faces", "rejection_counts", "association_counts",
+                            "face_size_counts", "face_source_counts", "match_stage_counts",
+                            "roi_calls_per_frame", "roi_batch_count", "embedding_batch_count",
+                            "faces_dropped_by_budget", "embedding_failures",
+                            "embedding_output_failures", "budget_skips",
+                            "camera_motion_px_p95", "blur_variance_p50", "blur_variance_p95",
+                        )
+                    },
+                }
+                for source_id, view in views.items()
+            ],
+            processed_fps=sum(view.processed_fps for view in views.values()),
+            source_fps=sum(view.source_fps for view in views.values()),
+            dropped_frames=sum(view.dropped_frames for view in views.values()),
+            decode_fps=sum(view.decode_fps for view in views.values()),
+            decoded_frames=sum(view.decoded_frames for view in views.values()),
+            processed_frames=sum(view.processed_frames for view in views.values()),
+            preview_fps=sum(view.preview_fps for view in views.values()),
+            queue_length=sum(view.queue_length for view in views.values()),
+            queue_capacity=sum(view.queue_capacity for view in views.values()),
+            latency_scope="per_source",
+            p95_latency_ms=0.0,
+            end_to_end_p95_latency_ms=0.0,
+            preview_frame_age_p95_ms=0.0,
+            preview_encode_p95_latency_ms=0.0,
+            capture_p50_latency_ms=0.0,
+            capture_p95_latency_ms=0.0,
+            capture_max_latency_ms=0.0,
+            last_decoded_frame_age_ms=None,
+            stage_p50_latency_ms={},
+            stage_p95_latency_ms={},
+            stage_max_latency_ms={},
+            stage_sample_counts={},
+            frame_width=0,
+            frame_height=0,
+            camera_motion_px_p95=0.0,
+            blur_variance_p50=0.0,
+            blur_variance_p95=0.0,
+            effective_hz={
+                stage: sum(view.effective_hz.get(stage, 0.0) for view in views.values())
+                for stage in {stage for view in views.values() for stage in view.effective_hz}
+            },
+        )
+        for key in ("face_observations", "accepted_faces", "small_faces", "unassociated_faces",
+                    "roi_batch_count", "embedding_batch_count", "faces_dropped_by_budget",
+                    "embedding_failures", "embedding_output_failures"):
+            data[key] = sum(getattr(view, key) for view in views.values())
+        for key in ("rejection_counts", "association_counts", "face_size_counts", "face_source_counts",
+                    "match_stage_counts", "budget_skips"):
+            keys = {item for view in views.values() for item in getattr(view, key)}
+            data[key] = {item: sum(getattr(view, key).get(item, 0) for view in views.values()) for item in keys}
+        arrived = data["decoded_frames"] or (
+            data["dropped_frames"] + data["processed_frames"]
+        )
+        data["drop_rate"] = data["dropped_frames"] / arrived if arrived else 0.0
+        data["roi_calls_per_frame"] = 0.0
+        data["achieved_sampling_hz"] = 0.0
+        if found_view is not None:
+            data["targets"] = found_view.targets
+            data["found_count"] = found_view.found_count
+            data["unfound_target_ids"] = found_view.unfound_target_ids
+        results = []
+        for source_id, view in views.items():
+            results.extend(result.model_copy(update={"source_id": source_id}) for result in view.confirmed_results)
+        data["confirmed_results"] = sorted(results, key=lambda result: result.timestamp_ms)[:1]
+        return SearchView.model_validate(data)
+
+    def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
+        for child in self._children.values():
+            try:
+                return child.get_evidence(evidence_id, variant)
+            except PersonSearchError as exc:
+                if exc.status_code != 404:
+                    raise
+        raise PersonSearchError("evidence not found", code="evidence_not_found", status_code=404)
+
+    def release_evidence(self, evidence_id: str) -> None:
+        for child in self._children.values():
+            try:
+                child.release_evidence(evidence_id)
+                return
+            except PersonSearchError as exc:
+                if exc.status_code != 404:
+                    raise
+        raise PersonSearchError("evidence not found", code="evidence_not_found", status_code=404)
+
+    def clear_evidence(self) -> None:
+        for child in self._children.values():
+            child.clear_evidence()
+
+    def clear_sensitive_state(self) -> None:
+        for child in self._children.values():
+            child.clear_sensitive_state()
+
+    def defer_sensitive_cleanup(self) -> None:
+        for child in self._children.values():
+            child.defer_sensitive_cleanup()
+
+    @property
+    def _sensitive_cleared(self) -> bool:
+        return all(child._sensitive_cleared for child in self._children.values())
+
+
 class SearchManager:
     def __init__(
         self,
@@ -2886,10 +3227,14 @@ class SearchManager:
                 from .rknn_backends import RknnFaceBackend
 
                 face_backend = RknnFaceBackend(settings)
+            elif settings.inference_backend == "hybrid":
+                from .hybrid_backends import RppScrfdRknnFaceBackend
+
+                face_backend = RppScrfdRknnFaceBackend(settings)
             else:
                 face_backend = InsightFaceBackend(settings)
         if person_detector is None:
-            if settings.inference_backend == "rknn":
+            if settings.inference_backend in {"rknn", "hybrid"}:
                 from .rknn_backends import RknnYoloXDetector
 
                 person_detector = RknnYoloXDetector(settings)
@@ -2898,7 +3243,7 @@ class SearchManager:
         self.face_backend = face_backend
         self.person_detector = person_detector
         self._targets: dict[str, Target] = {}
-        self._sessions: dict[str, SearchSession] = {}
+        self._sessions: dict[str, SearchSession | MultiSourceSearchSession] = {}
         self._request_index: dict[str, str] = {}
         self._active_search_id: str | None = None
         self._lock = threading.RLock()
@@ -3043,7 +3388,7 @@ class SearchManager:
     def start_batch_search(
         self,
         target_ids: list[str],
-        source: SourceConfig,
+        source: SourceConfig | list[SourceConfig],
         timeout_seconds: float | None = None,
         replace_active: bool = False,
         request_id: str | None = None,
@@ -3053,6 +3398,21 @@ class SearchManager:
             raise PersonSearchError(
                 "at least one target is required", code="invalid_targets", status_code=422
             )
+        if isinstance(source, list):
+            if len(source) != 2 or any(not isinstance(item, SourceConfig) for item in source):
+                raise PersonSearchError(
+                    "exactly two sources are required", code="invalid_source", status_code=422
+                )
+            if source[0] == source[1]:
+                raise PersonSearchError(
+                    "video sources must be different", code="invalid_source", status_code=422
+                )
+            if len(target_ids) != 1:
+                raise PersonSearchError(
+                    "two-source search currently supports one target",
+                    code="invalid_targets",
+                    status_code=422,
+                )
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise PersonSearchError(
                 "timeout_seconds must be positive", code="invalid_timeout", status_code=422
@@ -3123,18 +3483,31 @@ class SearchManager:
                 # while it runs. Never publish a session after the manager closed.
                 self._ensure_open()
                 search_id = str(uuid.uuid4())
-                session = SearchSession(
-                    search_id=search_id,
-                    target=targets[0],
-                    source=source,
-                    settings=self.settings,
-                    face_backend=self.face_backend,
-                    person_detector=self.person_detector,
-                    on_finished=self._on_finished,
-                    targets=targets,
-                    timeout_seconds=timeout_seconds,
-                    request_id=normalized_request_id,
-                )
+                if isinstance(source, list):
+                    session = MultiSourceSearchSession(
+                        search_id=search_id,
+                        targets=targets,
+                        sources=source,
+                        settings=self.settings,
+                        face_backend=self.face_backend,
+                        person_detector=self.person_detector,
+                        on_finished=self._on_finished,
+                        timeout_seconds=timeout_seconds,
+                        request_id=normalized_request_id,
+                    )
+                else:
+                    session = SearchSession(
+                        search_id=search_id,
+                        target=targets[0],
+                        source=source,
+                        settings=self.settings,
+                        face_backend=self.face_backend,
+                        person_detector=self.person_detector,
+                        on_finished=self._on_finished,
+                        targets=targets,
+                        timeout_seconds=timeout_seconds,
+                        request_id=normalized_request_id,
+                    )
                 with self._lock:
                     self._sessions[search_id] = session
                     if normalized_request_id:
@@ -3174,7 +3547,7 @@ class SearchManager:
         self._prune_sessions()
         return self._get_session(search_id).view()
 
-    def get_session(self, search_id: str) -> SearchSession:
+    def get_session(self, search_id: str) -> SearchSession | MultiSourceSearchSession:
         return self._get_session(search_id)
 
     def search_by_request_id(self, request_id: str) -> SearchView | None:
@@ -3288,7 +3661,7 @@ class SearchManager:
                     status_code=503,
                 )
 
-    def _active_session_locked(self) -> tuple[str | None, SearchSession | None]:
+    def _active_session_locked(self) -> tuple[str | None, SearchSession | MultiSourceSearchSession | None]:
         """Return the live active session and clear stale slot pointers.
 
         ``_active_search_id`` is updated by a worker callback, while request
@@ -3334,7 +3707,7 @@ class SearchManager:
             return None, None
         return active_id, session
 
-    def _get_session(self, search_id: str) -> SearchSession:
+    def _get_session(self, search_id: str) -> SearchSession | MultiSourceSearchSession:
         self._prune_sessions()
         with self._lock:
             session = self._sessions.get(search_id)

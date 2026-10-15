@@ -97,6 +97,13 @@ class RgaNv12Converter:
         if source.size != width * height * 3 // 2:
             raise ValueError("RGA NV12 buffer size does not match its dimensions")
         source = np.ascontiguousarray(source.reshape(height * 3 // 2, width))
+        # OpenCV's limited-range NV12 converter clamps Y - 16 to zero before
+        # applying chroma. RGA applies the matrix to negative luma instead,
+        # which shifts coloured shadows by up to 20 levels when Y < 16. Match
+        # the existing CPU semantics without changing UV or the shared frame.
+        if np.min(source[:height]) < 16:
+            source = source.copy()
+            np.maximum(source[:height], 16, out=source[:height])
         destination = np.empty((height, width, 3), dtype=np.uint8)
         source_buffer = self._wrap(
             ctypes.c_void_p(source.ctypes.data),

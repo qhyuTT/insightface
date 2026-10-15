@@ -21,6 +21,10 @@ RTSP 硬解；RK3588 现场默认以 NV12 桥接 4K H.265，避免系统 `videoc
 默认监听 `18080`，避免与盒端已有的 `8000` 服务冲突。详细步骤见
 [RK3588 原生部署](docs/rk3588-deployment.md)；普通开发和 T4 部署仍默认使用 ONNX/OpenCV。
 
+`.184` 当前按明确要求运行 `docs/rk3588-rpp-container.md` 的容器基线：RPP BF16
+做人脸检测，RKNN NPU 做行人检测和人脸识别，MPP 硬解视频；监听 `18080`。这次端口切换
+不是性能验收通过的结论，真实双路视频端到端 FPS 仍待测。
+
 服务一次只运行一个搜索任务，每个任务可包含最多 20 个目标。目标照片和 embedding 只保存在进程内存，搜索停止后自动清除。RTSP URI 在 API 响应中会脱敏。
 
 InsightFace 1.x 默认使用 128 与 640 双尺度人脸检测：128 负责近距离大脸，640 负责视频中的较小人脸。可用 `PERSON_SEARCH_FACE_DETECTION_SIZE` 强制单一尺寸，但通常不建议覆盖默认值。
@@ -414,7 +418,9 @@ PY
 
 FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时使用 `camera/device_index=0`。
 
-监控页面只提供 RTSP 视频源，默认地址为 `rtsp://192.168.31.241:8554/camera`。
+监控页面提供两路 RTSP 视频源，默认接收盒端 ZLMediaKit 的
+`rtsp://127.0.0.1:554/live/robot-01/ip-camera` 与
+`rtsp://127.0.0.1:554/live/robot-01/local-camera`。
 
 主要接口：
 

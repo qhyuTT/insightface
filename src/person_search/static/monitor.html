@@ -73,6 +73,15 @@
     .stage { min-width: 0; }
     .viewport { aspect-ratio: 16/9; background: #020504; display: grid; place-items: center; overflow: hidden; position: relative; }
     .viewport img { width: 100%; height: 100%; object-fit: contain; display: none; }
+    .feed-grid { display: grid; grid-template-columns: 1fr; gap: 1px; background: var(--line); }
+    .feed-grid.dual { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .feed-grid .viewport { min-width: 0; }
+    .feed-two { display: none; }
+    .feed-grid.dual .feed-two { display: grid; }
+    .feed-label { position: absolute; bottom: 12px; left: 14px; color: var(--signal); background: rgba(7,17,15,.82); padding: 5px 8px; font: 10px Menlo, monospace; }
+    .feed-status { position: absolute; right: 12px; bottom: 12px; max-width: calc(100% - 112px); color: var(--muted); background: rgba(7,17,15,.88); padding: 5px 8px; font: 10px/1.4 Menlo, monospace; text-align: right; }
+    .feed-status[data-state="running"] { color: var(--found); }
+    .feed-status[data-state="source_lost"], .feed-status[data-state="failed"] { color: var(--danger); }
     .empty { text-align: center; color: #61746d; }
     .reticle { width: 78px; height: 78px; border: 1px solid #344a42; margin: 0 auto 18px; position: relative; }
     .reticle::before, .reticle::after { content: ""; position: absolute; background: #344a42; }
@@ -103,6 +112,7 @@
     .diagnostic-cell output { display: block; color: var(--muted); font: 10px/1.65 Menlo, monospace; overflow-wrap: anywhere; }
     .notice { min-height: 20px; color: var(--danger); font: 11px/1.5 Menlo, monospace; margin-top: 12px; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; } .controls { order: 2; } .stage { order: 1; } .meta, .diagnostic-grid { grid-template-columns: 1fr 1fr; } .diagnostic-cell:nth-child(2) { border-right: 0; } .diagnostic-cell:nth-child(-n+2) { border-bottom: 1px solid var(--line); } }
+    @media (max-width: 600px) { .feed-grid.dual { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -134,30 +144,42 @@
           <div class="target-id" id="batchInfo"></div>
         </div>
 
-        <label for="rtspUri">RTSP URI</label>
-        <input id="rtspUri" type="text" value="rtsp://192.168.31.241:8554/camera">
+        <label for="rtspUri">视频源 1 · RTSP URI</label>
+        <input id="rtspUri" type="text" value="rtsp://127.0.0.1:554/live/robot-01/ip-camera">
+        <label for="rtspUri2">视频源 2 · RTSP URI（可选）</label>
+        <input id="rtspUri2" type="text" value="rtsp://127.0.0.1:554/live/robot-01/local-camera">
         <label class="check-option" for="debugPreview">
           <input id="debugPreview" type="checkbox">
           调试标注
         </label>
         <button id="startBtn" disabled>02 · 开始实时寻找</button>
         <button id="stopBtn" class="secondary danger" disabled>停止本次搜索</button>
+        <div class="target-id"><a href="/mediaserver/" target="_blank" rel="noopener noreferrer" style="color:var(--signal)">查看 ZLMediaKit 原始流状态（需媒体账号）</a></div>
         <div class="notice" id="notice"></div>
       </aside>
 
       <section class="stage">
         <div class="panel" data-index="02 / LIVE FEED">
-          <div class="viewport">
-            <div class="empty" id="emptyState"><div class="reticle"></div><span class="mono">等待视频流接入</span></div>
-            <img id="stream" alt="实时标注视频流">
-            <div class="scanline" id="scanline"></div>
-            <div class="result-banner" id="banner">● 尚未开始</div>
+          <div class="feed-grid" id="feedGrid">
+            <div class="viewport">
+              <div class="empty" id="emptyState"><div class="reticle"></div><span class="mono">等待视频流接入</span></div>
+              <img id="stream" alt="视频源 1 实时标注画面">
+              <div class="scanline" id="scanline"></div>
+              <div class="result-banner" id="banner">● 尚未开始</div>
+              <span class="feed-label">SOURCE 01</span>
+              <span class="feed-status" id="sourceStatus1">尚未连接</span>
+            </div>
+            <div class="viewport feed-two">
+              <img id="stream2" alt="视频源 2 实时标注画面">
+              <span class="feed-label">SOURCE 02</span>
+              <span class="feed-status" id="sourceStatus2">尚未连接</span>
+            </div>
           </div>
           <div class="meta">
             <div class="metric"><small>SEARCH STATUS</small><strong id="statusMetric">IDLE</strong></div>
-            <div class="metric"><small>PROCESSED FPS</small><strong id="fpsMetric">0.0</strong></div>
-            <div class="metric"><small>PREVIEW FPS</small><strong id="previewFpsMetric">0.0</strong></div>
-            <div class="metric"><small>P95 LATENCY</small><strong id="latencyMetric">0 ms</strong></div>
+            <div class="metric"><small>AI 循环 FPS</small><strong id="fpsMetric">0.0</strong></div>
+            <div class="metric"><small>JPEG 发布 FPS</small><strong id="previewFpsMetric">0.0</strong></div>
+            <div class="metric"><small>AI 循环 P95</small><strong id="latencyMetric">0 ms</strong></div>
             <div class="metric"><small>BEST SIMILARITY</small><strong id="similarityMetric">—</strong></div>
           </div>
         </div>
@@ -166,6 +188,7 @@
         </div>
         <div class="panel diagnostics" data-index="04 / INFERENCE LEDGER">
           <h2>远距离诊断</h2>
+          <p style="color:var(--muted);font:11px/1.5 Menlo,monospace">双路任务的以下诊断统计来自视频源 1；上方每路流状态和识别事件覆盖两路。</p>
           <div class="diagnostic-grid">
             <div class="diagnostic-cell"><small>FACE SIZE</small><output id="faceSizeDiag">尚无样本</output></div>
             <div class="diagnostic-cell"><small>REJECTION REASONS</small><output id="rejectionDiag">尚无样本</output></div>
@@ -204,6 +227,53 @@
         uri: $('rtspUri').value.trim(),
         debug_preview: $('debugPreview').checked,
       };
+    }
+    function sourceConfigs() {
+      const first = sourceConfig();
+      const secondUri = $('rtspUri2').value.trim();
+      return secondUri ? [first, {type:'rtsp', uri:secondUri, debug_preview:$('debugPreview').checked}] : [first];
+    }
+    function showPreviews(id, sourceCount) {
+      $('feedGrid').classList.toggle('dual', sourceCount === 2);
+      $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
+      $('stream').src = `/v1/searches/${id}/preview.mjpg?source_id=source-1&t=${Date.now()}`;
+      if (sourceCount === 2) {
+        $('stream2').style.display = 'block';
+        $('stream2').src = `/v1/searches/${id}/preview.mjpg?source_id=source-2&t=${Date.now()}`;
+      } else {
+        $('stream2').removeAttribute('src'); $('stream2').style.display = 'none';
+      }
+    }
+    function renderSourceStatus(sources = []) {
+      for (let index = 0; index < 2; index++) {
+        const source = sources[index];
+        const element = $(`sourceStatus${index + 1}`);
+        if (!source) { element.textContent = '尚未连接'; delete element.dataset.state; continue; }
+        const fps = Number(source.source_fps || 0);
+        const processed = Number(source.processed_fps || 0);
+        const dimensions = source.frame_width && source.frame_height
+          ? `${source.frame_width}×${source.frame_height}` : '无画面';
+        const state = source.status === 'running' && fps > 0
+          ? '正常' : ({initializing:'连接中', source_lost:'已断流', failed:'失败'}[source.status] || '等待帧');
+        element.textContent = `${state} · ${dimensions} · 采集 ${fps.toFixed(1)}fps · AI循环 ${processed.toFixed(1)}fps · JPEG ${Number(source.preview_fps || 0).toFixed(1)}fps · 检测 ${Number(source.effective_hz?.face_full || 0).toFixed(1)}Hz · 解码后→发布P95 ${Number(source.preview_frame_age_p95_ms || 0).toFixed(0)}ms · AI队列 ${source.queue_length || 0}/${source.queue_capacity || 0}`;
+        element.dataset.state = source.status;
+      }
+    }
+    async function attachActiveSearch() {
+      try {
+        const response = await fetch('/v1/searches/active', {cache:'no-store'});
+        if (!response.ok) throw new Error(`读取当前任务失败（HTTP ${response.status}）`);
+        const body = await response.json();
+        if (!body || searchId) return;
+        searchId = body.search_id; targetId = body.target_id; targetName = body.target_name || '';
+        eventSeq = 0; reconnectDelay = 1000; stopping = false; bestSimilarity = -1;
+        $('targetInfo').textContent = `${targetName || '当前目标'} · 正在运行的任务 ${searchId}`;
+        $('startBtn').disabled = true; $('stopBtn').disabled = false;
+        renderTargets(body.targets); renderSourceStatus(body.sources || []);
+        updateBatchAvailability(); setState(body.status);
+        showPreviews(searchId, body.sources?.length || 1);
+        connectEvents(); pollStatus();
+      } catch (error) { fail(error.message); }
     }
     const REJECTION_TEXT = {
       similarity_low: '相似度不足',
@@ -271,20 +341,25 @@
       $('matchStageDiag').textContent = countText(diagnostics.match_stage_counts);
       const latency = Object.fromEntries(Object.entries(diagnostics.stage_p95_latency_ms || {}).map(([key, value]) => [key, `${Number(value).toFixed(0)}ms`]));
       const rates = Object.fromEntries(Object.entries(diagnostics.effective_hz || {}).map(([key, value]) => [key, `${Number(value).toFixed(1)}Hz`]));
-      $('stageTimingDiag').textContent = [countText(latency), countText(rates)].join('  |  ');
+      const stageSummary = (item) => Object.entries(item.stage_p95_latency_ms || {}).map(([stage, p95]) =>
+        `${stage} P50/P95/max ${Number(item.stage_p50_latency_ms?.[stage] || 0).toFixed(0)}/${Number(p95).toFixed(0)}/${Number(item.stage_max_latency_ms?.[stage] || 0).toFixed(0)}ms n=${item.stage_sample_counts?.[stage] || 0}`
+      ).join(' / ');
+      $('stageTimingDiag').textContent = diagnostics.latency_scope === 'per_source'
+        ? (diagnostics.sources || []).map(item => `${item.source_id}: ${stageSummary(item) || '尚无样本'}`).join(' | ')
+        : [stageSummary(diagnostics) || countText(latency), countText(rates)].join('  |  ');
       renderRuntimeConditions(diagnostics);
     }
     function renderRuntimeConditions(body = {}) {
       const config = body.effective_config || {};
       const num = (value, digits = 1) => Number(value ?? 0).toFixed(digits);
       $('throughputDiag').textContent = [
-        `源流 ${num(body.source_fps)}fps`,
+        `BGR采集 ${num(body.decode_fps ?? body.source_fps)}fps`,
         `处理 ${num(body.processed_fps)}fps`,
         `预览 ${num(body.preview_fps)}fps`,
-        `帧龄P95 ${num(body.preview_frame_age_p95_ms, 0)}ms`,
+        body.latency_scope === 'per_source' ? '延迟见各视频源' : `解码后→JPEG发布P95 ${num(body.preview_frame_age_p95_ms, 0)}ms`,
         `丢帧 ${num((body.drop_rate || 0) * 100, 0)}%`,
-        `端到端 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
-        `分辨率 ${body.frame_width || 0}×${body.frame_height || 0}`,
+        body.latency_scope === 'per_source' ? '不含机器人/网络/浏览器延迟' : `解码后→AI完成P95 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
+        body.latency_scope === 'per_source' ? '分辨率见各视频源' : `分辨率 ${body.frame_width || 0}×${body.frame_height || 0}`,
         `ROI ${num(body.roi_calls_per_frame, 2)}次/帧`,
       ].join('  /  ');
 
@@ -423,7 +498,11 @@
       const files = [...$('batchFiles').files];
       const data = new FormData();
       data.append('targets', JSON.stringify(names.map((name, index) => ({name, image_filename: files[index].name}))));
-      data.append('source', JSON.stringify(sourceConfig()));
+      const sources = sourceConfigs();
+      if (sources.length === 2 && names.length !== 1) {
+        fail('双路视频当前仅支持一个寻人目标'); $('batchStartBtn').disabled = false; return;
+      }
+      data.append('source', JSON.stringify(sources.length === 2 ? sources : sources[0]));
       if ($('batchTimeout').value) data.append('timeout_seconds', $('batchTimeout').value);
       files.forEach(file => data.append('images', file));
       try {
@@ -432,21 +511,20 @@
         searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; targetName = `${body.found_count}/${body.total_count} 人`; bestSimilarity = -1;
         renderTargets(body.targets); updateBatchAvailability();
         $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
-        $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
-        $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
+        showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
         connectEvents(); pollStatus();
       } catch (error) { fail(error.message); $('batchStartBtn').disabled = false; }
     });
     $('startBtn').addEventListener('click', async () => {
       fail(''); $('startBtn').disabled = true;
-      const source = sourceConfig();
+      const sources = sourceConfigs();
       try {
-        const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, source})});
+        const sourcePayload = sources.length === 2 ? {sources} : {source:sources[0]};
+        const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, ...sourcePayload})});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));
         searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
         updateBatchAvailability();
-        $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
-        $('stream').src = `/v1/searches/${searchId}/preview.mjpg?t=${Date.now()}`;
+        showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
         connectEvents(); pollStatus();
       } catch (error) { fail(error.message + (error.message.includes('one search') ? '；请先停止旧任务或重启服务。' : '')); $('startBtn').disabled = false; }
     });
@@ -466,7 +544,7 @@
         return;
       }
       if (socket) socket.close(); clearTimeout(pollTimer); clearTimeout(reconnectTimer); setState('stopped');
-      $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('emptyState').style.display = 'block'; $('scanline').style.display = 'none';
+      $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('stream2').removeAttribute('src'); $('stream2').style.display = 'none'; $('feedGrid').classList.remove('dual'); $('emptyState').style.display = 'block'; $('scanline').style.display = 'none'; renderSourceStatus();
       $('stopBtn').disabled = true; $('startBtn').disabled = true; targetId = null; targetName = ''; searchId = null; bestSimilarity = -1;
       renderTargets();
       $('targetInfo').textContent = '任务已结束，请重新登记目标'; $('banner').textContent = '● 已停止';
@@ -510,7 +588,7 @@
       if ($('eventList').querySelector('.empty')) $('eventList').innerHTML = '';
       const row = document.createElement('div'); row.className = `event ${event.type}`;
       const time = new Date(event.occurred_at).toLocaleTimeString();
-      const detail = event.type === 'search_status' ? event.data.status : `${event.data.target_name || targetName} · TRACK #${event.data.track_id} · SIM ${(event.data.similarity ?? 0).toFixed(3)}`;
+      const detail = event.type === 'search_status' ? event.data.status : `${event.data.source_id ? event.data.source_id.toUpperCase() + ' · ' : ''}${event.data.target_name || targetName} · TRACK #${event.data.track_id} · SIM ${(event.data.similarity ?? 0).toFixed(3)}`;
       const timeCell = document.createElement('span'); timeCell.textContent = time;
       const kindCell = document.createElement('span'); kindCell.className = 'kind'; kindCell.textContent = event.type.toUpperCase();
       const detailCell = document.createElement('span'); detailCell.textContent = detail;
@@ -523,7 +601,8 @@
       try {
         const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
         if (response.ok) {
-          setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('previewFpsMetric').textContent = body.preview_fps.toFixed(1); $('latencyMetric').textContent = `${body.p95_latency_ms.toFixed(0)} ms`;
+          setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('previewFpsMetric').textContent = body.preview_fps.toFixed(1); $('latencyMetric').textContent = body.latency_scope === 'per_source' ? '见各源' : `${body.p95_latency_ms.toFixed(0)} ms`;
+          renderSourceStatus(body.sources || []);
           renderDiagnostics(body);
           // Far-face policies suppress candidate events, so the confirmed-decision
           // metric stays empty. Fall back to the best value actually observed.
@@ -545,6 +624,8 @@
         }
       } finally { if (!terminal) pollTimer = setTimeout(pollStatus, 1200); }
     }
+    attachActiveSearch();
+    setInterval(() => { if (!searchId) attachActiveSearch(); }, 3000);
   </script>
 </body>
 </html>

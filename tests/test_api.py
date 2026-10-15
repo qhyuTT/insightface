@@ -96,7 +96,8 @@ def test_monitor_page_is_available() -> None:
         assert "实时寻人控制台" in response.text
         assert 'id="targetName"' in response.text
         assert "target_name" in response.text
-        assert "rtsp://192.168.31.241:8554/camera" in response.text
+        assert "rtsp://127.0.0.1:554/live/robot-01/ip-camera" in response.text
+        assert "rtsp://127.0.0.1:554/live/robot-01/local-camera" in response.text
         assert 'id="sourceType"' not in response.text
         assert 'id="cameraIndex"' not in response.text
         assert 'id="debugPreview" type="checkbox"' in response.text
@@ -359,5 +360,11 @@ def test_health_advertises_confirmed_evidence_only_when_configured() -> None:
     manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
     with TestClient(create_app(settings, manager)) as client:
         capabilities = client.get("/healthz").json()["capabilities"]
-    assert "event_replay" in capabilities
-    assert "confirmed_evidence_v1" in capabilities
+    assert set(capabilities) == {
+        "replace_active",
+        "active_search",
+        "search_timeout",
+        "request_lookup",
+        "event_replay",
+        "confirmed_evidence_v1",
+    }

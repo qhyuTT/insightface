@@ -6,6 +6,7 @@ import struct
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 
@@ -13,7 +14,7 @@ from person_search.config import Settings
 from person_search.detector import _preprocess as _preprocess_onnx_yolox
 from person_search.domain import SourceConfig, SourceType
 from person_search.gstreamer_capture import GStreamerCapture
-from person_search.rga import _RgaBuffer
+from person_search.rga import RgaNv12Converter, RgaUnavailableError, _RgaBuffer
 from person_search.rknn_backends import (
     RknnFaceBackend,
     RknnYoloXDetector,
@@ -371,6 +372,51 @@ def test_gstreamer_capture_converts_nv12_frame_from_helper(monkeypatch) -> None:
 
 def test_rga_buffer_layout_matches_librga_2x_abi() -> None:
     assert ctypes.sizeof(_RgaBuffer) == 96
+
+
+@pytest.mark.parametrize("dark_luma", [False, True])
+@pytest.mark.parametrize("uv", [(128, 128), (90, 240), (54, 34), (240, 110), (0, 255)])
+def test_rga_preserves_shared_nv12_and_matches_cpu_luma_floor(dark_luma: bool, uv: tuple[int, int]) -> None:
+    converter = RgaNv12Converter.__new__(RgaNv12Converter)
+    width, height = 256, 256
+    nv12 = np.empty((height * 3 // 2, width), dtype=np.uint8)
+    luma = np.arange(256, dtype=np.uint8)
+    nv12[:height] = (luma if dark_luma else np.clip(luma, 16, 235))[:, None]
+    nv12[height:, 0::2] = uv[0]
+    nv12[height:, 1::2] = uv[1]
+    original = nv12.copy()
+    captured = []
+
+    def wrap(address, w, h, ws, hs, fmt):
+        if not captured:
+            buffer = (ctypes.c_uint8 * (w * h * 3 // 2)).from_address(address.value)
+            captured.append(np.ctypeslib.as_array(buffer).copy())
+        return _RgaBuffer()
+
+    converter._wrap = wrap
+    converter._convert = lambda *args: 1
+    converter.convert(nv12, width, height)
+    submitted = captured[0].reshape(nv12.shape)
+    np.testing.assert_array_equal(nv12, original)
+    np.testing.assert_array_equal(submitted[height:], original[height:])
+    np.testing.assert_array_equal(submitted[:height], np.maximum(original[:height], 16))
+    np.testing.assert_array_equal(
+        cv2.cvtColor(original, cv2.COLOR_YUV2BGR_NV12),
+        cv2.cvtColor(submitted, cv2.COLOR_YUV2BGR_NV12),
+    )
+
+
+def test_gstreamer_auto_converter_still_rejects_wrong_colors(monkeypatch) -> None:
+    capture = GStreamerCapture.__new__(GStreamerCapture)
+    capture._rga_converter = SimpleNamespace(
+        convert=lambda *args: np.full((2, 2, 3), 20, dtype=np.uint8)
+    )
+    monkeypatch.setattr(
+        "person_search.gstreamer_capture.cv2.cvtColor",
+        lambda *args: np.zeros((2, 2, 3), dtype=np.uint8),
+    )
+    with pytest.raises(RgaUnavailableError, match="color output disagrees"):
+        capture._select_fastest_converter(np.zeros((3, 2), dtype=np.uint8), 2, 2)
 
 
 def test_gstreamer_auto_converter_keeps_faster_verified_rga(monkeypatch) -> None:

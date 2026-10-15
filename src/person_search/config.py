@@ -76,10 +76,9 @@ class Settings(BaseSettings):
     insightface_model: str = "buffalo_l"
     insightface_root: Path = Path("~/.insightface").expanduser()
     yolox_model: Path = Path("models/yolox_tiny.onnx")
-    # The default remains the existing ONNX Runtime path.  RKNN is opt-in so a
-    # normal development checkout does not fail merely because librknnrt.so and
-    # converted models are absent.
-    inference_backend: Literal["onnx", "rknn"] = "onnx"
+    # The default remains the existing ONNX Runtime path. RKNN and the explicit
+    # accelerator-only RPP+RKNN hybrid are opt-in.
+    inference_backend: Literal["onnx", "rknn", "hybrid"] = "onnx"
     rknn_runtime_library: Path | None = None
     rknn_yolox_model: Path | None = None
     rknn_face_detection_model: Path | None = None
@@ -95,6 +94,26 @@ class Settings(BaseSettings):
     # EIS100 box: ArcFace 24 -> 15.7 ms, SCRFD-10G 87 -> 74 ms.  0 keeps the vendor
     # default so a runtime without that many cores is never asked for them.
     rknn_core_mask: int = Field(default=0, ge=0, le=7)
+    # Hybrid is the EIS100 container route: SCRFD runs through the external RPP
+    # accelerator; ArcFace and YOLOX run on the RK3588 NPU. SCRFD static graphs
+    # are prepared before deployment and never optimized during service startup.
+    rpp_face_detection_width: int = Field(default=1280, ge=128, le=4096, multiple_of=32)
+    rpp_face_detection_height: int = Field(default=736, ge=128, le=4096, multiple_of=32)
+    rpp_enrollment_face_detection_width: int = Field(
+        default=640, ge=128, le=4096, multiple_of=32
+    )
+    rpp_enrollment_face_detection_height: int = Field(
+        default=640, ge=128, le=4096, multiple_of=32
+    )
+    rpp_static_model_dir: Path = Path("models/rpp-static")
+    rpp_engine_cache_dir: Path = Path("models/rpp-engine-cache")
+    # Read by the RPP backend rather than by a bare ``os.environ`` lookup:
+    # the GIL-releasing wait mode changes throughput and failure behaviour, so
+    # the panel must report what the engine really used.  pydantic-settings
+    # maps these to PERSON_SEARCH_RPP_ENGINE_CACHE_ENABLED / _RELEASE_GIL, so an
+    # existing env var keeps working.
+    rpp_engine_cache_enabled: bool = False
+    rpp_release_gil: bool = False
     prefer_cuda: bool = True
     # 0 uses InsightFace 1.x Auto mode: 128x128 + 640x640. The small pass is
     # important for close-up faces that can be missed by a fixed 640x640 pass.

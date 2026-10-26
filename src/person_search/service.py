@@ -49,6 +49,7 @@ from .errors import (
     SearchStopTimeoutError,
 )
 from .face_tracking import FaceTracker
+from .inference_timing import inference_timing
 from .quality import normalize_embedding
 from .tracker import ByteTracker
 from .video import LatestFrameReader
@@ -1288,7 +1289,9 @@ class SearchSession:
             "enrollment_detection_static_input": _static_input_label(
                 self.face_backend, attribute="enrollment_static_input_hw"
             ),
-            "rknn_core_mask": settings.rknn_core_mask,
+            "rknn_core_mask": getattr(
+                self.person_detector, "core_mask", settings.rknn_core_mask
+            ),
             "rknn_core_mask_applied": {
                 "person": getattr(self.person_detector, "core_mask_applied", None),
                 "face": getattr(self.face_backend, "core_mask_applied", None),
@@ -1506,7 +1509,8 @@ class SearchSession:
                     face_due = now - last_face_at >= face_period
                 if person_due:
                     stage_started = time.monotonic()
-                    detections = self.person_detector.detect(packet.frame)
+                    with inference_timing("person", self._record_inference_timing):
+                        detections = self.person_detector.detect(packet.frame)
                     motion, previous_motion_gray = self._estimate_camera_motion(
                         packet.frame, previous_motion_gray
                     )
@@ -1522,11 +1526,12 @@ class SearchSession:
                     deep = face_pass_index % deep_scan_every_n == 0
                     face_pass_index += 1
                     stage_started = time.monotonic()
-                    faces = self.face_backend.detect_faces(
-                        packet.frame,
-                        enrollment=False,
-                        detection_size=deep_scales if deep else shallow_scales,
-                    )
+                    with inference_timing("face_full", self._record_inference_timing):
+                        faces = self.face_backend.detect_faces(
+                            packet.frame,
+                            enrollment=False,
+                            detection_size=deep_scales if deep else shallow_scales,
+                        )
                     # face_full always covers every pass, which is the cost the
                     # budget must reason about; face_full_deep isolates the large
                     # scale so its price is visible when tuning deep_scan_every_n.
@@ -1548,7 +1553,8 @@ class SearchSession:
                         and self._roi_fits_budget(started)
                     ):
                         stage_started = time.monotonic()
-                        roi_faces = self._analyze_person_rois(packet.frame, roi_tracks)
+                        with inference_timing("face_roi", self._record_inference_timing):
+                            roi_faces = self._analyze_person_rois(packet.frame, roi_tracks)
                         self._record_stage("face_roi", stage_started)
                         self._record_face_source("roi", len(roi_faces))
                         faces = _merge_faces(faces, roi_faces)
@@ -1578,7 +1584,8 @@ class SearchSession:
                 budget_limited = len(matchable) != len(matchable_before_budget)
                 if matchable:
                     stage_started = time.monotonic()
-                    accepted_faces = self._embed_faces_microbatched(packet.frame, matchable)
+                    with inference_timing("face_embed", self._record_inference_timing):
+                        accepted_faces = self._embed_faces_microbatched(packet.frame, matchable)
                     self._record_stage("face_embed", stage_started)
                 else:
                     accepted_faces = []
@@ -2125,6 +2132,10 @@ class SearchSession:
             self.metrics.stage_latencies_ms.setdefault(stage, []).append(latency_ms)
             self.metrics.stage_call_counts[stage] = self.metrics.stage_call_counts.get(stage, 0) + 1
             self.metrics.stage_called_at.setdefault(stage, []).append(time.monotonic())
+
+    def _record_inference_timing(self, stage: str, latency_ms: float) -> None:
+        with self._lock:
+            self.metrics.stage_latencies_ms.setdefault(stage, []).append(latency_ms)
 
     def _record_target_observations(
         self,
@@ -2781,6 +2792,7 @@ class SearchSession:
                 )
         with self._lock:
             self.metrics.roi_calls += analyzed_tracks
+            self.metrics.roi_tracks_per_pass.append(float(analyzed_tracks))
         return observations
 
     def _detect_roi_batch(
@@ -2980,8 +2992,8 @@ class SearchSession:
 class MultiSourceSearchSession:
     """One public search backed by two isolated camera pipelines.
 
-    Model objects are shared, while readers, trackers and confirmation windows
-    belong to each child. The RKNN/RPP backends serialize device access.
+    Face models are shared; optional RKNN person contexts can belong to each
+    source. Readers, trackers and confirmation windows always belong to each child.
     """
 
     def __init__(
@@ -2996,6 +3008,7 @@ class MultiSourceSearchSession:
         on_finished: Callable[[str, list[str]], None],
         timeout_seconds: float | None,
         request_id: str | None,
+        person_detectors: tuple[PersonDetector, PersonDetector] | None = None,
     ) -> None:
         self.search_id = search_id
         self.request_id = request_id
@@ -3022,7 +3035,10 @@ class MultiSourceSearchSession:
                     source=source,
                     settings=settings,
                     face_backend=face_backend,
-                    person_detector=person_detector,
+                    person_detector=(
+                        person_detectors[index - 1]
+                        if person_detectors is not None else person_detector
+                    ),
                     on_finished=lambda _search_id, _target_ids: None,
                     timeout_seconds=timeout_seconds,
                     request_id=request_id,
@@ -3185,7 +3201,8 @@ class MultiSourceSearchSession:
                             "achieved_sampling_hz", "confirmed_tracks",
                             "time_to_confirm_p50_seconds", "time_to_confirm_p95_seconds",
                             "track_dwell_p50_seconds", "unconfirmed_gate_counts",
-                            "roi_calls_per_frame", "roi_batch_count", "embedding_batch_count",
+                            "roi_calls_per_frame", "roi_tracks_per_pass_p95",
+                            "roi_batch_count", "embedding_batch_count",
                             "faces_dropped_by_budget", "embedding_failures",
                             "embedding_output_failures", "budget_skips",
                             "camera_motion_px_p95", "blur_variance_p50", "blur_variance_p95",
@@ -3247,6 +3264,7 @@ class MultiSourceSearchSession:
         )
         data["drop_rate"] = data["dropped_frames"] / arrived if arrived else 0.0
         data["roi_calls_per_frame"] = 0.0
+        data["roi_tracks_per_pass_p95"] = 0.0
         if found_view is not None:
             data["targets"] = found_view.targets
             data["found_count"] = found_view.found_count
@@ -3321,6 +3339,7 @@ class SearchManager:
                 person_detector = YoloXOnnxDetector(settings)
         self.face_backend = face_backend
         self.person_detector = person_detector
+        self._dual_person_detectors: tuple[PersonDetector, PersonDetector] | None = None
         self._targets: dict[str, Target] = {}
         self._sessions: dict[str, SearchSession | MultiSourceSearchSession] = {}
         self._request_index: dict[str, str] = {}
@@ -3361,6 +3380,52 @@ class SearchManager:
                 mode="json"
             ),
         }
+
+    def _person_detectors_for_dual_source(
+        self,
+    ) -> tuple[PersonDetector, PersonDetector] | None:
+        """Use independent NPU contexts for two cameras, preserving single-source settings.
+
+        The shared YOLOX context serializes both source threads through one RKNN
+        lock. On RK3588 each clone can run on a different core; if either clone
+        cannot initialize, keep the proven shared context for this search.
+        Contexts are reused by later dual searches and closed with the manager.
+        """
+        from .rknn_backends import RknnYoloXDetector
+
+        detector = self.person_detector
+        if not isinstance(detector, RknnYoloXDetector):
+            return None
+        if self._dual_person_detectors is not None:
+            return self._dual_person_detectors
+        clones: list[RknnYoloXDetector] = []
+        try:
+            for mask in (1, 2):
+                clone = RknnYoloXDetector(
+                    self.settings.model_copy(update={"rknn_core_mask": mask}),
+                    confidence=detector.confidence,
+                    nms=detector.nms,
+                    model_factory=detector._model_factory,
+                )
+                clones.append(clone)
+                clone.ensure_ready()
+                if clone.static_input_hw != detector.static_input_hw:
+                    raise ModelUnavailableError("dual-source YOLOX input shape differs")
+                if clone.core_mask_applied is not True:
+                    raise ModelUnavailableError("dual-source YOLOX core mask was not applied")
+            self._dual_person_detectors = (clones[0], clones[1])
+            return self._dual_person_detectors
+        except Exception as exc:  # noqa: BLE001 - use the ready shared context
+            for clone in clones:
+                try:
+                    clone.close()
+                except Exception:  # noqa: BLE001 - keep fallback usable
+                    logger.warning("dual-source YOLOX clone cleanup failed")
+            logger.warning(
+                "dual-source YOLOX contexts unavailable; using shared context: %s",
+                type(exc).__name__,
+            )
+            return None
 
     def enroll(self, image: np.ndarray, name: str = "目标") -> TargetView:
         self._ensure_open()
@@ -3570,6 +3635,7 @@ class SearchManager:
                         settings=self.settings,
                         face_backend=self.face_backend,
                         person_detector=self.person_detector,
+                        person_detectors=self._person_detectors_for_dual_source(),
                         on_finished=self._on_finished,
                         timeout_seconds=timeout_seconds,
                         request_id=normalized_request_id,
@@ -3723,7 +3789,11 @@ class SearchManager:
                 session.defer_sensitive_cleanup()
             except Exception as exc:  # noqa: BLE001 - shutdown remains best effort
                 logger.warning("session sensitive shutdown cleanup failed: %s", type(exc).__name__)
-        for component in (self.face_backend, self.person_detector):
+        for component in (
+            self.face_backend,
+            self.person_detector,
+            *(self._dual_person_detectors or ()),
+        ):
             close = getattr(component, "close", None)
             if callable(close):
                 try:

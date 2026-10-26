@@ -1,6 +1,7 @@
 # 机器人寻人识别服务技术方案
 
-版本：2026-10-15。项目：`~/WorkSpace/insightface`。
+版本：2026-10-15 盒端已部署快照。项目：`~/WorkSpace/insightface`。运行镜像
+`person-search-rk3588-rpp:box-confirm-20261015-v1`；运行时代码与 `eis100/fba1b6f` 一致。
 
 本文以当前 EIS100 RK3588 容器部署和单路海康实测为基线。描述已实现功能，并单独列出待验证
 事项和建议演进；历史 T4、RKNN-only、4K 和双路实验不作为当前性能承诺。现场快照与回滚索引
@@ -32,7 +33,9 @@ flowchart TD
     Ingress --> ZLM[盒端 ZLMediaKit]
     ZLM --> MPP[系统 Python / GStreamer / MPP 硬解]
     MPP --> NV12[NV12 按 stride / offset 提取有效行]
-    NV12 --> Reader[Python 3.11 采集线程]
+    NV12 --> Pipe[紧凑 NV12 / 帧头 / stdout 管道]
+    Pipe --> Convert[RGA auto 校验择优或 OpenCV 转 BGR]
+    Convert --> Reader[Python 3.11 采集线程]
     Reader --> Latest[最新帧快照]
     Reader --> Queue[有界 AI 队列]
     Queue --> Person[YOLOX / RKNN NPU]
@@ -43,7 +46,7 @@ flowchart TD
     ArcFace --> Verdict[相似度竞争与多帧确认]
     Verdict --> API[REST / WebSocket / 受控证据接口]
     API --> Dispatch[调度服务]
-    Tracks --> Overlay[检测与匹配框快照]
+    Tracks --> Overlay[检测框快照 + frame_id / epoch / 时间戳]
     Latest --> Preview[独立预览线程]
     Overlay --> Preview
     Preview --> JPEG[最新 JPEG / MJPEG]
@@ -51,8 +54,9 @@ flowchart TD
     HTTPS --> Browser[浏览器监控页]
 ```
 
-AI 不必处理每个视频帧，预览也不等待每个视频帧完成识别。预览叠框来自最近的 AI 状态快照，
-因此图像流畅不代表每帧都重新检测；框的时效性需要单独评估。
+AI 不必处理每个视频帧，预览也不等待每个视频帧完成识别。AI 队列满时淘汰旧帧，实际处理帧
+保持源内时间顺序，但并非逐帧无丢弃。预览叠框来自最近的 AI 状态快照；框超过 400ms 或
+跨源 epoch 时不画旧框，因此预览画面并不保证每帧都有框。
 
 ## 3. 技术栈与硬件分工
 
@@ -62,8 +66,8 @@ AI 不必处理每个视频帧，预览也不等待每个视频帧完成识别�
 | 依赖与测试 | `uv` / `uv.lock`、pytest、Ruff |
 | 码流读取 | RTSP over TCP；现场取本机 ZLM 的海康来源 |
 | 视频解码 | Rockchip MPP，GStreamer `mppvideodec`，输出 NV12 |
-| 桥接 | 系统 Python helper → 带帧头的 stdout 管道 → Python 3.11 |
-| 图像处理 | NumPy/OpenCV；RGA 可选转换并做颜色一致性校验 |
+| 桥接 | 系统 Python helper → 带帧头的紧凑 NV12 stdout 管道 → Python 3.11 |
+| 图像处理 | NV12→BGR 采用 RGA auto 校验择优或 OpenCV；模型输入另做 resize/格式转换 |
 | 行人检测 | YOLOX-Tiny RKNN，当前模型输入 640×384 |
 | 人脸检测 | SCRFD-10G RPP BF16，搜索 1280×736，登记 640×640 |
 | 人脸识别 | ArcFace RKNN，112×112，512 维，flip TTA |
@@ -97,8 +101,15 @@ Python helper 调用 GStreamer，主进程通过自定义帧协议接收数据�
 检查尺寸、平面边界与重叠，缺少 meta 才回退 caps `VideoInfo`。1080p 现场实际缓冲曾为
 stride 2304 / UV offset 2488320 / 3732480 bytes，不能按紧凑 3110400 bytes 直接截取。
 
-RGA 转换为可选加速。自动模式需要和 OpenCV 参考颜色比较，通过才采用；不通过则回退并记录
-原因。设备节点或库可见，只能证明可访问，不能证明本次转换使用了 RGA。
+RGA 转换为可选加速。盒端配置为 `auto`：首次比较 RGA/OpenCV 的颜色与耗时，颜色通过且
+RGA 至少快 5% 才选择它；否则使用 OpenCV 并记录原因。设备节点或库可见，只能证明可访问，
+不能证明某次会话实际使用了 RGA。
+
+MPP 缓冲在 helper 中映射并按有效行打包，再经 stdout 管道传给主进程；主进程从 NV12 生成
+BGR 帧，模型前处理还有 resize、归一化或上传。当前生产路径**没有**把 dma-buf 直接交给
+RGA3 做统一的 RGB 640×640 letterbox，也没有将该张量经 memfd 交给独立模型服务。
+YOLOX 输入为 640×384，SCRFD 搜索输入为 1280×736，ArcFace 为 112×112；不能用单一
+RGB640² 或“全程零拷贝”描述现网。预览 JPEG 只用于显示，不作为推理输入。
 
 ### 4.3 缓存、重连与停止
 
@@ -134,6 +145,19 @@ RTSP 可重连，帧标识与源 epoch 用来区分重连前后的数据。停�
 
 目标确认后仍保留在身份竞争集合中，防止同一个已命中人物被强制匹配给剩余目标。档位变化、
 轨迹丢失和确认样本的时序间隔需共同管理，不能靠单帧高分驱动物理动作。
+
+### 5.1 走过候选与框偏移的当前诊断
+
+2026-10-15 上线前一段单路活动快照中，全帧人体/人脸检测约 3.8–3.9Hz，1416 次累计
+人脸观测有 1087 次短边小于 48px。这是整个会话的分布，不代表某个人走过时的逐帧条件。
+`candidate` 长时间不转正式确认，需分别看轨迹采样率、原帧人脸尺寸、质量通过数、人体关联、
+相似度及未确认门；不能直接通过降阈值处理。框“飘”也需区分预览叠框落后于最新帧与同帧原始
+检测框坐标偏移，两者的修复位置不同。
+
+当前 `SearchView` 已暴露 `achieved_sampling_hz`、`unconfirmed_gate_counts`、
+`time_to_confirm_p50_seconds` / `time_to_confirm_p95_seconds` 等诊断，预览叠框记录来源
+`frame_id`、`source_epoch`、`captured_at`。这些改动改善可观测性和旧框呈现，没有修改检测模型、输入尺寸、相似度门槛、
+flip TTA 或确认状态机。要判定原始框精度，仍须同帧比对原图与检测输出。
 
 ## 6. RPP 输入与执行优化
 
@@ -177,6 +201,10 @@ zeros、确定性 random、ones 三组纯合成输入的九个输出逐值相同
 
 预览线程等待新的 latest frame_id，读取最近检测框快照，缩放、叠框并编码 JPEG。
 `PreviewHub` 保留最新 JPEG；浏览器以 MJPEG 读取，不让 AI 队列成为预览队列。
+
+叠框只在同一 `source_epoch`、AI 快照不晚于预览帧且框龄不超过 400ms 时显示。超时跳过
+旧框并累计 `preview_overlay_stale_frames`；`preview_overlay_age_p95_ms` 记录有效叠框的
+年龄。这避免移动的人经过旧位置时继续画框，但不改变原始检测坐标或跟踪精度。
 
 调度以编码开始时刻限频，当前部署目标 15Hz。一次编码已经超出预算时不额外 sleep，也不为
 补齐计划频率发送历史帧。无订阅者不编码，停止/断流唤醒线程，空返回不忙循环。
@@ -256,21 +284,32 @@ Compose，TLS 和 SSH 主机校验均保持严格。
 间隔 P95 201.539ms、最大 303.715ms，24 次 >200ms、0 次 >500ms。该测量增加一个客户端，
 不能作为独占带宽测试，也不是浏览器绘制或摄像头到屏幕的光学延迟测量。
 
-验证包括全量 456 项测试、限定 Ruff/diff 检查，以及实际镜像的四种合成活动状态 × 四个查询
-路由共 16 次 HTTP200。最终容器 healthy、restart=0，真实 healthz/readyz/active 正常，近期
-无 traceback/500。代码与镜像内三个后端配置模块哈希已比对一致。
+原生输入优化阶段验证包括全量 456 项测试、Ruff/diff 检查，以及实际镜像的四种合成活动
+状态 × 四个查询路由共 16 次 HTTP200。之后框时序与诊断改动通过 457 项 pytest、Ruff、
+`git diff --check` 和监控页 `node --check`；候选镜像再验活动 view/路由均 HTTP200。
+2026-10-15 再核对：运行容器 healthy、restart=0；`src/person_search` 的 26 个受 Git 跟踪
+运行时 `.py/.html/.js/.css` 文件，加上采集 helper 和健康契约脚本，共 28 个文件与已推送的
+`fba1b6f` 逐个 SHA256 一致，且无源码 bind mount 覆盖。镜像早于 Git 提交构建，镜像
+revision 仍为发布标识 `box-confirm-20261015-v1`。
 
-结论：已修复一处主要应用线程阻塞，单路真实预览接近 15 FPS 源帧率。仍有短时网络到达抖动，
-没有给出“永久不卡顿”、双路/4K 同性能或人群识别精度通过的结论。
+用户重启任务后的一次真实单路正样本：1920×1080，decoded 648 / processed 496，终态
+`completed`、`found_count=1`；同一轨迹 3/3 证据、最佳相似度 0.653（普通档门槛 0.55）、
+采样 4.82Hz，首次证据到正式确认 1.451s。全任务 28 次人脸观测中 20 次短边 <48px，
+8 次通过质量门；这些是累计值，不能归到目标走过瞬间。叠框龄 P95 307.9ms、因过期跳过
+17 帧；预览帧龄 P95 72.9ms、编码 P95 25.9ms。
+
+结论：已修复一处主要应用线程阻塞，单路真实预览接近 15 FPS 源帧率；上线后这一例目标
+在 1.451s 正式确认。前后没有同画面旧版 A/B，尚缺异人负样本、人工同帧框精度观察与长时
+稳定性数据，不能推断总体召回、误报或双路/4K 同性能已通过。
 
 ## 11. 后续验证与演进
 
 | 顺序 | 工作 | 需要的验收证据 |
 |---|---|---|
 | 1 | 保持当前单路任务做长时运行 | 多次任务/重连、峰值延迟、积压、错误、CPU/温度趋势 |
-| 2 | 核对浏览器真实呈现及叠框时效 | 单订阅者条件、呈现帧率、框龄、光学端到端延迟 |
+| 2 | 同帧核对浏览器叠框与原始检测坐标 | 单订阅者条件、框龄、同帧原图坐标、呈现帧率与光学端到端延迟 |
 | 3 | 若带宽仍限制体验，比较压缩视频预览 | 浏览器兼容、鉴权、叠框同步、码率和端到端延迟 |
-| 4 | 移动、遮挡与多人业务回归 | 误报/漏报、time-to-confirm、轨迹连续性与 shadow 区分 |
+| 4 | 多次同人及异人走过、移动遮挡与多人回归 | 正负样本、误报/漏报、time-to-confirm、未确认门、轨迹连续性与 shadow 区分 |
 | 5 | 用户确需双路或 4K 时单独验收 | 每源指标、共享模型公平性、CPU/内存/网络与业务精度 |
 
 不建议在缺证据时继续加大所有队列、移除模型锁、盲目降低 jitter、打开 RTP 任意丢包或降低

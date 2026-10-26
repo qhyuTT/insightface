@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ from .config import Settings
 from .detector import _decode_yolox, _nms
 from .domain import Detection, EmbeddingContract, FaceObservation
 from .errors import ModelUnavailableError
+from .inference_timing import record_inference_timing
 from .model_assets import sha256
 from .quality import assess_face, normalize_embedding
 from .rknn_runtime import (
@@ -81,6 +83,10 @@ class RknnYoloXDetector:
     def core_mask_applied(self) -> bool | None:
         return None if self._model is None else bool(getattr(self._model, "core_mask_applied", False))
 
+    @property
+    def core_mask(self) -> int:
+        return self.settings.rknn_core_mask
+
     def ensure_ready(self) -> None:
         if self._model is not None and self._model.is_ready:
             return
@@ -135,8 +141,11 @@ class RknnYoloXDetector:
         input_hw = self._input_hw
         if model is None or input_hw is None:
             raise ModelUnavailableError("RKNN YOLOX initialization did not complete")
+        preprocess_started = time.monotonic()
         image, ratio = _preprocess_yolox(frame, input_hw)
+        record_inference_timing("preprocess", time.monotonic() - preprocess_started)
         output = model.run(image)
+        postprocess_started = time.monotonic()
         raw = np.asarray(output[0], dtype=np.float32)
         if raw.ndim == 3 and raw.shape[0] == 1:
             raw = raw[0]
@@ -160,15 +169,18 @@ class RknnYoloXDetector:
         scores = predictions[:, 4] * predictions[:, 5]
         keep = np.where(scores >= self.confidence)[0]
         if keep.size == 0:
+            record_inference_timing("postprocess", time.monotonic() - postprocess_started)
             return []
         selected = _nms(boxes_xyxy[keep], scores[keep], self.nms)
-        return [
+        detections = [
             Detection(
                 bbox=boxes_xyxy[keep[index]].astype(np.float32),
                 score=float(scores[keep[index]]),
             )
             for index in selected
         ]
+        record_inference_timing("postprocess", time.monotonic() - postprocess_started)
+        return detections
 
     def close(self) -> None:
         if self._model is not None:

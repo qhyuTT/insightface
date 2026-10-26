@@ -411,6 +411,7 @@ class SearchView(BaseModel):
     preview_overlay_age_p95_ms: float = 0.0
     preview_overlay_stale_frames: int = 0
     roi_calls_per_frame: float = 0.0
+    roi_tracks_per_pass_p95: float = 0.0
     drop_rate: float = 0.0
     end_to_end_p95_latency_ms: float = 0.0
     camera_motion_px_p95: float = 0.0
@@ -590,6 +591,7 @@ class SearchMetrics:
     preview_overlay_ages_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     preview_overlay_stale_frames: int = 0
     roi_calls: int = 0
+    roi_tracks_per_pass: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     budget_skips: dict[str, int] = field(default_factory=dict)
     end_to_end_latencies_ms: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
     camera_motion_px: BoundedFloatSeries = field(default_factory=BoundedFloatSeries)
@@ -622,6 +624,7 @@ class SearchMetrics:
             "preview_frame_ages_ms",
             "preview_encode_latencies_ms",
             "preview_overlay_ages_ms",
+            "roi_tracks_per_pass",
         ):
             values = getattr(self, name)
             if not isinstance(values, BoundedFloatSeries):
@@ -644,8 +647,10 @@ class SearchMetrics:
             elapsed = max(now - self.started_at, 1e-6)
             fps = _window_fps(self.processed_at, now, started_at=self.started_at) if self.processed_at else self.frame_count / elapsed
         p95 = float(np.percentile(self.latencies_ms[-1000:], 95)) if self.latencies_ms else 0.0
-        stage_p95_latency_ms = {
-            stage: float(np.percentile(latencies[-1000:], 95))
+        # One percentile pass per stage keeps detailed backend tracing cheap
+        # enough for the monitor's frequent active-search polls.
+        stage_percentiles = {
+            stage: np.percentile(latencies, (50, 95))
             for stage, latencies in sorted(self.stage_latencies_ms.items())
             if latencies
         }
@@ -671,10 +676,11 @@ class SearchMetrics:
             "face_size_counts": dict(sorted(self.face_size_counts.items())),
             "face_source_counts": dict(sorted(self.face_source_counts.items())),
             "match_stage_counts": dict(sorted(self.match_stage_counts.items())),
-            "stage_p95_latency_ms": stage_p95_latency_ms,
+            "stage_p95_latency_ms": {
+                stage: float(values[1]) for stage, values in stage_percentiles.items()
+            },
             "stage_p50_latency_ms": {
-                stage: _percentile(values, 50)
-                for stage, values in self.stage_latencies_ms.items() if values
+                stage: float(values[0]) for stage, values in stage_percentiles.items()
             },
             "stage_max_latency_ms": {
                 stage: max(values) for stage, values in self.stage_latencies_ms.items() if values
@@ -703,6 +709,7 @@ class SearchMetrics:
             "roi_calls_per_frame": (
                 self.roi_calls / self.frame_count if self.frame_count else 0.0
             ),
+            "roi_tracks_per_pass_p95": _percentile(self.roi_tracks_per_pass, 95),
             "drop_rate": drop_rate,
             "end_to_end_p95_latency_ms": end_to_end_p95,
             "budget_skips": dict(sorted(self.budget_skips.items())),

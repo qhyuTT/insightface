@@ -1,5 +1,16 @@
 # RK3588 RPP + RKNN hybrid container
 
+Current deployed snapshot (2026-10-15):
+`person-search-rk3588-rpp:box-confirm-20261015-v1`. The production runtime
+source matches `eis100/fba1b6f` across 26 tracked application files and two
+runtime scripts (capture helper and health contract). The
+previous `rpp-native-input-20261015-v1` image is retained for rollback. This
+document's 2026-10-11 staging results are historical; use the
+[current technical solution](technical-solution-20261015.md) and
+[deployment snapshot](project-memory.md) for current behavior and verification.
+The live bridge still copies packed NV12 over stdout and converts it to BGR in
+the service. It does not use a dma-buf-to-memfd model-service input path.
+
 The performance-oriented route assigns SCRFD face detection (search
 `1280x736`, enrollment `640x640`) to the RPP accelerator, and assigns both
 ArcFace face recognition and YOLOX person detection to the RK3588 RKNN NPU.

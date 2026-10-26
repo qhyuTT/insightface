@@ -308,6 +308,32 @@ def test_rpp_scrfd_preprocessing_matches_insightface_onnx_blob() -> None:
     np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.parametrize("frame_hw,input_hw", [
+    ((1080, 1920), (736, 1280)),
+    ((720, 1280), (736, 1280)),
+    ((83, 171), (736, 1280)),
+    ((421, 317), (640, 640)),
+])
+def test_rpp_scrfd_preprocessing_preserves_rgb_and_letterbox_exactly(
+    frame_hw: tuple[int, int], input_hw: tuple[int, int]
+) -> None:
+    frame = np.random.default_rng(sum(frame_hw)).integers(
+        0, 256, (*frame_hw, 3), dtype=np.uint8
+    )
+    actual, ratio = _preprocess_scrfd(frame, input_hw)
+    resized_width = max(1, min(input_hw[1], int(frame_hw[1] * ratio)))
+    resized_height = max(1, min(input_hw[0], int(frame_hw[0] * ratio)))
+    resized = cv2.resize(frame, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    padded = np.zeros((*input_hw, 3), dtype=np.uint8)
+    padded[:resized_height, :resized_width] = rgb
+    expected = cv2.dnn.blobFromImage(
+        padded, 1.0 / 128.0, (input_hw[1], input_hw[0]),
+        (127.5, 127.5, 127.5), swapRB=False,
+    )[0]
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_rpp_scrfd_decodes_output_bindings_by_name() -> None:
     input_hw = (64, 64)
     names = (

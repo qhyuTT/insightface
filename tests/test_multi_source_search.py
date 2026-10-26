@@ -79,6 +79,99 @@ def test_two_sources_share_one_search_but_not_tracking_state(monkeypatch) -> Non
     assert [event["data"]["source_id"] for event in session.events.after(0, 0) if event["type"] == "target_found"] == ["source-2"]
 
 
+def test_dual_rknn_contexts_are_source_owned_reused_and_closed(monkeypatch) -> None:
+    from person_search import rknn_backends
+
+    created = []
+
+    class FakeRknnYoloXDetector:
+        provider_name = "RKNN_NPU"
+        static_input_hw = (640, 640)
+        core_mask_applied = True
+
+        def __init__(self, settings, confidence=0.25, nms=0.45, *, model_factory=None):
+            self.settings = settings
+            self.confidence = confidence
+            self.nms = nms
+            self._model_factory = model_factory
+            self.closed = False
+            created.append(self)
+
+        @property
+        def core_mask(self):
+            return self.settings.rknn_core_mask
+
+        def ensure_ready(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(rknn_backends, "RknnYoloXDetector", FakeRknnYoloXDetector)
+    monkeypatch.setattr(SearchSession, "start", lambda self: None)
+
+    def finish_stop(self, timeout=15.0):
+        self.status = SearchStatus.STOPPED
+        self._finished.set()
+
+    monkeypatch.setattr(SearchSession, "stop", finish_stop)
+    settings = Settings(rknn_core_mask=7)
+    base = FakeRknnYoloXDetector(settings)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), base)
+    target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    search = manager.start_batch_search([target.target_id], _sources())
+    session = manager.get_session(search.search_id)
+    first, second = session._children.values()
+    assert first.person_detector is created[1]
+    assert second.person_detector is created[2]
+    assert [child._effective_config()["rknn_core_mask"] for child in (first, second)] == [1, 2]
+    assert base.core_mask == 7
+    manager.stop_search(search.search_id)
+    next_target = manager.enroll(np.zeros((200, 200, 3), dtype=np.uint8), "张三")
+    manager.start_batch_search([next_target.target_id], _sources())
+    assert len(created) == 3
+    manager.shutdown()
+    assert all(detector.closed for detector in created)
+
+
+def test_dual_rknn_context_failure_falls_back_to_shared_detector(monkeypatch) -> None:
+    from person_search import rknn_backends
+
+    created = []
+
+    class FakeRknnYoloXDetector:
+        provider_name = "RKNN_NPU"
+        static_input_hw = (640, 640)
+
+        def __init__(self, settings, confidence=0.25, nms=0.45, *, model_factory=None):
+            self.settings = settings
+            self.confidence = confidence
+            self.nms = nms
+            self._model_factory = model_factory
+            self.closed = False
+            created.append(self)
+
+        @property
+        def core_mask_applied(self):
+            return self.settings.rknn_core_mask != 2
+
+        def ensure_ready(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(rknn_backends, "RknnYoloXDetector", FakeRknnYoloXDetector)
+    settings = Settings(rknn_core_mask=7)
+    base = FakeRknnYoloXDetector(settings)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), base)
+    assert manager._person_detectors_for_dual_source() is None
+    assert all(detector.closed for detector in created[1:])
+    assert not base.closed
+    manager.shutdown()
+    assert base.closed
+
+
 def test_explicit_stop_cleans_both_video_sources(monkeypatch) -> None:
     monkeypatch.setattr(SearchSession, "start", lambda self: None)
     stopped = []

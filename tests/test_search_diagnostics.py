@@ -95,6 +95,12 @@ def test_recent_rates_decay_and_stage_statistics_expose_sample_scope(monkeypatch
     assert snapshot['stage_p50_latency_ms']['face_full'] == 20.0
     assert snapshot['stage_max_latency_ms']['face_full'] == 90.0
     assert snapshot['stage_sample_counts']['face_full'] == 3
+    metrics.stage_latencies_ms.setdefault('face_full.lock_wait', []).extend([2.0, 4.0])
+    metrics.roi_tracks_per_pass.extend([1.0, 3.0])
+    snapshot = metrics.snapshot()
+    assert snapshot['stage_p95_latency_ms']['face_full.lock_wait'] == pytest.approx(3.9)
+    assert snapshot['roi_tracks_per_pass_p95'] == pytest.approx(2.9)
+    assert 'face_full.lock_wait' not in snapshot['effective_hz']
     monkeypatch.setattr('time.monotonic', lambda: 106.0)
     assert metrics.snapshot()['processed_fps'] == 0.0
     assert metrics.snapshot()['preview_fps'] == 0.0

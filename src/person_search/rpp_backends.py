@@ -15,8 +15,10 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
@@ -27,6 +29,7 @@ from .config import Settings
 from .detector import _nms
 from .domain import EmbeddingContract, FaceObservation
 from .errors import ModelUnavailableError
+from .inference_timing import record_inference_timing
 from .model_assets import EMBEDDING_MODEL_MANIFESTS, sha256
 from .quality import assess_face, normalize_embedding
 
@@ -441,7 +444,9 @@ class _RppExecutionEngine:
         return "native_stream_sync" if self._native_stream is not None else "sync_execute"
 
     def run(self, input_tensor: np.ndarray) -> dict[str, np.ndarray]:
+        prepare_started = time.monotonic()
         array = np.ascontiguousarray(input_tensor, dtype=np.float32)
+        prepare_seconds = time.monotonic() - prepare_started
         if array.shape != self._input_shape:
             raise ValueError(
                 f"RPP input shape {array.shape} does not match {self._input_shape}"
@@ -449,19 +454,29 @@ class _RppExecutionEngine:
         input_index = self._input_index
         if input_index is None:
             raise ModelUnavailableError("RPP input binding is not initialized")
+        lock_started = time.monotonic()
         with _RPP_EXECUTION_LOCK:
+            lock_wait_seconds = time.monotonic() - lock_started
             if self._closed or self._execution_failed:
                 raise ModelUnavailableError("RPP execution engine is closed or failed")
             if self._native_stream is None:
+                input_started = time.monotonic()
                 self._devices[input_index].copy_from_numpy(array)
+                input_seconds = time.monotonic() - input_started
+                execute_started = time.monotonic()
                 if not self._context.execute(1, self._bindings):
                     raise ModelUnavailableError("RPP execution failed")
+                execute_seconds = time.monotonic() - execute_started
             else:
                 try:
+                    input_started = time.monotonic()
                     self._native_input.copy_from_numpy(array, self._bindings[input_index])
+                    input_seconds = time.monotonic() - input_started
+                    execute_started = time.monotonic()
                     if not self._context.enqueue(1, self._bindings, self._native_stream.stream):
                         raise ModelUnavailableError("RPP enqueue failed")
                     self._native_stream.synchronize()
+                    execute_seconds = time.monotonic() - execute_started
                     self._native_input.clear()
                 except Exception as exc:
                     self._execution_failed = True
@@ -469,6 +484,7 @@ class _RppExecutionEngine:
                     if isinstance(exc, ModelUnavailableError):
                         raise
                     raise ModelUnavailableError("RPP asynchronous execution failed") from exc
+            output_started = time.monotonic()
             outputs: dict[str, np.ndarray] = {}
             for name, index in self._output_indices.items():
                 host = self._hosts[index]
@@ -479,7 +495,16 @@ class _RppExecutionEngine:
                 if not np.isfinite(output).all():
                     raise ModelUnavailableError(f"RPP output {name} contains non-finite values")
                 outputs[name] = output
-            return outputs
+            output_seconds = time.monotonic() - output_started
+        for part, seconds in (
+            ("runtime_prepare", prepare_seconds),
+            ("lock_wait", lock_wait_seconds),
+            ("input_copy", input_seconds),
+            ("device_run", execute_seconds),
+            ("output_copy", output_seconds),
+        ):
+            record_inference_timing(part, seconds)
+        return outputs
 
     def close(self) -> None:
         with _RPP_EXECUTION_LOCK:
@@ -648,17 +673,37 @@ def _preprocess_scrfd(frame: np.ndarray, input_hw: tuple[int, int]) -> tuple[np.
     resized_w = max(1, min(target_w, int(frame.shape[1] * ratio)))
     resized_h = max(1, min(target_h, int(frame.shape[0] * ratio)))
     resized = cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    # blobFromImage swaps BGR to RGB while converting to CHW float32. Keeping
+    # the letterbox in BGR avoids a separate full-size color-conversion copy.
     padded = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    padded[:resized_h, :resized_w] = rgb
+    padded[:resized_h, :resized_w] = resized
     blob = cv2.dnn.blobFromImage(
         padded,
         1.0 / 128.0,
         (target_w, target_h),
         (127.5, 127.5, 127.5),
-        swapRB=False,
+        swapRB=True,
     )
     return np.ascontiguousarray(blob[0], dtype=np.float32), ratio
+
+
+@lru_cache(maxsize=4)
+def _scrfd_centers(input_hw: tuple[int, int]) -> tuple[np.ndarray, ...]:
+    """Reuse fixed SCRFD anchor grids across full-frame and ROI calls."""
+    height, width = input_hw
+    grids: list[np.ndarray] = []
+    for stride in _SCRFD_STRIDES:
+        grid_h, grid_w = height // stride, width // stride
+        centers_y, centers_x = np.meshgrid(
+            np.arange(grid_h, dtype=np.float32),
+            np.arange(grid_w, dtype=np.float32),
+            indexing="ij",
+        )
+        centers = np.stack((centers_x, centers_y), axis=-1).reshape(-1, 2) * stride
+        centers = np.repeat(centers, _SCRFD_ANCHORS, axis=0)
+        centers.setflags(write=False)
+        grids.append(centers)
+    return tuple(grids)
 
 
 def _decode_scrfd(
@@ -672,12 +717,12 @@ def _decode_scrfd(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if len(output_names) != 9 or any(name not in outputs for name in output_names):
         raise ModelUnavailableError("RPP SCRFD output bindings do not match the model")
-    height, width = input_hw
     boxes: list[np.ndarray] = []
     landmarks: list[np.ndarray] = []
     scores: list[np.ndarray] = []
     expected_shapes = _scrfd_output_shapes(input_hw)
 
+    centers_by_level = _scrfd_centers(input_hw)
     for level, stride in enumerate(_SCRFD_STRIDES):
         score = np.asarray(outputs[output_names[level]], dtype=np.float32)
         bbox = np.asarray(outputs[output_names[3 + level]], dtype=np.float32)
@@ -688,14 +733,7 @@ def _decode_scrfd(
             expected_shapes[6 + level],
         ):
             raise ModelUnavailableError("RPP SCRFD output tensors have invalid shapes")
-        grid_h, grid_w = height // stride, width // stride
-        centers_y, centers_x = np.meshgrid(
-            np.arange(grid_h, dtype=np.float32),
-            np.arange(grid_w, dtype=np.float32),
-            indexing="ij",
-        )
-        centers = np.stack((centers_x, centers_y), axis=-1).reshape(-1, 2) * stride
-        centers = np.repeat(centers, _SCRFD_ANCHORS, axis=0)
+        centers = centers_by_level[level]
         scores_flat = score.reshape(-1)
         bbox_flat = bbox.reshape(-1, 4)
         kps_flat = kps.reshape(-1, 10)

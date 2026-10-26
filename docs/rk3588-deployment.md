@@ -1,5 +1,9 @@
 # EIS100 RK3588 原生部署
 
+本文是 RKNN-only 原生部署路径，不是 2026-10-15 的线上部署。当前线上使用
+RPP BF16 + RKNN 的 `box-confirm-20261015-v1` 容器；现状、单路实测和回滚见
+[当前技术方案](technical-solution-20261015.md) 与 [项目记忆](project-memory.md)。
+
 这条部署路径不依赖 Docker。盒子是 ARM64 Ubuntu 20.04，系统已经提供
 Rockchip MPP/GStreamer 和 `mppvideodec`，因此应用使用项目自己的 Python 3.11 环境，
 视频采集则委托给 `/usr/bin/python3` + 系统 GStreamer helper；4K H.265 保留 MPP 的

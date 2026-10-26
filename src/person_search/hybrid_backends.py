@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 
 import numpy as np
@@ -11,6 +12,7 @@ from .backends import FaceBackend
 from .config import Settings
 from .domain import EmbeddingContract, FaceObservation
 from .errors import ModelUnavailableError
+from .inference_timing import record_inference_timing
 from .rknn_backends import RknnFaceBackend
 from .rpp_backends import (
     EngineFactory,
@@ -220,8 +222,11 @@ class RppScrfdRknnFaceBackend:
         input_hw = self.enrollment_static_input_hw if enrollment else self.static_input_hw
         if detector is None:
             raise ModelUnavailableError("RPP SCRFD engine did not initialize")
+        preprocess_started = time.monotonic()
         input_tensor, ratio = _preprocess_scrfd(frame, input_hw)
+        record_inference_timing("preprocess", time.monotonic() - preprocess_started)
         outputs = detector.run(input_tensor)
+        postprocess_started = time.monotonic()
         boxes, landmarks, scores = _decode_scrfd(
             frame,
             outputs,
@@ -249,6 +254,7 @@ class RppScrfdRknnFaceBackend:
                     blur_variance=quality.blur_variance,
                 )
             )
+        record_inference_timing("postprocess", time.monotonic() - postprocess_started)
         return observations
 
     def detect_faces_batch(

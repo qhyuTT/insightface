@@ -18,6 +18,7 @@ import ctypes.util
 import logging
 import platform
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -25,6 +26,7 @@ from typing import Any, Self
 import numpy as np
 
 from .errors import ModelUnavailableError
+from .inference_timing import record_inference_timing
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +311,9 @@ class RknnModel:
             raise ModelUnavailableError(
                 f"RKNN model must have one input tensor, got {len(self.input_attrs)}"
             )
+        prepare_started = time.monotonic()
         prepared, tensor_type, tensor_format = self._prepare_input(data, self.input_attrs[0])
+        prepare_seconds = time.monotonic() - prepare_started
         input_buffer = ctypes.c_void_p(int(prepared.ctypes.data))
         input_desc = _RknnInput(
             index=0,
@@ -325,13 +329,20 @@ class RknnModel:
             descriptor.is_prealloc = 0
             descriptor.index = index
 
+        lock_started = time.monotonic()
         with self._lock:
+            lock_wait_seconds = time.monotonic() - lock_started
             try:
+                input_started = time.monotonic()
                 self._check_result(
                     runtime.rknn_inputs_set(context, 1, ctypes.byref(input_desc)),
                     "rknn_inputs_set",
                 )
+                input_seconds = time.monotonic() - input_started
+                execute_started = time.monotonic()
                 self._check_result(runtime.rknn_run(context, None), "rknn_run")
+                execute_seconds = time.monotonic() - execute_started
+                output_started = time.monotonic()
                 self._check_result(
                     runtime.rknn_outputs_get(
                         context, len(output_desc), output_desc, None
@@ -339,7 +350,7 @@ class RknnModel:
                     "rknn_outputs_get",
                 )
                 try:
-                    return [self._copy_output(descriptor, info) for descriptor, info in zip(
+                    result = [self._copy_output(descriptor, info) for descriptor, info in zip(
                         output_desc, self.output_attrs, strict=True
                     )]
                 finally:
@@ -347,12 +358,22 @@ class RknnModel:
                         runtime.rknn_outputs_release(context, len(output_desc), output_desc),
                         "rknn_outputs_release",
                     )
+                output_seconds = time.monotonic() - output_started
             except ModelUnavailableError:
                 raise
             except Exception as exc:
                 raise ModelUnavailableError(
                     f"RKNN inference failed for {self.model_path.name}: {exc}"
                 ) from exc
+        for part, seconds in (
+            ("runtime_prepare", prepare_seconds),
+            ("lock_wait", lock_wait_seconds),
+            ("input_copy", input_seconds),
+            ("device_run", execute_seconds),
+            ("output_copy", output_seconds),
+        ):
+            record_inference_timing(part, seconds)
+        return result
 
     def close(self) -> None:
         with self._lock:

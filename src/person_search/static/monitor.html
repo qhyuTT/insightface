@@ -345,7 +345,7 @@
         `${stage} P50/P95/max ${Number(item.stage_p50_latency_ms?.[stage] || 0).toFixed(0)}/${Number(p95).toFixed(0)}/${Number(item.stage_max_latency_ms?.[stage] || 0).toFixed(0)}ms n=${item.stage_sample_counts?.[stage] || 0}`
       ).join(' / ');
       $('stageTimingDiag').textContent = diagnostics.latency_scope === 'per_source'
-        ? (diagnostics.sources || []).map(item => `${item.source_id}: ${stageSummary(item) || '尚无样本'} / 叠框龄P95 ${Number(item.preview_overlay_age_p95_ms || 0).toFixed(0)}ms 过期跳过 ${item.preview_overlay_stale_frames || 0}`).join(' | ')
+        ? (diagnostics.sources || []).map(item => `${item.source_id}: ${stageSummary(item) || '尚无样本'} / ROI轨迹P95 ${Number(item.roi_tracks_per_pass_p95 || 0).toFixed(0)} / 叠框龄P95 ${Number(item.preview_overlay_age_p95_ms || 0).toFixed(0)}ms 过期跳过 ${item.preview_overlay_stale_frames || 0}`).join(' | ')
         : [stageSummary(diagnostics) || countText(latency), countText(rates)].join('  |  ');
       renderRuntimeConditions(diagnostics);
     }
@@ -364,6 +364,7 @@
         body.latency_scope === 'per_source' ? '不含机器人/网络/浏览器延迟' : `解码后→AI完成P95 ${num(body.end_to_end_p95_latency_ms, 0)}ms`,
         body.latency_scope === 'per_source' ? '分辨率见各视频源' : `分辨率 ${body.frame_width || 0}×${body.frame_height || 0}`,
         `ROI ${num(body.roi_calls_per_frame, 2)}次/帧`,
+        body.latency_scope === 'per_source' ? 'ROI轨迹见各视频源' : `ROI轨迹P95 ${num(body.roi_tracks_per_pass_p95, 0)}`,
       ].join('  /  ');
 
       // The confirmation window needs a minimum sampling rate; below it the

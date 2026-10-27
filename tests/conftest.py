@@ -4,6 +4,14 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 import numpy as np
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolated_legacy_auth(monkeypatch):
+    # Explicit test-only baseline; production defaults to authentication enabled.
+    monkeypatch.setenv("PERSON_SEARCH_AUTH_ENABLED", "false")
+
 
 from person_search.domain import Detection, EmbeddingContract, FaceObservation
 

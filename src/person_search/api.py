@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import re
 import time
@@ -17,7 +16,6 @@ from fastapi import (
     FastAPI,
     File,
     Form,
-    Header,
     Request,
     Response,
     UploadFile,
@@ -28,6 +26,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from . import API_VERSION, __version__
+from .auth import ExecutorAuthMiddleware, ExecutorAuthorization
 from .config import Settings, get_settings
 from .domain import SearchCreate, SearchView, SourceConfig, SourceType, TargetView
 from .errors import ModelUnavailableError, PersonSearchError
@@ -43,15 +42,18 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 def create_app(
     settings: Settings | None = None,
     manager: SearchManager | None = None,
+    authorization: ExecutorAuthorization | None = None,
 ) -> FastAPI:
     install_evidence_access_log_filter()
     settings = settings or get_settings()
     manager = manager or SearchManager(settings)
+    authorization = authorization or ExecutorAuthorization(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
         await asyncio.to_thread(manager.shutdown)
+        await authorization.close()
 
     app = FastAPI(
         title="Robot Person Search PoC",
@@ -60,6 +62,25 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.manager = manager
+    app.state.authorization = authorization
+    app.add_middleware(ExecutorAuthMiddleware, authorization=authorization)
+
+    def principal(request: Request | WebSocket):
+        return getattr(request.state, "principal", None)
+
+    @app.get("/livez", include_in_schema=False)
+    async def liveness() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/v1/auth/tickets", include_in_schema=False)
+    async def stream_ticket(request: Request) -> JSONResponse:
+        if not settings.auth_enabled:
+            raise PersonSearchError("tickets require authentication", code="auth_required", status_code=403)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("path"), str):
+            raise PersonSearchError("invalid ticket resource", code="invalid_ticket_resource", status_code=422)
+        result = authorization.issue_ticket(principal(request), body["path"], body.get("purpose"))
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @app.exception_handler(PersonSearchError)
     async def handle_person_search_error(_: Request, exc: PersonSearchError) -> JSONResponse:
@@ -84,6 +105,31 @@ def create_app(
         code = "invalid_source" if _contains_source_validation_error(fields) else "validation_error"
         return _problem(422, code, "request validation failed", fields)
 
+    @app.delete("/v1/leases/{lease_id}/resources", status_code=204, include_in_schema=False)
+    async def release_lease_resources(request: Request, lease_id: str) -> Response:
+        caller = principal(request)
+        if caller is None or caller.lease_id != lease_id:
+            raise PersonSearchError("lease mismatch", code="lease_mismatch", status_code=403)
+        authorization.closing_leases.add(lease_id)
+        searches = [key for key, owner in authorization.search_owners.items() if owner == lease_id]
+        targets = [key for key, owner in authorization.target_owners.items() if owner == lease_id]
+        for search_id in searches:
+            try:
+                await asyncio.to_thread(manager.stop_search, search_id)
+            except PersonSearchError as exc:
+                if exc.status_code != 404:
+                    raise
+        active = await asyncio.to_thread(manager.active_search)
+        if active and authorization.search_owners.get(active.search_id) == lease_id:
+            raise PersonSearchError("search resources not released", code="lease_release_pending", status_code=503)
+        for target_id in targets:
+            await asyncio.to_thread(manager.delete_target, target_id)
+        for search_id in searches:
+            authorization.search_owners.pop(search_id, None)
+        for target_id in targets:
+            authorization.target_owners.pop(target_id, None)
+        return Response(status_code=204)
+
     @app.get("/healthz")
     async def health() -> dict[str, Any]:
         active = await asyncio.to_thread(manager.active_search)
@@ -94,10 +140,14 @@ def create_app(
             "request_lookup",
             "event_replay",
         ]
-        if settings.evidence_api_key:
+        if settings.auth_enabled:
             capabilities.append("confirmed_evidence_v1")
+        if settings.auth_enabled:
+            capabilities.extend(["jwt_auth_v1", "lease_ownership_v1", "stream_tickets_v1"])
         return {
             "status": "ok",
+            "executor_id": settings.executor_id,
+            "capacity": 1,
             "package_version": __version__,
             "api_version": API_VERSION,
             "build_revision": settings.build_revision,
@@ -120,10 +170,12 @@ def create_app(
     @app.get("/monitor", response_class=HTMLResponse, include_in_schema=False)
     async def monitor() -> HTMLResponse:
         page = Path(__file__).with_name("static").joinpath("monitor.html").read_text()
-        return HTMLResponse(page)
+        settings_script = f"<script>window.executorIdentity={json.dumps(settings.executor_id)};window.executorAuthEnabled={json.dumps(settings.auth_enabled)};</script>"
+        return HTMLResponse(page.replace("</head>", settings_script + "</head>"), headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     @app.post("/v1/targets", response_model=TargetView, status_code=201)
     async def create_target(
+        request: Request,
         name: Annotated[str, Form(min_length=1, max_length=80)],
         image: Annotated[UploadFile, File()],
     ) -> TargetView:
@@ -148,15 +200,23 @@ def create_app(
             raise PersonSearchError(
                 "decoded image exceeds the pixel limit", code="image_too_large", status_code=413
             )
-        return await asyncio.to_thread(manager.enroll, frame, name)
+        target = await asyncio.to_thread(manager.enroll, frame, name)
+        authorization.bind(principal(request), "target", target.target_id)
+        return target
 
     @app.delete("/v1/targets/{target_id}", status_code=204)
-    async def delete_target(target_id: str) -> Response:
+    async def delete_target(request: Request, target_id: str) -> Response:
+        authorization.own(principal(request), "target", target_id)
         await asyncio.to_thread(manager.delete_target, target_id)
         return Response(status_code=204)
 
     @app.post("/v1/searches", response_model=SearchView, status_code=201)
-    async def create_search(request: SearchCreate) -> SearchView:
+    async def create_search(http_request: Request, request: SearchCreate) -> SearchView:
+        authorization.own(principal(http_request), "target", request.target_id)
+        if settings.auth_enabled and request.replace_active:
+            active = await asyncio.to_thread(manager.active_search)
+            if active is not None:
+                authorization.own(principal(http_request), "search", active.search_id)
         selected_sources = request.sources or [request.source]
         for selected_source in selected_sources:
             assert selected_source is not None
@@ -174,7 +234,7 @@ def create_app(
                         code="invalid_source",
                         status_code=422,
                     )
-        return await asyncio.to_thread(
+        search = await asyncio.to_thread(
             manager.start_batch_search,
             [request.target_id],
             request.sources or request.source,
@@ -182,9 +242,12 @@ def create_app(
             request.replace_active,
             request.request_id,
         )
+        authorization.bind(principal(http_request), "search", search.search_id)
+        return search
 
     @app.post("/v1/batch-searches", response_model=SearchView, status_code=201)
     async def create_batch_search(
+        request: Request,
         targets: Annotated[str, Form()],
         source: Annotated[str, Form()],
         images: Annotated[list[UploadFile], File()],
@@ -306,7 +369,8 @@ def create_app(
                 frame = await _decode_upload(image)
                 target = await asyncio.to_thread(manager.enroll, frame, spec["name"])
                 enrolled_ids.append(target.target_id)
-            return await asyncio.to_thread(
+                authorization.bind(principal(request), "target", target.target_id)
+            search = await asyncio.to_thread(
                 manager.start_batch_search,
                 enrolled_ids,
                 request_source,
@@ -314,6 +378,8 @@ def create_app(
                 False,
                 None,
             )
+            authorization.bind(principal(request), "search", search.search_id)
+            return search
         except Exception:
             for target_id in enrolled_ids:
                 try:
@@ -323,39 +389,38 @@ def create_app(
             raise
 
     @app.get("/v1/searches/active", response_model=SearchView | None)
-    async def active_search() -> SearchView | None:
-        return await asyncio.to_thread(manager.active_search)
+    async def active_search(request: Request) -> SearchView | None:
+        search = await asyncio.to_thread(manager.active_search)
+        if search:
+            authorization.own(principal(request), "search", search.search_id)
+        return search
 
     @app.get("/v1/searches/by-request/{request_id}", response_model=SearchView | None)
-    async def search_by_request(request_id: str) -> SearchView | None:
-        return await asyncio.to_thread(manager.search_by_request_id, request_id)
+    async def search_by_request(request: Request, request_id: str) -> SearchView | None:
+        search = await asyncio.to_thread(manager.search_by_request_id, request_id)
+        if search:
+            authorization.own(principal(request), "search", search.search_id)
+        return search
 
     @app.get("/v1/searches/{search_id}", response_model=SearchView)
-    async def get_search(search_id: str) -> SearchView:
+    async def get_search(request: Request, search_id: str) -> SearchView:
+        authorization.own(principal(request), "search", search_id)
         return await asyncio.to_thread(manager.get_search, search_id)
 
     @app.get("/v1/searches/{search_id}/evidence/{evidence_id}")
     async def get_evidence(
+        request: Request,
         search_id: str,
         evidence_id: str,
         variant: str = "face_crop",
-        x_api_key: Annotated[str | None, Header()] = None,
     ) -> Response:
         """Fetch a short-lived, in-memory confirmation image.
 
         The opaque id is delivered only in a confirmed event.  No image is
         embedded in events or written to a file, log, or persistence layer.
         """
-        if not settings.evidence_api_key:
-            raise PersonSearchError(
-                "evidence retrieval is not configured",
-                code="evidence_access_not_configured",
-                status_code=503,
-            )
-        if not _api_key_matches(x_api_key, settings.evidence_api_key):
-            raise PersonSearchError(
-                "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
-            )
+        caller = _evidence_principal(request, authorization, settings.auth_enabled, "evidence:read")
+        authorization.own(caller, "search", search_id)
         payload, media_type = await asyncio.to_thread(
             manager.get_session(search_id).get_evidence, evidence_id, variant
         )
@@ -367,21 +432,13 @@ def create_app(
 
     @app.delete("/v1/searches/{search_id}/evidence/{evidence_id}", status_code=204)
     async def release_evidence(
+        request: Request,
         search_id: str,
         evidence_id: str,
-        x_api_key: Annotated[str | None, Header()] = None,
     ) -> Response:
         """Acknowledge durable downstream storage and release in-memory JPEGs."""
-        if not settings.evidence_api_key:
-            raise PersonSearchError(
-                "evidence retrieval is not configured",
-                code="evidence_access_not_configured",
-                status_code=503,
-            )
-        if not _api_key_matches(x_api_key, settings.evidence_api_key):
-            raise PersonSearchError(
-                "invalid evidence API key", code="invalid_evidence_api_key", status_code=403
-            )
+        caller = _evidence_principal(request, authorization, settings.auth_enabled, "evidence:release")
+        authorization.own(caller, "search", search_id)
         await asyncio.to_thread(
             manager.get_session(search_id).release_evidence,
             evidence_id,
@@ -393,7 +450,8 @@ def create_app(
         response_class=StreamingResponse,
         responses={200: {"content": {"multipart/x-mixed-replace": {}}}},
     )
-    async def preview_search(search_id: str, source_id: str = "source-1") -> StreamingResponse:
+    async def preview_search(request: Request, search_id: str, source_id: str = "source-1") -> StreamingResponse:
+        authorization.own(principal(request), "search", search_id)
         session = manager.get_session(search_id)
         preview = session.preview_for(source_id) if hasattr(session, "preview_for") else session.preview
 
@@ -404,6 +462,8 @@ def create_app(
             preview.subscribe()
             try:
                 while True:
+                    if settings.auth_enabled and not await authorization.is_active(principal(request)):
+                        return
                     seq, jpeg = await asyncio.to_thread(preview.after, seq, 1.0)
                     if jpeg is not None:
                         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
@@ -419,20 +479,23 @@ def create_app(
         )
 
     @app.delete("/v1/searches/active", status_code=204)
-    async def delete_active_search() -> Response:
+    async def delete_active_search(request: Request) -> Response:
         active = await asyncio.to_thread(manager.active_search)
         if active is not None:
+            authorization.own(principal(request), "search", active.search_id)
             await asyncio.to_thread(manager.stop_search, active.search_id)
         return Response(status_code=204)
 
     @app.delete("/v1/searches/{search_id}", status_code=204)
-    async def delete_search(search_id: str) -> Response:
+    async def delete_search(request: Request, search_id: str) -> Response:
+        authorization.own(principal(request), "search", search_id)
         await asyncio.to_thread(manager.stop_search, search_id)
         return Response(status_code=204)
 
     @app.websocket("/v1/searches/{search_id}/events")
     async def search_events(websocket: WebSocket, search_id: str, after_seq: int = 0) -> None:
         try:
+            authorization.own(principal(websocket), "search", search_id)
             session = manager.get_session(search_id)
         except PersonSearchError:
             await websocket.close(code=1008, reason="search not found")
@@ -441,6 +504,9 @@ def create_app(
         seq = max(0, after_seq)
         try:
             while True:
+                if settings.auth_enabled and not await authorization.is_active(principal(websocket)):
+                    await websocket.close(code=1008, reason="access denied")
+                    return
                 replay = getattr(session.events, "after_with_meta", None)
                 if replay is not None:
                     events, gap, oldest_seq = await asyncio.to_thread(replay, seq, 1.0)
@@ -483,20 +549,18 @@ def _problem(status: int, code: str, message: str, fields: Any = None) -> JSONRe
     return JSONResponse(status_code=status, content={"detail": detail})
 
 
-def _api_key_matches(provided: str | None, expected: str | None) -> bool:
-    """Compare header credentials without leaking timing or raising on Unicode.
-
-    ``hmac.compare_digest`` only accepts ASCII ``str`` values.  Configuration is
-    intentionally allowed to contain Unicode (headers are decoded as text by
-    Starlette), so compare canonical UTF-8 bytes instead and fail closed for
-    absent credentials.
-    """
-    if not isinstance(provided, str) or not isinstance(expected, str) or not provided or not expected:
-        return False
-    try:
-        return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
-    except (UnicodeError, TypeError):
-        return False
+def _evidence_principal(request: Request, authorization, auth_enabled: bool, permission: str):
+    if not auth_enabled:
+        raise PersonSearchError(
+            "evidence access requires executor JWT authentication",
+            code="auth_required",
+            status_code=503,
+        )
+    caller = getattr(request.state, "principal", None)
+    if caller is None:
+        raise PersonSearchError("access denied", code="invalid_token", status_code=401)
+    authorization.require(caller, permission, write=permission == "evidence:release")
+    return caller
 
 
 # Validation messages are generated from third-party/Pydantic errors.  Never

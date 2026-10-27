@@ -1,5 +1,9 @@
 # EIS100 RK3588 原生部署
 
+认证升级：默认启用调度平台 RS256/JWKS，配置见[统一认证](authentication.md)。
+启动发布需要 `RK3588_REMOTE_PROBE_TOKEN_FILE`，指向目标机 owner-only 的新签发执行器
+JWT 文件；匿名 `/livez` 只表示存活，随后强制验证受保护 readiness 才报告完成。
+
 本文是 RKNN-only 原生部署路径，不是 2026-10-15 的线上部署。当前线上使用
 RPP BF16 + RKNN 的 `box-confirm-20261015-v1` 容器；现状、单路实测和回滚见
 [当前技术方案](technical-solution-20261015.md) 与 [项目记忆](project-memory.md)。

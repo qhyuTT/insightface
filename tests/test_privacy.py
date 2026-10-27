@@ -52,3 +52,12 @@ def test_console_entrypoint_keeps_the_filter_after_uvicorn_configures_logging() 
         "()": "person_search.privacy.EvidenceAccessLogFilter"
     }
     assert config["handlers"]["access"]["filters"] == ["evidence_access"]
+
+
+def test_stream_ticket_is_redacted_from_access_log():
+    record = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s", (
+        "GET /v1/searches/example/preview.mjpg?source_id=source-1&ticket=private-ticket HTTP/1.1",
+    ), None)
+    EvidenceAccessLogFilter().filter(record)
+    assert "private-ticket" not in record.getMessage()
+    assert "ticket=[redacted]" in record.getMessage()

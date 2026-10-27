@@ -1,12 +1,13 @@
-"""Fail the container health check unless the dispatch API contract is ready."""
+"""Check liveness by default; authenticated readiness requires a fresh JWT file."""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
+from pathlib import Path
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 _REQUIRED_CAPABILITIES = frozenset(
     {
@@ -20,8 +21,11 @@ _REQUIRED_CAPABILITIES = frozenset(
 )
 
 
-def _get_json(base_url: str, path: str) -> dict[str, object]:
-    with urlopen(f"{base_url}{path}", timeout=5) as response:
+def _get_json(base_url: str, path: str, token: str = "") -> dict[str, object]:
+    request = Request(f"{base_url}{path}")
+    if token:
+        request.add_header("Authorization", "Bearer " + token)
+    with urlopen(request, timeout=5) as response:
         payload = json.load(response)
     if not isinstance(payload, dict):
         raise TypeError(f"{path} returned a non-object response")
@@ -32,8 +36,24 @@ def main() -> int:
     port = os.environ.get("PERSON_SEARCH_PORT", "18080")
     base_url = f"http://127.0.0.1:{port}"
     try:
-        health = _get_json(base_url, "/healthz")
-        readiness = _get_json(base_url, "/readyz")
+        token_file = os.environ.get("PERSON_SEARCH_PROBE_TOKEN_FILE")
+        if not token_file:
+            if "--require-ready" in sys.argv:
+                print("readiness requires a fresh protected probe token file", file=sys.stderr)
+                return 1
+            live = _get_json(base_url, "/livez")
+            if live.get("status") != "ok":
+                return 1
+            print("executor alive; provider readiness and authentication are not checked")
+            return 0
+        protected = Path(token_file)
+        if protected.stat().st_mode & 0o077:
+            raise ValueError("probe token file must be owner-only")
+        token = protected.read_text().strip()
+        if not token or len(token) > 16384 or any(character.isspace() for character in token):
+            raise ValueError("invalid probe token")
+        health = _get_json(base_url, "/healthz", token)
+        readiness = _get_json(base_url, "/readyz", token)
     except (OSError, URLError, ValueError, TypeError) as exc:
         print(f"executor health contract unavailable: {type(exc).__name__}", file=sys.stderr)
         return 1

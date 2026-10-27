@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,10 +68,25 @@ class Settings(BaseSettings):
     port: int = Field(default=8000, ge=1, le=65535)
     log_level: str = "info"
     build_revision: str = Field(default="unknown", min_length=1, max_length=128, pattern=r"^\S+$")
-    # Evidence is intentionally an opt-in, short-lived in-memory hand-off. The
-    # executor does not expose a face image unless its caller configured a
-    # separate shared credential.
-    evidence_api_key: str | None = Field(default=None, max_length=256, repr=False)
+    executor_id: str = Field(default="executor-01", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    auth_enabled: bool = True
+    auth_issuer: str = ""
+    auth_jwks_url: str = ""
+    auth_status_url: str = ""
+    auth_audience: str = ""
+    auth_ca_file: Path | None = None
+
+    @field_validator("auth_jwks_url", "auth_status_url")
+    @classmethod
+    def validate_auth_endpoint(cls, value: str) -> str:
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("authentication endpoints must be fixed HTTPS URLs without credentials")
+        return value
+
+    # Evidence is a short-lived in-memory hand-off exposed only through scoped JWTs.
     evidence_ttl_seconds: float = Field(default=600.0, gt=0, le=3600)
 
     insightface_model: str = "buffalo_l"
@@ -302,17 +318,6 @@ class Settings(BaseSettings):
     terminal_session_ttl_seconds: float = Field(default=600.0, gt=0, le=86400)
     max_retained_sessions: int = Field(default=100, ge=1, le=10000)
     max_enrolled_targets: int = Field(default=100, ge=1, le=10000)
-
-    @field_validator("evidence_api_key")
-    @classmethod
-    def validate_evidence_api_key(cls, value: str | None) -> str | None:
-        """Keep the optional header credential safe to compare and transport."""
-        if value is None or value == "":
-            # An empty environment override has historically meant "disabled".
-            return value
-        if any(ord(char) < 0x21 or ord(char) == 0x7F for char in value):
-            raise ValueError("evidence_api_key must not contain whitespace or control characters")
-        return value
 
     @model_validator(mode="after")
     def apply_match_profile(self) -> Self:

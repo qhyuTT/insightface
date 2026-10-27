@@ -7,6 +7,10 @@
 事项和建议演进；历史 T4、RKNN-only、4K 和双路实验不作为当前性能承诺。现场快照与回滚索引
 见 [项目记忆](project-memory.md)。
 
+认证部分已于 2026-10-26 升级：本文下方旧证据 API Key 描述仅代表 10-15 快照，不再适用于
+当前配置。现在只接受调度平台签发、带执行器与租约 scope 的 JWT，详见
+[统一认证文档](authentication.md)。
+
 ## 1. 目标与范围
 
 系统接收目标登记照，在机器人上传的视频中检测、跟踪和识别目标，以同一轨迹的多帧证据确认
@@ -229,18 +233,19 @@ H.265。本次约 6.8 Mbps，对应原视频约 2 Mbps。更换压缩视频预�
 | `GET /v1/searches/{search_id}` | 指定会话状态 |
 | `GET /v1/searches/{search_id}/preview.mjpg` | 预览；多源可指定 source_id |
 | `WS /v1/searches/{search_id}/events` | 识别状态事件 |
-| `GET/DELETE /v1/searches/{search_id}/evidence/{evidence_id}` | 受独立密钥保护的短期证据读取/释放 |
+| `GET/DELETE /v1/searches/{search_id}/evidence/{evidence_id}` | 由任务租约 JWT scope 保护的短期证据读取/释放 |
 | `DELETE /v1/searches/active` 或 `/v1/searches/{search_id}` | 停止搜索 |
 
 使用 Uvicorn 单 worker：目标、会话与特征在内存中，直接增加 worker 会造成状态分裂。
 请求幂等、替换会话、停止超时和任务终态均需保持生命周期一致。停止未完成时不能提前释放
 活动槽位或宣称清理成功。
 
-RTSP 凭据对外脱敏；证据接口使用 `X-API-Key` 独立校验，提供短期内存证据与显式释放。
+RTSP 凭据对外脱敏；证据接口使用 `evidence:read` / `evidence:release` JWT scope，提供
+短期内存证据与显式释放。
 调度如何持久化已授权证据属于它自己的边界。诊断不保存真人帧、登记照、embedding 或证据为
 本地素材，日志不包含密钥或完整保护配置。
 
-HTTPS 页面认证、ZLM 管理入口 Basic Auth、ZLM API secret 与证据 API key 各有职责，不能
+HTTPS 页面认证、ZLM 管理入口 Basic Auth、ZLM API secret 与执行器 JWT 各有职责，不能
 混用。`/mediaserver/` 管理页账号不能直接当作 ZLM 原生 API secret。
 
 ## 9. 部署基线与发布步骤

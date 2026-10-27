@@ -24,6 +24,8 @@ def test_health_does_not_load_models() -> None:
     with client_with_face() as client:
         assert client.get("/healthz").json() == {
             "status": "ok",
+            "executor_id": "executor-01",
+            "capacity": 1,
             "package_version": __version__,
             "api_version": API_VERSION,
             "build_revision": "unknown",
@@ -292,71 +294,25 @@ def test_search_can_be_reconciled_by_request_id_after_terminal_state(monkeypatch
         assert missing.json() is None
 
 
-def test_evidence_endpoint_requires_key_and_never_sets_cache_headers() -> None:
-    class EvidenceSession:
-        def __init__(self) -> None:
-            self.releases: list[str] = []
-
-        def get_evidence(self, evidence_id: str, variant: str) -> tuple[bytes, str]:
-            assert evidence_id == "opaque-evidence-id"
-            assert variant == "face_crop"
-            return b"jpeg-evidence", "image/jpeg"
-
-        def release_evidence(self, evidence_id: str) -> None:
-            self.releases.append(evidence_id)
-
-    evidence_session = EvidenceSession()
-
-    class EvidenceManager:
-        def get_session(self, search_id: str) -> EvidenceSession:
-            assert search_id == "search-evidence"
-            return evidence_session
-
-        def shutdown(self) -> None:
-            pass
-
-    settings = Settings(evidence_api_key="test-evidence-key")
-    with TestClient(create_app(settings, EvidenceManager())) as client:  # type: ignore[arg-type]
-        rejected = client.get("/v1/searches/search-evidence/evidence/opaque-evidence-id")
-        assert rejected.status_code == 403
-        rejected_delete = client.delete(
-            "/v1/searches/search-evidence/evidence/opaque-evidence-id"
-        )
-        assert rejected_delete.status_code == 403
-
-        response = client.get(
-            "/v1/searches/search-evidence/evidence/opaque-evidence-id",
-            headers={"X-API-Key": "test-evidence-key"},
-        )
-        released = client.delete(
-            "/v1/searches/search-evidence/evidence/opaque-evidence-id",
-            headers={"X-API-Key": "test-evidence-key"},
-        )
-    assert response.status_code == 200
-    assert response.content == b"jpeg-evidence"
-    assert response.headers["content-type"] == "image/jpeg"
-    assert response.headers["cache-control"] == "no-store"
-    assert released.status_code == 204
-    assert evidence_session.releases == ["opaque-evidence-id"]
-
-
-def test_evidence_endpoint_is_unavailable_when_server_key_is_not_configured() -> None:
-    with client_with_face() as client:
+def test_evidence_is_unavailable_without_jwt_auth_even_with_obsolete_key_header() -> None:
+    settings = Settings(auth_enabled=False)
+    manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
+    with TestClient(create_app(settings, manager)) as client:
         response = client.get(
             "/v1/searches/unknown/evidence/unknown",
-            headers={"X-API-Key": "caller-key"},
+            headers={"X-API-Key": "obsolete-test-key"},
         )
         released = client.delete(
             "/v1/searches/unknown/evidence/unknown",
-            headers={"X-API-Key": "caller-key"},
+            headers={"X-API-Key": "obsolete-test-key"},
         )
     assert response.status_code == released.status_code == 503
-    assert response.json()["detail"]["code"] == "evidence_access_not_configured"
-    assert released.json()["detail"]["code"] == "evidence_access_not_configured"
+    assert response.json()["detail"]["code"] == "auth_required"
+    assert released.json()["detail"]["code"] == "auth_required"
 
 
-def test_health_advertises_confirmed_evidence_only_when_configured() -> None:
-    settings = Settings(evidence_api_key="test-evidence-key")
+def test_health_does_not_advertise_evidence_when_authentication_is_disabled() -> None:
+    settings = Settings(auth_enabled=False)
     manager = SearchManager(settings, FakeFaceBackend([make_face()]), FakePersonDetector())
     with TestClient(create_app(settings, manager)) as client:
         capabilities = client.get("/healthz").json()["capabilities"]
@@ -366,5 +322,4 @@ def test_health_advertises_confirmed_evidence_only_when_configured() -> None:
         "search_timeout",
         "request_lookup",
         "event_replay",
-        "confirmed_evidence_v1",
     }

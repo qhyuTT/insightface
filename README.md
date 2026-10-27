@@ -1,3 +1,7 @@
+> 认证升级：生产默认启用调度平台 RS256/JWKS 认证，旧匿名调用示例需添加对应 Bearer Token。
+> 部署、监控页和健康探针的新契约见 [统一认证](docs/authentication.md)。匿名 `/livez`
+> 只说明进程存活；`/healthz`、`/readyz` 与所有业务接口均需认证。
+
 # Robot Person Search PoC
 
 用一张目标照片，在 RTSP 或 USB 摄像头视频中实时寻找目标人物的 PoC。系统使用行人检测与跟踪维持轨迹，只用多帧人脸证据确认身份，避免拥挤场景中单帧误认直接触发机器人动作。
@@ -341,11 +345,12 @@ uv run person-search-api
 
 ### 安全边界（重要）
 
-默认监听 loopback 是有意的安全边界。当前没有全局 API 认证：除证据下载与释放接口（配置
-`PERSON_SEARCH_EVIDENCE_API_KEY` 后才受 `X-API-Key` 保护）外，目标登记、搜索创建/停止、
-MJPEG 预览、WebSocket 事件、监控页和文档都可以匿名访问。不要把服务端口直接暴露到公网或
-不受控局域网；需要绑定 `0.0.0.0` 时，必须放在反向代理/API gateway 或 mTLS 后，并用
-防火墙/网络 ACL 限制调用方。证据 API key 只保护证据接口，不是全局凭据。
+默认监听 loopback 是有意的安全边界。生产环境默认启用调度平台 RS256/JWKS 认证；除
+`/livez` 和不含业务数据的监控页外，健康、就绪、目标、搜索、预览、事件与证据接口均需
+执行器和资源范围匹配的 Bearer JWT。读取证据要求 `evidence:read`，释放证据要求
+`evidence:release` 与对应任务租约。关闭认证仅可用于隔离开发环境，且证据接口会拒绝服务。
+生产部署必须固定 issuer、JWKS、状态校验地址和唯一执行器 ID，不能把该端口暴露给不受信任
+网络。详见[统一认证文档](docs/authentication.md)。
 
 RTSP source 为支持本地隧道和摄像头网段，允许 loopback、私网及任意可解析的主机名。这也
 意味着未受信调用方可能诱导服务访问内网地址（SSRF/端口探测）。只接受受信控制面提交的
@@ -436,7 +441,7 @@ FFmpeg 占用摄像头期间，搜索请求应使用 RTSP source，不能同时�
 - `GET /v1/searches/{search_id}`：查询状态、provider、FPS、P95 延迟和累计人脸诊断计数。
 - `GET /v1/searches/{search_id}/preview.mjpg`：获取后端画框后的实时 MJPEG 预览。
 - `WS /v1/searches/{search_id}/events?after_seq=0`：订阅 `candidate`、`confirmed`、`lost` 和 `search_status`。
-- `GET /v1/searches/{search_id}/evidence/{evidence_id}?variant=face_crop`：在命中后拉取短时有效的命中人脸裁剪；`variant=frame` 可拉取同一时刻原始帧。请求必须带 `X-API-Key`，并配置 `PERSON_SEARCH_EVIDENCE_API_KEY`。
+- `GET /v1/searches/{search_id}/evidence/{evidence_id}?variant=face_crop`：调度器在命中后使用任务租约 JWT 和 `evidence:read` 拉取短时证据；`variant=frame` 同样受保护。不要手动下载或保存证据图片。
 - `DELETE /v1/searches/{search_id}`：停止任务并清除登记数据。
 
 搜索请求示例：
@@ -488,11 +493,15 @@ curl -X POST http://127.0.0.1:8000/v1/batch-searches \
 
 ### 命中证据交接
 
-正式 `confirmed`（及其后续的 `target_found`）事件可能带有不透明的 `data.evidence_id`。执行器仅把
-对应的 JPEG 原始帧和人脸裁剪保存在进程内存，默认最长 600 秒；证据绝不写入日志、事件 payload、磁盘或数据库。
-控制面可在收到 `confirmed` 后使用其共享密钥拉取裁剪，随后自行按隐私策略加密保存，并调用同一路径的 `DELETE` 确认释放。自动完成（`completed`）时证据会保留到 TTL；显式停止、超时或失败时立即清空。`GET /v1/searches/{search_id}` 的 `confirmed_results` 可作为事件漏收时的可靠查询源，其中的 `evidence_available` 表示该条裁剪此刻是否仍可下载。
+认证启用时，正式 `confirmed`（及其后续的 `target_found`）事件可能带有不透明的
+`data.evidence_id`。执行器仅把 JPEG 原始帧和人脸裁剪保存在进程内存，默认最长 600 秒；
+证据绝不写入日志、事件 payload、磁盘或数据库。调度器收到事件后使用任务租约 JWT 和
+`evidence:read` 拉取，再由 Dispatch 按既定隐私策略加密保存到 MariaDB，并使用
+`evidence:release` 确认释放。不要手动下载或另存图片。自动完成时证据保留到 TTL；显式停止、
+超时或失败时立即清空。`GET /v1/searches/{search_id}` 的 `confirmed_results` 可作为事件
+漏收时的可靠查询源，其中的 `evidence_available` 表示裁剪此刻是否仍可读取。
 
-`confirmed` 事件同时带 `face_bbox`（人脸检测框）与 `bbox`（人体跟踪框），两者都是归一化坐标；裁剪取自 `face_bbox`。未配置 `PERSON_SEARCH_EVIDENCE_API_KEY` 时不会编码任何图片，事件里也不会出现 `evidence_id`。
+`confirmed` 事件同时带 `face_bbox`（人脸检测框）与 `bbox`（人体跟踪框），两者都是归一化坐标；裁剪取自 `face_bbox`。关闭 JWT 认证时不会生成证据图片，事件里也不会出现 `evidence_id`。
 
 取图与释放的失败语义各不相同，调用方必须区别对待：
 
@@ -502,14 +511,9 @@ curl -X POST http://127.0.0.1:8000/v1/batch-searches \
 | 404 | `evidence_released` | 已被自己的 `DELETE` 释放 | 否（幂等成功） |
 | 410 | `evidence_expired` | 超过 TTL | 否 |
 | 410 | `evidence_discarded` | 随搜索显式停止/超时/失败被清空 | 否 |
-| 403 | `invalid_evidence_api_key` | 密钥不匹配 | 否 |
-| 503 | `evidence_access_not_configured` | 执行器未配置密钥 | 否 |
-
-```bash
-curl -H "X-API-Key: $PERSON_SEARCH_EVIDENCE_API_KEY" \
-  'http://127.0.0.1:8000/v1/searches/SEARCH_ID/evidence/EVIDENCE_ID?variant=face_crop' \
-  --output matched-face.jpg
-```
+| 401 | `invalid_token` | JWT 无效或已撤销 | 重新签发有效 JWT 后重试 |
+| 403 | `insufficient_scope` / `lease_mismatch` | JWT scope 或任务租约不匹配 | 否；由调度端核对租约归属 |
+| 503 | `auth_unavailable` / `auth_required` | 身份服务不可用，或本实例未启用 JWT | 恢复身份服务或在受控部署中启用统一认证 |
 
 ## 离线视频验证
 

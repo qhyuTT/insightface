@@ -37,9 +37,9 @@ T4_ORT_CUDA_DEVICE_ID="${T4_ORT_CUDA_DEVICE_ID:-}"
 T4_HEALTH_ATTEMPTS="${T4_HEALTH_ATTEMPTS:-30}"
 T4_HEALTH_INTERVAL_SECONDS="${T4_HEALTH_INTERVAL_SECONDS:-2}"
 T4_READY_TIMEOUT_SECONDS="${T4_READY_TIMEOUT_SECONDS:-900}"
-# Enables GET /v1/searches/{id}/evidence/{id}. Must match the dispatch platform's
-# DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY, or every confirmed hit loses its face crop.
-T4_EVIDENCE_API_KEY="${T4_EVIDENCE_API_KEY:-}"
+T4_AUTH_ENV_FILE="${T4_AUTH_ENV_FILE:-}"
+T4_PROBE_TOKEN_FILE="${T4_PROBE_TOKEN_FILE:-}"
+T4_AUTH_CA_FILE="${T4_AUTH_CA_FILE:-}"
 # conservative keeps the calibrated far-face bar; responsive trades false-accept
 # headroom for a faster verdict and should wait for a calibrated threshold.
 # transit additionally shortens the far-face window and the gap between samples,
@@ -323,6 +323,9 @@ if [[ -n "${T4_YOLOX_MODEL_URL}" ]]; then
   build_args+=(--build-arg "YOLOX_MODEL_URL=${T4_YOLOX_MODEL_URL}")
 fi
 
+[[ -n "${T4_AUTH_ENV_FILE}" && -r "${T4_AUTH_ENV_FILE}" ]] || fail "T4_AUTH_ENV_FILE must identify a readable protected JWT trust configuration"
+[[ -n "${T4_PROBE_TOKEN_FILE}" && -r "${T4_PROBE_TOKEN_FILE}" ]] || fail "T4_PROBE_TOKEN_FILE must identify a readable owner-only fresh executor JWT"
+
 log "Building ${T4_IMAGE_NAME}"
 docker build "${build_args[@]}" --tag "${T4_IMAGE_NAME}" .
 
@@ -335,10 +338,6 @@ log "Checking NVIDIA Container Toolkit"
 docker run --rm --gpus all --entrypoint nvidia-smi "${T4_IMAGE_NAME}" >/dev/null
 
 docker volume create "${T4_MODEL_VOLUME}" >/dev/null
-
-if [[ -z "${T4_EVIDENCE_API_KEY}" ]]; then
-  log "WARNING: T4_EVIDENCE_API_KEY is empty; the confirmed-hit evidence endpoint will return 503"
-fi
 
 # Keep environment construction in one place. The candidate deliberately binds
 # loopback only; production uses T4_BIND_HOST after the candidate passes checks.
@@ -354,8 +353,16 @@ container_env_args() {
     --env "PERSON_SEARCH_FACE_DETECTION_EXTRA_SCALE_CUDA=${T4_FACE_DETECTION_EXTRA_SCALE}"
     --env "PERSON_SEARCH_MATCH_PROFILE=${T4_MATCH_PROFILE}"
     --env "PERSON_SEARCH_DEPARTURE_ADJUDICATION_ENABLED=${T4_DEPARTURE_ADJUDICATION}"
-    --env "PERSON_SEARCH_EVIDENCE_API_KEY=${T4_EVIDENCE_API_KEY}"
   )
+  if [[ -n "${T4_AUTH_ENV_FILE}" ]]; then
+    CONTAINER_ENV_ARGS+=(--env-file "${T4_AUTH_ENV_FILE}")
+  fi
+  if [[ -n "${T4_AUTH_CA_FILE}" ]]; then
+    CONTAINER_ENV_ARGS+=(--volume "${T4_AUTH_CA_FILE}:/run/dispatch-ca.crt:ro" --env "PERSON_SEARCH_AUTH_CA_FILE=/run/dispatch-ca.crt")
+  fi
+  if [[ -n "${T4_PROBE_TOKEN_FILE}" ]]; then
+    CONTAINER_ENV_ARGS+=(--volume "${T4_PROBE_TOKEN_FILE}:/run/executor-probe.jwt:ro" --env "PERSON_SEARCH_PROBE_TOKEN_FILE=/run/executor-probe.jwt")
+  fi
   if [[ -n "${T4_ORT_INTRA_OP_NUM_THREADS}" ]]; then
     CONTAINER_ENV_ARGS+=(--env "PERSON_SEARCH_ORT_INTRA_OP_NUM_THREADS=${T4_ORT_INTRA_OP_NUM_THREADS}")
   fi
@@ -394,7 +401,7 @@ wait_for_health() {
       break
     fi
     if docker exec "${name}" python -c \
-      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/healthz', timeout=2).read()" \
+      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/livez', timeout=2).read()" \
       >/dev/null 2>&1; then
       ready=1
       break
@@ -415,11 +422,19 @@ verify_readiness() {
 import json
 import sys
 import urllib.request
+import os
+from pathlib import Path
 
 port, expected_revision, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
-with urllib.request.urlopen(
-    f"http://127.0.0.1:{port}/readyz", timeout=timeout
-) as response:
+token_file = os.environ.get("PERSON_SEARCH_PROBE_TOKEN_FILE")
+if not token_file:
+    raise SystemExit("readiness requires PERSON_SEARCH_PROBE_TOKEN_FILE with a fresh executor JWT")
+protected = Path(token_file)
+if protected.stat().st_mode & 0o077:
+    raise SystemExit("probe token file must be owner-only")
+token = protected.read_text().strip()
+request = urllib.request.Request(f"http://127.0.0.1:{port}/readyz", headers={"Authorization": "Bearer " + token})
+with urllib.request.urlopen(request, timeout=timeout) as response:
     payload = json.load(response)
 
 assert payload.get("status") == "ready", payload
@@ -448,7 +463,7 @@ wait_for_rollback() {
       break
     fi
     if docker exec "${name}" python -c \
-      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/healthz', timeout=2).read()" \
+      "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/livez', timeout=2).read()" \
       >/dev/null 2>&1; then
       ready=1
       break
@@ -469,6 +484,12 @@ previous_port="${T4_PORT}"
 existing_state=""
 if [[ -n "${existing_container_id}" ]]; then
   existing_state="$(docker inspect --format '{{.State.Running}}' "${T4_CONTAINER_NAME}" 2>/dev/null || true)"
+  # Never automatically restore an anonymous legacy control plane after the
+  # authentication cutover. First upgrade is a maintenance-window migration.
+  if [[ "${existing_state}" == "true" ]] && ! docker exec "${T4_CONTAINER_NAME}" python -c \
+    'from person_search.auth import ExecutorAuthorization; from person_search.config import Settings; assert Settings().auth_enabled' >/dev/null 2>&1; then
+    fail "Existing service lacks enabled JWT authentication; perform the first cutover in a maintenance window with the legacy service stopped"
+  fi
   previous_port="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
     "${T4_CONTAINER_NAME}" 2>/dev/null | awk -F= '$1 == "PERSON_SEARCH_PORT" { print $2; exit }' || true)"
   [[ -n "${previous_port}" ]] || previous_port="${T4_PORT}"
@@ -500,9 +521,9 @@ rollback_on_exit() {
       if [[ "${old_was_running}" == "1" ]]; then
         docker start "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
         if wait_for_rollback "${T4_CONTAINER_NAME}" "${previous_port}"; then
-          log "Previous container passed rollback health/provider checks"
+          log "Previous authenticated container is alive; verify readiness before reopening traffic"
         else
-          log "ERROR: previous container was restored but failed rollback health/provider checks" >&2
+          log "ERROR: previous container was restored but failed rollback liveness checks" >&2
           [[ "${status}" -eq 0 ]] && status=1
         fi
       fi
@@ -510,9 +531,9 @@ rollback_on_exit() {
       docker start "${T4_CONTAINER_NAME}" >/dev/null 2>&1 || true
       if [[ "${old_was_running}" == "1" ]]; then
         if wait_for_rollback "${T4_CONTAINER_NAME}" "${previous_port}"; then
-          log "Previous container passed rollback health/provider checks"
+          log "Previous authenticated container is alive; verify readiness before reopening traffic"
         else
-          log "ERROR: previous container was restored but failed rollback health/provider checks" >&2
+          log "ERROR: previous container was restored but failed rollback liveness checks" >&2
           [[ "${status}" -eq 0 ]] && status=1
         fi
       fi

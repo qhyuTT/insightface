@@ -75,7 +75,7 @@ def test_docker_revision_label_preserves_cache_and_health_uses_runtime_port() ->
     assert "$$" not in source
     assert r"\${PERSON_SEARCH_PORT" not in source
     assert (
-        'CMD curl --fail --silent "http://127.0.0.1:${PERSON_SEARCH_PORT:-8000}/healthz"'
+        'CMD curl --fail --silent "http://127.0.0.1:${PERSON_SEARCH_PORT:-8000}/livez"'
     ) in source
 
 

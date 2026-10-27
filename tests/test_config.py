@@ -153,13 +153,5 @@ def test_runtime_float_settings_reject_non_finite_values() -> None:
         Settings(min_processed_fps=math.nan)
 
 
-def test_evidence_api_key_rejects_header_control_characters() -> None:
-    # Empty remains the backwards-compatible "disabled" sentinel.
-    assert Settings(evidence_api_key="").evidence_api_key == ""
-    assert Settings(evidence_api_key="  key  ").evidence_api_key == "key"
-    with pytest.raises(ValidationError):
-        Settings(evidence_api_key="key\nvalue")
-    with pytest.raises(ValidationError):
-        Settings(evidence_api_key="x" * 257)
-
-    assert "top-secret-key" not in repr(Settings(evidence_api_key="top-secret-key"))
+def test_shared_evidence_key_is_not_a_supported_setting() -> None:
+    assert "evidence_api_key" not in Settings.model_fields

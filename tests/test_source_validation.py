@@ -10,7 +10,6 @@ from pydantic import ValidationError
 from starlette.requests import Request
 
 from person_search.api import (
-    _api_key_matches,
     _contains_source_validation_error,
     _redact_validation_text,
     _safe_validation_fields,
@@ -184,13 +183,6 @@ def test_api_source_shape_errors_keep_stable_classification(
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == expected_code
-
-
-def test_evidence_api_key_comparison_supports_unicode_without_500() -> None:
-    assert _api_key_matches("密钥-🔐", "密钥-🔐") is True
-    assert _api_key_matches("密钥-🔐", "密钥-不同") is False
-    assert _api_key_matches(None, "密钥-🔐") is False
-    assert _api_key_matches(123, "123") is False  # type: ignore[arg-type]
 
 
 def test_person_search_error_messages_are_uri_redacted() -> None:

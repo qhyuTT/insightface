@@ -22,9 +22,8 @@ services:
     restart: unless-stopped
     stop_grace_period: 20s
     env_file:
-      # Must contain PERSON_SEARCH_EVIDENCE_API_KEY matching dispatch's
-      # DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY; Compose requires it and the
-      # health check verifies the advertised capability.
+      # Contains fixed AUTH_ISSUER/JWKS_URL/STATUS_URL/EXECUTOR_ID trust settings.
+      # Docker checks /livez only; dispatch performs authenticated readiness.
       - path: ${PERSON_SEARCH_RUNTIME_ENV_FILE:-/ssd/person-search-rpp/runtime.env}
         required: true
     environment:

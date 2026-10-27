@@ -4,11 +4,16 @@
 
 ## 安全边界（上线前必读）
 
-服务默认只监听 `127.0.0.1`。当前没有全局 API 认证：目标登记、搜索创建/停止、MJPEG
-预览、WebSocket 事件、`/monitor` 与文档接口均可匿名访问；只有配置
-`PERSON_SEARCH_EVIDENCE_API_KEY` 后，证据下载/释放接口才要求 `X-API-Key`。因此设置
-`PERSON_SEARCH_HOST=0.0.0.0` 时，必须把服务放在反向代理/API gateway 或 mTLS 后，并用
-防火墙/网络 ACL 限制来源；证据 key 不能当作全局认证。
+服务默认只监听 `127.0.0.1`，并默认启用调度平台 RS256/JWKS 认证。业务 API、
+WebSocket、预览、证据与文档均要求对应 JWT；静态监控页通过统一登录获得内存 Token。
+部署前必须配置稳定执行器身份、签发方、公钥和状态地址，详见
+[统一认证与探针](authentication.md)。`/livez` 仅表示进程存活，readiness 必须认证检查。
+首次从匿名旧版本切换时进入维护窗口并停止旧服务；脚本不会把正在运行的匿名旧版本当成
+自动回退基线。后续回退也必须验证鉴权与 readiness，不能重新开放匿名控制面。
+
+`T4_AUTH_ENV_FILE` 指向受保护的信任配置；`T4_PROBE_TOKEN_FILE` 指向 owner-only 的新签发
+执行器只读 JWT 文件，候选和正式 readiness 检查时均须保持有效。私有 CA 使用
+`T4_AUTH_CA_FILE` 只读挂载；不关闭 TLS 校验。旧证据 Key 不再承担生产认证。
 
 RTSP 输入允许 loopback、私网和任意 DNS 主机名，以兼容本地隧道与摄像头网段。未受信请求
 可借此诱导服务访问内网地址（SSRF/端口探测），所以除 API 鉴权外还应在防火墙/网络层配置

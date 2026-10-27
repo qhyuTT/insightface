@@ -15,6 +15,11 @@ start_service="${RK3588_START_SERVICE:-0}"
 allow_dirty="${RK3588_ALLOW_DIRTY:-0}"
 bootstrap_host="${RK3588_BOOTSTRAP_HOST:-0}"
 remote_runtime_source="${RK3588_REMOTE_RUNTIME_SOURCE:-}"
+remote_probe_file="${RK3588_REMOTE_PROBE_TOKEN_FILE:-}"
+if [[ "${start_service}" == "1" && -z "${remote_probe_file}" ]]; then
+  echo "RK3588_REMOTE_PROBE_TOKEN_FILE must name an owner-only fresh JWT on the target host" >&2
+  exit 1
+fi
 
 current_branch="$(git -C "${repo_dir}" branch --show-current)"
 if [[ "${current_branch}" != "${expected_branch}" ]]; then
@@ -130,9 +135,11 @@ if [[ "${start_service}" == "1" ]]; then
   ssh "${ssh_target}" "systemctl --user enable person-search-rk3588.service && systemctl --user restart person-search-rk3588.service"
   echo "waiting for native service on ${ssh_target}:18080"
   for _ in {1..20}; do
-    if ssh "${ssh_target}" "curl --fail --silent http://127.0.0.1:18080/healthz"; then
+    if ssh "${ssh_target}" "curl --fail --silent http://127.0.0.1:18080/livez"; then
       echo
-      echo "native service is healthy; commit=${commit}"
+      probe_file_q="$(printf '%q' "${remote_probe_file}")"
+      ssh "${ssh_target}" "cd ${remote_dir_q} && PERSON_SEARCH_PROBE_TOKEN_FILE=${probe_file_q} .venv/bin/python scripts/check_rk3588_contract.py --require-ready"
+      echo "native service authenticated readiness passed; commit=${commit}"
       exit 0
     fi
     sleep 1

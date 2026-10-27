@@ -11,6 +11,7 @@ _EVIDENCE_PATH = re.compile(r"(/v1/searches/)[^/?\s]+(/evidence/)[^?\s]+")
 
 
 def _redact_evidence_path(value: str) -> str:
+    value = re.sub(r"([?&]ticket=)[^&\s\"]+", r"\1[redacted]", value)
     return _EVIDENCE_PATH.sub(r"\1[redacted]\2[redacted]", value)
 
 

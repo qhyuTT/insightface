@@ -2026,7 +2026,7 @@ class SearchSession:
                 and decision.state.value == "confirmed"
                 and isinstance(frame, np.ndarray)
                 and decision.face_bbox is not None
-                and bool(self.settings.evidence_api_key)
+                and getattr(self.settings, "auth_enabled", False)
             ):
                 # The person track box is intentionally retained in the public
                 # ``bbox`` field.  Crop from the detector's actual face box so a

@@ -57,6 +57,7 @@ RUN python3 -m pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" "uv==0.
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
+COPY scripts/check_rk3588_contract.py ./scripts/check_rk3588_contract.py
 
 # The lock file contains CPU onnxruntime for the inference-cpu extra. Replace
 # that package with the GPU build after syncing the remaining dependencies.
@@ -105,6 +106,6 @@ VOLUME ["/models"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl --fail --silent "http://127.0.0.1:${PERSON_SEARCH_PORT:-8000}/healthz" || exit 1
+  CMD curl --fail --silent "http://127.0.0.1:${PERSON_SEARCH_PORT:-8000}/livez" || exit 1
 
 CMD ["person-search-api"]

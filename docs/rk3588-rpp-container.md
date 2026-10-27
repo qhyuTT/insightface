@@ -58,16 +58,12 @@ healthy service or publisher listing alone does not prove that decoded frames
 and recognition are progressing; check per-source processed FPS in the monitor.
 The dispatch backend requires six `/healthz` capabilities: `replace_active`,
 `active_search`, `search_timeout`, `request_lookup`, `event_replay`, and
-`confirmed_evidence_v1`. The last one is advertised only when
-`PERSON_SEARCH_EVIDENCE_API_KEY` is set. Put that variable in the protected
-runtime env file with the same value as dispatch's
-`DISPATCH_INSIGHTFACE_EVIDENCE_API_KEY`; do not put either value in source
-control or logs. Run `scripts/sync_rk3588_evidence_key.py --apply` as root on
-the box to copy the already configured dispatch key without printing it; the
-script backs up an existing runtime file, creates it if absent, preserves its
-owner, and sets mode `0600`. The Compose health check verifies `/readyz` and the complete
-capability set, so a missing conditional capability leaves the container
-unhealthy with the missing capability named in its health log.
+`confirmed_evidence_v1`. Production authentication uses fixed issuer/JWKS/status
+URLs and a unique executor ID in the protected runtime env file. The Compose
+health check uses `/livez` only; dispatch performs authenticated `/healthz` and
+`/readyz` checks using a fresh short-lived probe JWT. Do not configure or sync a
+shared evidence API key. See [authentication](authentication.md) for the trust
+configuration and rotation sequence.
 The host `rpp_server` uses SysV shared-memory IDs from the client
 process, so the container must use `ipc: host` as configured in Compose.
 

@@ -212,6 +212,83 @@
     const $ = (id) => document.getElementById(id);
     let targetId = null, targetName = '', searchId = null, socket = null, pollTimer = null, bestSimilarity = -1;
     let eventSeq = 0, reconnectTimer = null, reconnectDelay = 1000, stopping = false;
+    const executorId = window.executorIdentity || 'executor-01';
+    const authEnabled = window.executorAuthEnabled !== false;
+    const prefix = location.pathname.match(/^\/insightface\/[^/]+/)?.[0] || '';
+    let accessToken = '', tokenUntil = 0, dispatchToken = '', dispatchUntil = 0;
+    let manualLeaseId = null, identityPending = null, authReady = !authEnabled, previewTimer = null;
+    const nativeFetch = window.fetch.bind(window);
+
+    async function dispatchFetch(path, init = {}) {
+      const headers = new Headers(init.headers);
+      headers.set('Content-Type', 'application/json');
+      if (dispatchToken) headers.set('Authorization', `Bearer ${dispatchToken}`);
+      if (path === '/auth/refresh') {
+        const csrf = await nativeFetch('/api/v1/auth/csrf', {credentials:'same-origin', cache:'no-store'});
+        if (!csrf.ok) throw new Error('请先在调度平台登录');
+        headers.set('X-CSRF-Token', (await csrf.json()).csrf_token);
+      }
+      const response = await nativeFetch(`/api/v1${path}`, {...init, headers, credentials:'same-origin', cache:'no-store'});
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body?.detail?.message || body?.detail || '请在调度平台登录并确认管理员权限');
+      return body;
+    }
+    async function refreshDispatch() {
+      if (dispatchToken && dispatchUntil > Date.now() + 60000) return;
+      const refresh = async () => dispatchFetch('/auth/refresh', {method:'POST'});
+      const body = navigator.locks ? await navigator.locks.request('ard-auth-refresh', refresh) : await refresh();
+      dispatchToken = body.access_token; dispatchUntil = Date.now() + (body.expires_in || 900) * 1000;
+    }
+    async function ensureIdentity() {
+      if (!authEnabled || (accessToken && tokenUntil > Date.now() + 60000)) return;
+      if (!identityPending) identityPending = (async () => {
+        await refreshDispatch();
+        const body = manualLeaseId
+          ? await dispatchFetch(`/recognition-executors/${encodeURIComponent(executorId)}/leases`, {method:'POST', body:JSON.stringify({purpose:'manual'})})
+          : await dispatchFetch('/auth/exchange', {method:'POST', body:JSON.stringify({executor_id:executorId})});
+        accessToken = body.access_token; tokenUntil = Date.now() + (body.expires_in || 900) * 1000;
+        if (body.lease_id) manualLeaseId = body.lease_id;
+      })().finally(() => { identityPending = null; });
+      await identityPending;
+    }
+    async function ensureManualLease() {
+      if (!authEnabled || manualLeaseId) return;
+      await ensureIdentity(); await refreshDispatch();
+      const body = await dispatchFetch(`/recognition-executors/${encodeURIComponent(executorId)}/leases`, {method:'POST', body:JSON.stringify({purpose:'manual'})});
+      manualLeaseId = body.lease_id; accessToken = body.access_token;
+      tokenUntil = Date.now() + (body.expires_in || 900) * 1000;
+    }
+    async function releaseManualLease() {
+      if (!authEnabled || !manualLeaseId) return;
+      await refreshDispatch();
+      await dispatchFetch(`/recognition-executors/${encodeURIComponent(executorId)}/leases/${encodeURIComponent(manualLeaseId)}/release`, {method:'POST'});
+      manualLeaseId = null; accessToken = ''; tokenUntil = 0;
+    }
+    async function apiFetch(path, init = {}) {
+      await ensureIdentity();
+      const method = init.method || 'GET';
+      if (method !== 'GET' && path !== '/v1/auth/tickets') await ensureManualLease();
+      const headers = new Headers(init.headers);
+      if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
+      const response = await nativeFetch(`${prefix}${path}`, {...init, headers, cache:'no-store'});
+      if (response.status === 401) { accessToken = ''; tokenUntil = 0; }
+      return response;
+    }
+    async function streamUrl(path, purpose) {
+      if (!authEnabled) return `${prefix}${path}`;
+      const response = await apiFetch('/v1/auth/tickets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path, purpose})});
+      const body = await response.json();
+      if (!response.ok) throw new Error(problem(body, '连接授权失败'));
+      return `${prefix}${path}${path.includes('?') ? '&' : '?'}ticket=${encodeURIComponent(body.ticket)}`;
+    }
+    async function bootstrapAuth() {
+      try { await ensureIdentity(); authReady = true; await attachActiveSearch(); }
+      catch (error) {
+        authReady = false; fail(error.message);
+        const link = document.createElement('a'); link.href = '/'; link.textContent = ' 打开调度平台登录';
+        $('notice').append(link);
+      }
+    }
 
     function fail(message) { $('notice').textContent = message; }
     function setState(status) {
@@ -233,16 +310,20 @@
       const secondUri = $('rtspUri2').value.trim();
       return secondUri ? [first, {type:'rtsp', uri:secondUri, debug_preview:$('debugPreview').checked}] : [first];
     }
-    function showPreviews(id, sourceCount) {
+    async function showPreviews(id, sourceCount) {
+      clearTimeout(previewTimer);
       $('feedGrid').classList.toggle('dual', sourceCount === 2);
       $('emptyState').style.display = 'none'; $('stream').style.display = 'block';
-      $('stream').src = `/v1/searches/${id}/preview.mjpg?source_id=source-1&t=${Date.now()}`;
+      $('stream').src = await streamUrl(`/v1/searches/${id}/preview.mjpg?source_id=source-1`, 'preview');
       if (sourceCount === 2) {
         $('stream2').style.display = 'block';
-        $('stream2').src = `/v1/searches/${id}/preview.mjpg?source_id=source-2&t=${Date.now()}`;
+        $('stream2').src = await streamUrl(`/v1/searches/${id}/preview.mjpg?source_id=source-2`, 'preview');
       } else {
         $('stream2').removeAttribute('src'); $('stream2').style.display = 'none';
       }
+      if (searchId === id && authEnabled) previewTimer = setTimeout(() => {
+        if (searchId === id && !stopping) showPreviews(id, sourceCount).catch(error => fail(error.message));
+      }, Math.max(1000, tokenUntil - Date.now() - 60000));
     }
     function renderSourceStatus(sources = []) {
       for (let index = 0; index < 2; index++) {
@@ -261,7 +342,7 @@
     }
     async function attachActiveSearch() {
       try {
-        const response = await fetch('/v1/searches/active', {cache:'no-store'});
+        const response = await apiFetch('/v1/searches/active', {cache:'no-store'});
         if (!response.ok) throw new Error(`读取当前任务失败（HTTP ${response.status}）`);
         const body = await response.json();
         if (!body || searchId) return;
@@ -271,7 +352,7 @@
         $('startBtn').disabled = true; $('stopBtn').disabled = false;
         renderTargets(body.targets); renderSourceStatus(body.sources || []);
         updateBatchAvailability(); setState(body.status);
-        showPreviews(searchId, body.sources?.length || 1);
+        await showPreviews(searchId, body.sources?.length || 1);
         connectEvents(); pollStatus();
       } catch (error) { fail(error.message); }
     }
@@ -505,7 +586,7 @@
       fail(''); $('enrollBtn').disabled = true; $('enrollBtn').textContent = '正在分析人脸…';
       const data = new FormData(); data.append('name', $('targetName').value.trim()); data.append('image', $('targetFile').files[0]);
       try {
-        const response = await fetch('/v1/targets', {method:'POST', body:data}); const body = await response.json();
+        const response = await apiFetch('/v1/targets', {method:'POST', body:data}); const body = await response.json();
         if (!response.ok) throw new Error(problem(body, '照片登记失败'));
         targetId = body.target_id; targetName = body.name; $('targetInfo').textContent = `${targetName} · TARGET ${targetId} · QUALITY ${body.quality_score.toFixed(2)}`;
         $('startBtn').disabled = false; $('enrollBtn').textContent = '✓ 目标已登记';
@@ -525,12 +606,12 @@
       if ($('batchTimeout').value) data.append('timeout_seconds', $('batchTimeout').value);
       files.forEach(file => data.append('images', file));
       try {
-        const response = await fetch('/v1/batch-searches', {method:'POST', body:data});
+        const response = await apiFetch('/v1/batch-searches', {method:'POST', body:data});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '批量搜索启动失败'));
         searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; targetName = `${body.found_count}/${body.total_count} 人`; bestSimilarity = -1;
         renderTargets(body.targets); updateBatchAvailability();
         $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
-        showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
+        await showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
         connectEvents(); pollStatus();
       } catch (error) { fail(error.message); $('batchStartBtn').disabled = false; }
     });
@@ -539,11 +620,11 @@
       const sources = sourceConfigs();
       try {
         const sourcePayload = sources.length === 2 ? {sources} : {source:sources[0]};
-        const response = await fetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, ...sourcePayload})});
+        const response = await apiFetch('/v1/searches', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_id:targetId, ...sourcePayload})});
         const body = await response.json(); if (!response.ok) throw new Error(problem(body, '无法启动搜索'));
         searchId = body.search_id; eventSeq = 0; reconnectDelay = 1000; stopping = false; bestSimilarity = -1; $('similarityMetric').textContent = '—'; $('stopBtn').disabled = false; setState(body.status);
         updateBatchAvailability();
-        showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
+        await showPreviews(searchId, sources.length); renderSourceStatus(body.sources || []);
         connectEvents(); pollStatus();
       } catch (error) { fail(error.message + (error.message.includes('one search') ? '；请先停止旧任务或重启服务。' : '')); $('startBtn').disabled = false; }
     });
@@ -553,7 +634,7 @@
       if (!searchId) return;
       stopping = true; $('stopBtn').disabled = true;
       try {
-        const response = await fetch(`/v1/searches/${searchId}`, {method:'DELETE'});
+        const response = await apiFetch(`/v1/searches/${searchId}`, {method:'DELETE'});
         if (!response.ok) {
           const body = await response.json().catch(() => ({}));
           throw new Error(problem(body, `停止失败（HTTP ${response.status}）`));
@@ -564,15 +645,25 @@
       }
       if (socket) socket.close(); clearTimeout(pollTimer); clearTimeout(reconnectTimer); setState('stopped');
       $('stream').removeAttribute('src'); $('stream').style.display = 'none'; $('stream2').removeAttribute('src'); $('stream2').style.display = 'none'; $('feedGrid').classList.remove('dual'); $('emptyState').style.display = 'block'; $('scanline').style.display = 'none'; renderSourceStatus();
+      clearTimeout(previewTimer);
+      try { await releaseManualLease(); } catch (error) { fail(error.message); }
       $('stopBtn').disabled = true; $('startBtn').disabled = true; targetId = null; targetName = ''; searchId = null; bestSimilarity = -1;
       renderTargets();
       $('targetInfo').textContent = '任务已结束，请重新登记目标'; $('banner').textContent = '● 已停止';
     }
-    function connectEvents() {
+    async function connectEvents() {
       const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
       if (!searchId || stopping) return;
       clearTimeout(reconnectTimer);
-      socket = new WebSocket(`${protocol}://${location.host}/v1/searches/${searchId}/events?after_seq=${eventSeq}`);
+      try {
+        const path = await streamUrl(`/v1/searches/${searchId}/events?after_seq=${eventSeq}`, 'websocket');
+        if (!searchId || stopping) return;
+        socket = new WebSocket(`${protocol}://${location.host}${path}`);
+      } catch (error) {
+        fail(error.message);
+        reconnectTimer = setTimeout(connectEvents, Math.min(reconnectDelay *= 2, 10000));
+        return;
+      }
       socket.onmessage = ({data}) => {
         const event = JSON.parse(data);
         if (event.type === 'replay_gap') {
@@ -618,7 +709,7 @@
       if (!searchId) return;
       let terminal = false;
       try {
-        const response = await fetch(`/v1/searches/${searchId}`); const body = await response.json();
+        const response = await apiFetch(`/v1/searches/${searchId}`); const body = await response.json();
         if (response.ok) {
           setState(body.status); $('fpsMetric').textContent = body.processed_fps.toFixed(1); $('previewFpsMetric').textContent = body.preview_fps.toFixed(1); $('latencyMetric').textContent = body.latency_scope === 'per_source' ? '见各源' : `${body.p95_latency_ms.toFixed(0)} ms`;
           renderSourceStatus(body.sources || []);
@@ -639,12 +730,12 @@
           }
           if (body.error) fail(body.error);
           terminal = ['completed', 'timed_out', 'stopped', 'failed'].includes(body.status);
-          if (terminal) { $('stopBtn').disabled = true; $('scanline').style.display = 'none'; searchId = null; updateBatchAvailability(); }
+          if (terminal) { clearTimeout(previewTimer); if (socket) { stopping = true; socket.close(); } if (manualLeaseId) await releaseManualLease(); $('stopBtn').disabled = true; $('scanline').style.display = 'none'; searchId = null; updateBatchAvailability(); }
         }
       } finally { if (!terminal) pollTimer = setTimeout(pollStatus, 1200); }
     }
-    attachActiveSearch();
-    setInterval(() => { if (!searchId) attachActiveSearch(); }, 3000);
+    bootstrapAuth();
+    setInterval(() => { if (authReady && !searchId) attachActiveSearch(); }, 3000);
   </script>
 </body>
 </html>
